@@ -703,6 +703,29 @@ Done when: each seed is either fixed in the compiler or its expectation correcte
 in the generator, with the reason recorded — and the seeds are in the gate, not
 merely reproducible by hand.
 
+Progress, by instrumenting seed 17 (the module's checks replaced with `Out.WriteInt`
+of each variable, so the program's values could be read beside the generator's):
+
+* Of the twelve checked variables, **one** differs: the program computes `m0 = 5`
+  where the model says `3`. Everything else agrees, so the divergence is in one
+  chain of statements, not in the generator's arithmetic at large.
+* The generator's *model* of the shifts is right (it follows the report: `LSL` and
+  `ASR` of 32 or more are 0 or -1), and so is the runtime: a C probe of
+  `rt_lsl`/`rt_asr` gives `LSL(1,33)=0`, `LSL(1000,33)=0`, `ASR(-1000,33)=-1`,
+  `LSL(3,32)=0`, `ASR(-8,2)=-2`, `LSL(1,31)=MIN(INTEGER)`. R22's semantics are
+  intact, on both sides, so neither is this failure.
+* The last statement that writes `m0` is `m0 := (m0 + R(3))` — the exact shape
+  DESIGN R23 records — and the one before it is
+  `m0 := (F0(F0(MIN)) + LSL(F0(MAX), 33))`, whose *both* operands call `F0`, a
+  procedure whose body writes module variables (`m0`, `m8`) and contains a
+  `REPEAT` and a `CASE 1 OF 1:`. R23's minimal reproduction does not fire at any
+  `-O` level, so the suspect is now inside `F0` itself rather than in the order of
+  `+`.
+* Next: the same instrumentation inside `F0`'s body (print `p0`, `acc` and the
+  module variables at each iteration), which will separate "the emitter evaluates
+  a `REPEAT`/`CASE` wrongly" from "the emitter evaluates the operands in the wrong
+  order".
+
 ## W7 — memory safety: evaluate it, then test it
 
 Why: the design's promise is that a memory access in emitted code is either
