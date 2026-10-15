@@ -49,6 +49,20 @@ use crate::sema::{span_key, Sema};
 use crate::types::{Basic, Type, TypeId, Types};
 use crate::Diagnostic;
 
+/// A procedure's frame: the region a nested procedure reaches its enclosing
+/// storage through (DESIGN §9.7, the C back end's `F_<path>` struct). Its first
+/// word is the static link, so a nested procedure can walk up from the frame it
+/// was handed — `sl` points at the *parent's* frame, and a symbol one level up
+/// needs no hop.
+struct Frame {
+    /// The lexical path (`Outer__Inner`), which nested symbols are named with.
+    path: String,
+    level: usize,
+    /// Every parameter and local, by its offset in this frame.
+    locals: HashMap<String, (u64, TypeId)>,
+    size: u64,
+}
+
 /// A formal parameter as the checker flattened it, and how the C back end passes
 /// it (DESIGN §9.7): a value of a basic type is the value itself, a `VAR`
 /// parameter is the caller's address, a *structured* value parameter is the
@@ -153,6 +167,10 @@ enum Rt {
     /// into an array, and the relations).
     StrCopy,
     CharCmp,
+    /// `rt_pack`/`rt_unpk`: the exponent scaling of report §10.2, which take the
+    /// storage of their operands.
+    Pack,
+    Unpk,
 }
 
 impl Rt {
@@ -170,6 +188,8 @@ impl Rt {
             Rt::Set => "ob_rt_set",
             Rt::StrCopy => "ob_rt_strcopy",
             Rt::CharCmp => "ob_rt_charcmp",
+            Rt::Pack => "ob_rt_pack",
+            Rt::Unpk => "ob_rt_unpk",
         }
     }
 }
@@ -284,6 +304,163 @@ fn collect_strings(body: &[Stmt], out: &mut Vec<(u32, String)>) {
     }
 }
 
+/// The locals whose *storage* the body hands to someone: a `VAR` actual, and the
+/// operands of `PACK`/`UNPK`, which take addresses (report §10.1, §10.2). A local
+/// that holds its value in a register has no address to hand over, so these live
+/// in frame slots — the C back end's locals are in memory for the same reason.
+fn address_taken(
+    sema: &Sema<'_>,
+    module: &Module,
+    body: &[Stmt],
+    proc_formals: &HashMap<String, Vec<Formal>>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign { value, .. } => address_taken_expr(sema, module, value, proc_formals, out),
+            StmtKind::Call(d) => address_taken_call(sema, module, d, proc_formals, out),
+            StmtKind::If { arms, els } => {
+                for (c, b) in arms {
+                    address_taken_expr(sema, module, c, proc_formals, out);
+                    address_taken(sema, module, b, proc_formals, out);
+                }
+                if let Some(b) = els {
+                    address_taken(sema, module, b, proc_formals, out);
+                }
+            }
+            StmtKind::While { arms } => {
+                for (c, b) in arms {
+                    address_taken_expr(sema, module, c, proc_formals, out);
+                    address_taken(sema, module, b, proc_formals, out);
+                }
+            }
+            StmtKind::Repeat { body, until } => {
+                address_taken(sema, module, body, proc_formals, out);
+                address_taken_expr(sema, module, until, proc_formals, out);
+            }
+            StmtKind::For {
+                from, to, by, body, ..
+            } => {
+                address_taken_expr(sema, module, from, proc_formals, out);
+                address_taken_expr(sema, module, to, proc_formals, out);
+                if let Some(k) = by {
+                    address_taken_expr(sema, module, k, proc_formals, out);
+                }
+                address_taken(sema, module, body, proc_formals, out);
+            }
+            StmtKind::Case { subject, arms } => {
+                address_taken_expr(sema, module, subject, proc_formals, out);
+                for arm in arms {
+                    address_taken(sema, module, &arm.body, proc_formals, out);
+                }
+            }
+            StmtKind::Return(e) => {
+                if let Some(e) = e {
+                    address_taken_expr(sema, module, e, proc_formals, out);
+                }
+            }
+            StmtKind::Exit => {}
+        }
+    }
+}
+
+fn address_taken_call(
+    sema: &Sema<'_>,
+    module: &Module,
+    d: &Designator,
+    proc_formals: &HashMap<String, Vec<Formal>>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    let args = match d.sels.last() {
+        Some(Selector::Call(args)) => args.clone(),
+        _ => Vec::new(),
+    };
+    // `SYSTEM.ADR(x)` takes x's storage (report §11.1), so x must have one.
+    if d.base.len() == 2 && d.base[0] == "SYSTEM" && d.base[1] == "ADR" {
+        for a in &args {
+            if let ExprKind::Designator(d) = &a.kind {
+                if d.sels.is_empty() {
+                    out.insert(d.base[0].clone());
+                }
+            }
+        }
+    }
+    if d.base.len() == 1 {
+        let name = d.base[0].clone();
+        if name == "PACK" || name == "UNPK" {
+            for a in &args {
+                if let ExprKind::Designator(d) = &a.kind {
+                    if d.sels.is_empty() {
+                        out.insert(d.base[0].clone());
+                    }
+                }
+            }
+        }
+        let formals = proc_formals
+            .get(&name)
+            .cloned()
+            .or_else(|| {
+                sema.call_types
+                    .get(&span_key(d.span))
+                    .and_then(|t| match sema.types.get(*t) {
+                        Type::Proc { params, .. } => Some(
+                            params
+                                .iter()
+                                .enumerate()
+                                .map(|(i, pm)| Formal {
+                                    name: format!("a{i}"),
+                                    ty: pm.ty,
+                                    by_var: pm.by_var,
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    })
+            })
+            .unwrap_or_default();
+        for (a, f) in args.iter().zip(formals.iter()) {
+            if f.by_var {
+                if let ExprKind::Designator(d) = &a.kind {
+                    if d.sels.is_empty() {
+                        out.insert(d.base[0].clone());
+                    }
+                }
+            }
+        }
+    }
+    let _ = module;
+    for a in &args {
+        address_taken_expr(sema, module, a, proc_formals, out);
+    }
+}
+
+fn address_taken_expr(
+    sema: &Sema<'_>,
+    module: &Module,
+    e: &Expr,
+    proc_formals: &HashMap<String, Vec<Formal>>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match &e.kind {
+        ExprKind::Designator(d) => address_taken_call(sema, module, d, proc_formals, out),
+        ExprKind::Unary(_, x) => address_taken_expr(sema, module, x, proc_formals, out),
+        ExprKind::Binary(_, l, r) => {
+            address_taken_expr(sema, module, l, proc_formals, out);
+            address_taken_expr(sema, module, r, proc_formals, out);
+        }
+        ExprKind::TypeTest(x, _) => address_taken_expr(sema, module, x, proc_formals, out),
+        ExprKind::Set(elems) => {
+            for el in elems {
+                address_taken_expr(sema, module, &el.lo, proc_formals, out);
+                if let Some(h) = &el.hi {
+                    address_taken_expr(sema, module, h, proc_formals, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn uses_of(sema: &Sema<'_>, types: &Types, module: &Module, body: &[Stmt]) -> Uses {
     let mut uses = Uses::default();
     collect_strings(body, &mut uses.strings);
@@ -315,10 +492,12 @@ fn collect_imports(
     for s in body {
         match &s.kind {
             StmtKind::Assign { target, value } => {
-                collect_imports_designator(sema, types, module, target, uses);
+                collect_imports_designator(sema, types, module, target, false, uses);
                 collect_imports_expr(sema, types, module, value, uses);
             }
-            StmtKind::Call(d) => collect_imports_designator(sema, types, module, d, uses),
+            // A statement-level designator *is* a call (a parameterless one has
+            // no `Call` selector to say so).
+            StmtKind::Call(d) => collect_imports_designator(sema, types, module, d, true, uses),
             StmtKind::If { arms, els } => {
                 for (c, b) in arms {
                     collect_imports_expr(sema, types, module, c, uses);
@@ -372,7 +551,7 @@ fn collect_imports_expr(
     uses: &mut Uses,
 ) {
     match &e.kind {
-        ExprKind::Designator(d) => collect_imports_designator(sema, types, module, d, uses),
+        ExprKind::Designator(d) => collect_imports_designator(sema, types, module, d, false, uses),
         ExprKind::Unary(_, x) => collect_imports_expr(sema, types, module, x, uses),
         ExprKind::Binary(_, l, r) => {
             collect_imports_expr(sema, types, module, l, uses);
@@ -396,24 +575,34 @@ fn collect_imports_designator(
     types: &Types,
     module: &Module,
     d: &Designator,
+    statement_call: bool,
     uses: &mut Uses,
 ) {
     if d.base.len() == 2 {
         if let Some(m) = alias_of(module, &d.base[0]) {
             let symbol = format!("{}__{}", m, mangle(&d.base[1]));
-            let called = matches!(d.sels.last(), Some(Selector::Call(_)));
+            let called = statement_call || matches!(d.sels.last(), Some(Selector::Call(_)));
             // The checker recorded the type of the whole designator where it
             // stands (a call's type at the call site, a variable's at its use),
             // which is where the C back end reads it too — an interface's
             // *variables* are not in the type environment it builds.
+            // A call's type is recorded at its designator *when it has a `Call`
+            // selector*; a parameterless call written without parentheses has
+            // none, and the checker has already established that it takes no
+            // parameters (report §9.2). `TypeId(0)` says "no signature to read",
+            // and the declaration falls back to an empty one.
             let ty = if called {
-                sema.call_types.get(&span_key(d.span)).copied()
+                sema.call_types
+                    .get(&span_key(d.span))
+                    .copied()
+                    .unwrap_or(TypeId(0))
             } else {
-                sema.type_at(d.span, types)
+                match sema.type_at(d.span, types) {
+                    Some(t) => t,
+                    None => return,
+                }
             };
-            if let Some(ty) = ty {
-                uses.imports.push((symbol, ty, called));
-            }
+            uses.imports.push((symbol, ty, called));
         }
     }
     for sel in &d.sels {
@@ -565,6 +754,12 @@ struct Backend<'a> {
     /// A module variable's own map, when its type reaches a pointer: what
     /// `__init` registers with the collector.
     root_maps: HashMap<String, DataId>,
+    /// The frames of the procedures being lowered, outermost first: what a
+    /// nested procedure's enclosing accesses and links are computed from.
+    frames: Vec<Frame>,
+    /// Each procedure's lexical level (1 at module level) and path, for the link
+    /// a nested call passes and the name it is emitted under.
+    proc_level: HashMap<String, usize>,
     /// Every procedure the module declares, under the symbol it is emitted with,
     /// and the formals it was declared with (which is what a call's argument
     /// passing needs when the checker recorded no type at the call site — a
@@ -621,6 +816,8 @@ impl<'a> Backend<'a> {
             maps: HashMap::new(),
             nfields: HashMap::new(),
             root_maps: HashMap::new(),
+            frames: Vec::new(),
+            proc_level: HashMap::new(),
             procs: HashMap::new(),
             proc_formals: HashMap::new(),
             vars: HashMap::new(),
@@ -671,6 +868,8 @@ impl<'a> Backend<'a> {
             Rt::Set,
             Rt::StrCopy,
             Rt::CharCmp,
+            Rt::Pack,
+            Rt::Unpk,
         ] {
             let sig = self.rt_signature(rt);
             let id = self
@@ -708,7 +907,17 @@ impl<'a> Backend<'a> {
         for p in &module.decls.procs {
             self.lower_proc(p)?;
         }
-        self.lower_function(self.init, &[], &[], None, &module.body, span)?;
+        self.lower_function(
+            self.init,
+            &[],
+            &[],
+            None,
+            &module.body,
+            span,
+            String::new(),
+            None,
+            &[],
+        )?;
         self.lower_load(module)?;
         Ok(())
     }
@@ -721,6 +930,18 @@ impl<'a> Backend<'a> {
     /// types and every variable, parameter and local.
     fn compute_layouts(&mut self, module: &Module) -> Result<(), Diagnostic> {
         let mut layouts = Layouts::new(self.types, self.ptr_bytes);
+        // The predeclared types, which `SIZE` can name without any declaration
+        // (report §11.1's own table).
+        for t in [
+            self.types.integer(),
+            self.types.boolean(),
+            self.types.char(),
+            self.types.byte(),
+            self.types.real(),
+            self.types.set(),
+        ] {
+            layouts.of(t);
+        }
         for decl in &module.decls.types {
             if let Some(t) = self.sema.type_at(span_of_type(&decl.ty), self.types) {
                 layouts.of(t);
@@ -1051,6 +1272,15 @@ impl<'a> Backend<'a> {
                 sig.params.push(AbiParam::new(I32));
                 sig.returns.push(AbiParam::new(I32));
             }
+            // `rt_pack(float *, int32_t)` and `rt_unpk(float *, int32_t *)`.
+            Rt::Pack => {
+                sig.params.push(AbiParam::new(self.ptr));
+                sig.params.push(AbiParam::new(I32));
+            }
+            Rt::Unpk => {
+                sig.params.push(AbiParam::new(self.ptr));
+                sig.params.push(AbiParam::new(self.ptr));
+            }
             // `rt_is(const ObDesc *, const ObDesc *) -> int32_t`.
             Rt::Is => {
                 sig.params.push(AbiParam::new(self.ptr));
@@ -1346,19 +1576,73 @@ impl<'a> Backend<'a> {
     }
 
     fn declare_proc(&mut self, p: &Proc) -> Result<(), Diagnostic> {
-        // A nested procedure reaches its enclosing frame through a static link
-        // (DESIGN §9.7), which this back end has no frames for yet.
-        if let Some(inner) = p.decls.procs.first() {
-            return Err(not_yet("a nested procedure", inner.name_span));
-        }
-        // The checker's flattened signature is what names the parameters, and
-        // it is what the C back end reads for the same purpose.
+        let path = match self.frames.last() {
+            Some(f) if f.level >= 1 => format!("{}__{}", f.path, p.name),
+            _ => p.name.clone(),
+        };
+        let level = self.frames.last().map(|f| f.level + 1).unwrap_or(1);
         let (formals, result) = self.formals(p)?;
-        let abi = self.abi_params(&formals, p.name_span)?;
-        let id = self.declare_function(&self.symbol(&p.name), p.export, &abi, result, p.name_span)?;
-        self.procs.insert(p.name.clone(), id);
-        self.proc_formals.insert(p.name.clone(), formals);
+        let mut abi = Vec::new();
+        if level > 1 {
+            // A nested procedure takes the enclosing frame as a hidden first
+            // parameter, whatever it does with it (DESIGN §9.7: the C back end
+            // adds it for every nested procedure, and `csmoke` pins that).
+            abi.push(AbiParam::new(self.ptr));
+        }
+        abi.extend(self.abi_params(&formals, p.name_span)?);
+        let symbol = format!("{}__{}", self.module_name, mangle(&path));
+        let id = self.declare_function(&symbol, p.export, &abi, result, p.name_span)?;
+        // Keyed by the lexical path: two procedures called `inner` in different
+        // parents are different procedures, and a call resolves by walking
+        // outward from the caller's own path.
+        self.procs.insert(path.clone(), id);
+        self.proc_formals.insert(path.clone(), formals);
+        self.proc_level.insert(path.clone(), level);
+        // The nested ones, declared in the parent's frame's context: their
+        // symbols carry the lexical path, which is what makes two procedures
+        // called `inner` in different parents distinct.
+        let frame = self.frame_of(p, level, &path);
+        self.frames.push(frame);
+        for q in &p.decls.procs {
+            self.declare_proc(q)?;
+        }
+        self.frames.pop();
         Ok(())
+    }
+
+    /// The frame a procedure with nested procedures owns: the static link first,
+    /// then its parameters and its locals, each at the next multiple of its own
+    /// alignment (the C back end's `struct F_<path>`). A procedure with no nested
+    /// procedure has no frame — its locals stay in registers and slots.
+    fn frame_of(&self, p: &Proc, level: usize, path: &str) -> Frame {
+        let mut locals = HashMap::new();
+        let mut at = self.ptr_bytes;
+        if !p.decls.procs.is_empty() {
+            let (formals, _) = self.formals(p).unwrap_or_default();
+            for f in &formals {
+                let size = self.storable(f.ty, p.name_span).unwrap_or(self.ptr_bytes);
+                let align = self.type_align(f.ty);
+                at = crate::layout::round_up(at, align);
+                locals.insert(f.name.clone(), (at, f.ty));
+                at += size;
+            }
+            for v in &p.decls.vars {
+                let ty = self.decl_type(&v.ty);
+                let size = self.storable(ty, v.span).unwrap_or(0);
+                let align = self.type_align(ty);
+                for (name, _) in &v.names {
+                    at = crate::layout::round_up(at, align);
+                    locals.insert(name.clone(), (at, ty));
+                    at += size;
+                }
+            }
+        }
+        Frame {
+            path: path.to_string(),
+            level,
+            locals,
+            size: crate::layout::round_up(at, self.ptr_bytes),
+        }
     }
 
     /// A procedure's parameters, as the checker flattened them, and its result.
@@ -1496,16 +1780,35 @@ impl<'a> Backend<'a> {
                 locals.push((lname.clone(), ty));
             }
         }
+        let level = self.frames.last().map(|f| f.level + 1).unwrap_or(1);
+        let path = match self.frames.last() {
+            Some(f) => format!("{}__{}", f.path, p.name),
+            None => p.name.clone(),
+        };
         let id = *self
             .procs
-            .get(&p.name)
+            .get(&path)
             .expect("a declared procedure has a symbol");
         let body = p.body.clone();
-        self.lower_function(id, &formals, &locals, result, &body, p.name_span)
+        let frame = self.frame_of(p, level, &path);
+        let has_frame = !p.decls.procs.is_empty();
+        let nested = p.decls.procs.clone();
+        self.lower_function(
+            id,
+            &formals,
+            &locals,
+            result,
+            &body,
+            p.name_span,
+            path,
+            if has_frame { Some(frame) } else { None },
+            &nested,
+        )
     }
 
     /// Lower one function: parameters and locals as SSA variables, the body as
     /// IR, and a path that runs off the end returning.
+    #[allow(clippy::too_many_arguments)]
     fn lower_function(
         &mut self,
         id: FuncId,
@@ -1514,12 +1817,16 @@ impl<'a> Backend<'a> {
         result: Option<TypeId>,
         body: &[Stmt],
         span: Span,
+        path: String,
+        frame: Option<Frame>,
+        nested: &[Proc],
     ) -> Result<(), Diagnostic> {
+        let level = self.frames.last().map(|f| f.level + 1).unwrap_or(1);
         // Every symbol the body can name is declared *before* the builder
         // exists: a Cranelift function reference is part of the function, and
         // the frontend does not hand the `ir::Function` back once it holds it.
-        // The string literals are data objects for the same reason — a literal
-        // used where a pointer is expected (`ARRAY OF CHAR`) has to name one.
+        // The string literals and other modules' symbols are data and function
+        // references for the same reason.
         let uses = uses_of(self.sema, self.types, self.module, body);
         let mut string_ids = Vec::new();
         for (at, text) in &uses.strings {
@@ -1528,7 +1835,12 @@ impl<'a> Backend<'a> {
 
         let mut ctx = self.obj.make_context();
         let mut sig = self.obj.make_signature();
-        sig.params = self.abi_params(formals, span)?;
+        if level > 1 {
+            // A nested procedure's first parameter is the enclosing frame
+            // (DESIGN §9.7).
+            sig.params.push(AbiParam::new(self.ptr));
+        }
+        sig.params.extend(self.abi_params(formals, span)?);
         if let Some(r) = result {
             sig.returns.push(AbiParam::new(self.scalar(r, span)?));
         }
@@ -1557,50 +1869,43 @@ impl<'a> Backend<'a> {
         let mut roots = HashMap::new();
         for (name, mid) in self.root_maps.clone() {
             let n = self.region_fields(self.var_ty[&name], 0).len() as i32;
-            roots.insert(
-                name,
-                (self.obj.declare_data_in_func(mid, &mut ctx.func), n),
-            );
+            roots.insert(name, (self.obj.declare_data_in_func(mid, &mut ctx.func), n));
         }
-
-        // Other modules' procedures the body calls: an import needs its ABI
-        // before the builder can name it (an interface's procedure has no
-        // declaration in this module otherwise).
         let mut imported_ids = Vec::new();
         let mut imported_var_ids = Vec::new();
         for (symbol, ty, is_call) in &uses.imports {
             if !is_call {
-                // An interface's variable: the defining module's data, named the
-                // way its header declares it.
-                let id = self
+                let did = self
                     .obj
                     .declare_data(symbol, Linkage::Import, true, false)
                     .map_err(|e| host(format!("{e}")))?;
-                imported_var_ids.push((symbol.clone(), id, *ty));
+                imported_var_ids.push((symbol.clone(), did, *ty));
                 continue;
             }
-            let params = match self.types.get(*ty) {
-                Type::Proc { params, .. } => params.clone(),
-                _ => continue,
+            // A call the checker recorded a type for has the interface's ABI; a
+            // parameterless call written without parentheses has none to read, and
+            // an empty one is what it takes — its result, if it is a function at
+            // all, is discarded, which the C ABI allows for the scalars this back
+            // end lowers.
+            let (formals, result) = match self.types.get(*ty) {
+                Type::Proc { params, result } => (
+                    params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, pm)| Formal {
+                            name: format!("a{i}"),
+                            ty: pm.ty,
+                            by_var: pm.by_var,
+                        })
+                        .collect::<Vec<Formal>>(),
+                    *result,
+                ),
+                _ => (Vec::new(), None),
             };
-            let formals: Vec<Formal> = params
-                .iter()
-                .enumerate()
-                .map(|(i, pm)| Formal {
-                    name: format!("a{i}"),
-                    ty: pm.ty,
-                    by_var: pm.by_var,
-                })
-                .collect();
             let abi = self.abi_params(&formals, span)?;
-            let result = match self.types.get(*ty) {
-                Type::Proc { result, .. } => *result,
-                _ => None,
-            };
             let id = self.declare_import(symbol, &abi, result, span)?;
             imported_ids.push((symbol.clone(), id));
         }
-
         let mut strings_gv = HashMap::new();
         for (at, sid) in string_ids {
             strings_gv.insert(at, self.obj.declare_data_in_func(sid, &mut ctx.func));
@@ -1623,20 +1928,63 @@ impl<'a> Backend<'a> {
             bcx.append_block_params_for_function_params(entry);
             bcx.switch_to_block(entry);
             let values: Vec<ir::Value> = bcx.block_params(entry).to_vec();
+            let mut at = 0;
+            let sl = if level > 1 {
+                at = 1;
+                Some(values[0])
+            } else {
+                None
+            };
             let mut vars = HashMap::new();
             let mut local_tys: HashMap<String, TypeId> = HashMap::new();
             let mut var_params: HashMap<String, (ir::Value, TypeId)> = HashMap::new();
             let mut open: HashMap<String, (ir::Value, ir::Value, TypeId)> = HashMap::new();
-            let mut at = 0;
+            let mut slots: HashMap<String, ir::Value> = HashMap::new();
+            let mut regions: Vec<(TypeId, ir::Value)> = Vec::new();
+            // The frame, when this procedure owns one: every parameter and local
+            // lives in it, because a nested procedure reaches them through it.
+            let frame_addr = match &frame {
+                Some(f) => {
+                    let align = self.ptr_bytes.trailing_zeros() as u8;
+                    let slot = bcx.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        f.size as u32,
+                        align,
+                    ));
+                    let addr = bcx.ins().stack_addr(self.ptr, slot, 0);
+                    bcx.emit_small_memset(
+                        self.obj.target_config(),
+                        addr,
+                        0,
+                        f.size,
+                        align,
+                        ir::MemFlagsData::new(),
+                    );
+                    // The link, first word: our own frame is what a *child* call
+                    // passes on, and `NULL` at the top of a chain.
+                    let link = match sl {
+                        Some(s) => s,
+                        None => bcx.ins().iconst(self.ptr, 0),
+                    };
+                    bcx.ins().store(ir::MemFlagsData::new(), link, addr, 0);
+                    Some(addr)
+                }
+                None => None,
+            };
             for f in formals {
                 local_tys.insert(f.name.clone(), f.ty);
                 if let Some(elem) = f.open(self.types) {
-                    // An open array arrives as the element pointer and the length
-                    // the caller passed (report §10.1).
                     open.insert(f.name.clone(), (values[at], values[at + 1], elem));
                     at += 2;
                 } else if f.by_var || f.structured(self.types) {
                     var_params.insert(f.name.clone(), (values[at], f.ty));
+                    at += 1;
+                } else if let (Some(addr), Some(fr)) = (frame_addr, &frame) {
+                    // In the frame, at the offset the frame layout gave it.
+                    let (off, _) = fr.locals[&f.name];
+                    let here = bcx.ins().iadd_imm_s(addr, off as i64);
+                    bcx.ins().store(ir::MemFlagsData::new(), values[at], here, 0);
+                    slots.insert(f.name.clone(), here);
                     at += 1;
                 } else {
                     let var = bcx.declare_var(self.scalar(f.ty, span)?);
@@ -1645,15 +1993,19 @@ impl<'a> Backend<'a> {
                     at += 1;
                 }
             }
-            let mut slots: HashMap<String, ir::Value> = HashMap::new();
-            let mut regions: Vec<(TypeId, ir::Value)> = Vec::new();
+            let mut taken = std::collections::BTreeSet::new();
+            address_taken(self.sema, self.module, body, &self.proc_formals, &mut taken);
             for (lname, ty) in locals {
                 local_tys.insert(lname.clone(), *ty);
-                if self.value_type(*ty).is_none() {
-                    // A region — a record or an array — lives in a frame slot,
-                    // zeroed exactly as the C back end zeroes a local (`memset`)
-                    // and given its descriptor just after (a record carries one,
-                    // DESIGN §9.3).
+                if let (Some(addr), Some(fr)) = (frame_addr, &frame) {
+                    let (off, _) = fr.locals[lname];
+                    slots.insert(lname.clone(), bcx.ins().iadd_imm_s(addr, off as i64));
+                    continue;
+                }
+                if self.value_type(*ty).is_none() || taken.contains(lname) {
+                    // A region, or a local whose *address* the body hands to
+                    // someone (`VAR` actuals, `PACK`/`UNPK`): a register has no
+                    // address, so both live in a slot.
                     let size = self.layout(*ty).map(|l| l.size).ok_or_else(|| {
                         not_yet(&format!("the local `{lname}`"), span)
                     })?;
@@ -1690,9 +2042,20 @@ impl<'a> Backend<'a> {
                     vars.insert(lname.clone(), var);
                 }
             }
+            // The enclosing locals this body can name, and how far up they are:
+            // `sl` points at the parent's frame, so a symbol one level up needs
+            // no hop at all (DESIGN §9.7).
+            let mut outer = HashMap::new();
+            for fr in &self.frames {
+                let hops = level.saturating_sub(fr.level + 1);
+                for (name, (off, ty)) in &fr.locals {
+                    outer.insert(name.clone(), (hops, *off, *ty));
+                }
+            }
             let mut l = Lower::new(
                 self, bcx, vars, slots, local_tys, var_params, open, strings_gv, imported,
-                imported_vars, imported_var_tys, gvs, frefs, rts, msgs, descs, roots, result,
+                imported_vars, imported_var_tys, gvs, frefs, rts, msgs, descs, roots, outer,
+                frame_addr, sl, level, path.clone(), result,
             );
             for (ty, addr) in regions {
                 l.desc_init(ty, addr, span)?;
@@ -1701,13 +2064,11 @@ impl<'a> Backend<'a> {
                 l.init_preamble(span)?;
             }
             l.stmts(body)?;
-            // A path that reaches the end of a body returns zero: the C back end
-            // zero-initialises its result accumulator for the same reason, since a
-            // function the checker accepted may reach no `RETURN` at all (W8.4)
-            // and the report defines no value for that path.
             if !l.ended() {
                 if result.is_some() {
-                    let rty = self.value_type(result.unwrap_or(TypeId(0))).unwrap_or(I32);
+                    let rty = self
+                        .value_type(result.unwrap_or(TypeId(0)))
+                        .unwrap_or(I32);
                     let zero = if rty == types::F32 {
                         l.bcx.ins().f32const(0.0)
                     } else {
@@ -1723,7 +2084,25 @@ impl<'a> Backend<'a> {
         }
         self.obj
             .define_function(id, &mut ctx)
-            .map_err(|e| host(format!("{e:?}")))
+            .map_err(|e| host(format!("{e:?}")))?;
+        // The nested procedures, with this frame on the stack: their bodies reach
+        // it through the link they were handed, and their own frames push onto
+        // the same stack.
+        if let Some(f) = frame {
+            self.frames.push(f);
+            let mut failed = None;
+            for q in nested {
+                if let Err(e) = self.lower_proc(q) {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            self.frames.pop();
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// The type a declaration's `TypeExpr` denotes: the semantic pass recorded
@@ -1808,6 +2187,18 @@ struct Lower<'b, 'f, 'a> {
     imported_var_tys: HashMap<String, TypeId>,
     /// The narrowing a type-`CASE` arm gives the case variable (report §9.5).
     narrow: Vec<HashMap<String, TypeId>>,
+    /// The enclosing procedures' locals, by name: how many links to walk from
+    /// `sl` to reach the frame that holds one, its offset there, and its type.
+    outer: HashMap<String, (usize, u64, TypeId)>,
+    /// This procedure's own frame (when it owns one), and the static link it was
+    /// handed (when it is nested).
+    frame: Option<ir::Value>,
+    sl: Option<ir::Value>,
+    /// This procedure's lexical level, which is what a nested call's link is
+    /// computed from, and its lexical path, which is what its symbols are keyed
+    /// by.
+    level: usize,
+    path: String,
     /// The result type, which is what `RETURN` answers with.
     result: Option<TypeId>,
     /// The loops an `EXIT` leaves, innermost last.
@@ -1836,6 +2227,11 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         msgs: HashMap<Msg, ir::GlobalValue>,
         descs: HashMap<TypeId, ir::GlobalValue>,
         roots: HashMap<String, (ir::GlobalValue, i32)>,
+        outer: HashMap<String, (usize, u64, TypeId)>,
+        frame: Option<ir::Value>,
+        sl: Option<ir::Value>,
+        level: usize,
+        path: String,
         result: Option<TypeId>,
     ) -> Lower<'b, 'f, 'a> {
         Lower {
@@ -1857,6 +2253,11 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             descs,
             roots,
             narrow: Vec::new(),
+            outer,
+            frame,
+            sl,
+            level,
+            path,
             result,
             loops: Vec::new(),
         }
@@ -2060,6 +2461,20 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 self.bcx.ins().symbol_value(self.b.ptr, gv),
                 self.narrowed(name, ty),
             )
+        } else if let Some((hops, offset, ty)) = self.outer.get(name).copied() {
+            // An enclosing local: walk the static links `hops` times from the
+            // link this procedure was handed (DESIGN §9.7: `sl` points at the
+            // parent's frame, so one level up is no hop at all).
+            let mut link = self
+                .sl
+                .ok_or_else(|| not_yet(&format!("the enclosing local `{name}`"), span))?;
+            for _ in 0..hops {
+                link = self
+                    .bcx
+                    .ins()
+                    .load(self.b.ptr, ir::MemFlagsData::new(), link, 0);
+            }
+            Place::Addr(self.bcx.ins().iadd_imm_s(link, offset as i64), ty)
         } else {
             return Err(not_yet(&format!("the designator `{name}`"), span));
         };
@@ -2299,12 +2714,19 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 Ok(())
             }
             Place::Addr(a, t) => {
-                if self.b.value_type(*t).is_none() {
-                    return Err(not_yet(
-                        &format!("an assignment to {}", type_name(self.b.types.get(*t))),
-                        span,
-                    ));
-                }
+                let want = match self.b.value_type(*t) {
+                    Some(w) => w,
+                    None => {
+                        return Err(not_yet(
+                            &format!("an assignment to {}", type_name(self.b.types.get(*t))),
+                            span,
+                        ))
+                    }
+                };
+                // A store's width is the *destination's*, as C's assignment
+                // conversion makes it (`w := ADR(x) - ADR(y)` narrows).
+                let from = self.value_width(v);
+                let v = self.coerce(v, from, want);
                 self.bcx.ins().store(ir::MemFlagsData::new(), v, *a, 0);
                 Ok(())
             }
@@ -2755,8 +3177,12 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         let head = self.bcx.create_block();
         let after = self.bcx.create_block();
         self.jump_to(head);
+        // Each guard is tested in a block of its own — the C back end's
+        // `if … else if … else break` — because a block can be *entered* once:
+        // only the loop's back edge jumps to `head` again.
+        let mut test = head;
         for (cond, body) in arms {
-            self.bcx.switch_to_block(head);
+            self.bcx.switch_to_block(test);
             let yes = self.bcx.create_block();
             let no = self.bcx.create_block();
             self.branch(cond, yes, no)?;
@@ -2765,8 +3191,9 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             self.stmts(body)?;
             self.loops.pop();
             self.jump_to(head);
-            self.bcx.switch_to_block(no);
+            test = no;
         }
+        self.bcx.switch_to_block(test);
         self.jump_to(after);
         self.bcx.switch_to_block(after);
         Ok(())
@@ -2869,7 +3296,10 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             return self.type_case(subject, arms, span);
         }
         match self.b.types.get(ty) {
-            Type::Basic(Basic::Integer) | Type::Basic(Basic::Boolean) => {}
+            Type::Basic(Basic::Integer)
+            | Type::Basic(Basic::Boolean)
+            | Type::Basic(Basic::Char)
+            | Type::Basic(Basic::Byte) => {}
             other => return Err(not_yet(&format!("a CASE over {}", type_name(other)), span)),
         }
         let value = self.expr(subject)?;
@@ -2883,7 +3313,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 continue;
             }
             self.bcx.switch_to_block(pending);
-            let test = self.label_test(value, arm)?;
+            let test = self.label_test(value, arm, self.b.unsigned(ty))?;
             let body_b = self.bcx.create_block();
             let next = self.bcx.create_block();
             self.bcx.ins().brif(test, body_b, &[], next, &[]);
@@ -2916,7 +3346,19 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// Whether a scalar subject is one of an arm's labels: an equality for a
     /// single label, an interval for a range, and a disjunction of those for the
     /// labels that share the arm.
-    fn label_test(&mut self, value: ir::Value, arm: &CaseArm) -> Result<ir::Value, Diagnostic> {
+    fn label_test(
+        &mut self,
+        value: ir::Value,
+        arm: &CaseArm,
+        unsigned: bool,
+    ) -> Result<ir::Value, Diagnostic> {
+        // A range over an unsigned subject (`CHAR`, `BYTE`) compares unsigned,
+        // which is report §8.2.4's ordinal order.
+        let (ge, le) = if unsigned {
+            (IntCC::UnsignedGreaterThanOrEqual, IntCC::UnsignedLessThanOrEqual)
+        } else {
+            (IntCC::SignedGreaterThanOrEqual, IntCC::SignedLessThanOrEqual)
+        };
         let mut test: Option<ir::Value> = None;
         for l in arm.labels.as_deref().unwrap_or(&[]) {
             let lo = case_label(&l.lo, arm.span)?;
@@ -2927,15 +3369,8 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                     if hi == lo {
                         self.bcx.ins().icmp_imm_s(IntCC::Equal, value, i64::from(lo))
                     } else {
-                        let a = self.bcx.ins().icmp_imm_s(
-                            IntCC::SignedGreaterThanOrEqual,
-                            value,
-                            i64::from(lo),
-                        );
-                        let b = self
-                            .bcx
-                            .ins()
-                            .icmp_imm_s(IntCC::SignedLessThanOrEqual, value, i64::from(hi));
+                        let a = self.bcx.ins().icmp_imm_s(ge, value, i64::from(lo));
+                        let b = self.bcx.ins().icmp_imm_s(le, value, i64::from(hi));
                         self.bcx.ins().band(a, b)
                     }
                 }
@@ -3086,6 +3521,17 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// A call used as a statement: a procedure of this module, or one of the
     /// predeclared proper procedures this slice lowers — `ASSERT` and `NEW`.
     fn call_stmt(&mut self, d: &Designator) -> Result<(), Diagnostic> {
+        // report §11.1's SYSTEM proper procedures come first: their names are
+        // qualified, so nothing else can look them up.
+        if let Some(entry) = self.system_entry(&d.base).map(str::to_string) {
+            let args = self.call_args(d)?.to_vec();
+            match entry.as_str() {
+                "GET" => return self.sys_get(&args, d.span),
+                "PUT" => return self.sys_put(&args, d.span),
+                "COPY" => return self.sys_copy(&args, d.span),
+                _ => return Err(not_yet(&format!("SYSTEM.{entry}"), d.span)),
+            }
+        }
         let args = self.call_args(d)?.to_vec();
         // A call to another module's procedure: the symbol is the C back end's
         // (`Texts__WriteString`), and its ABI is the interface's — the checker
@@ -3098,8 +3544,12 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             return Ok(());
         }
         let name = self.base_name(d)?;
-        if let Some(fref) = self.frefs.get(name).copied() {
-            let vals = self.pass_args(d, &args)?;
+        let key = self.callee_key(name);
+        if let Some(fref) = key.as_ref().and_then(|k| self.frefs.get(k)).copied() {
+            let mut vals = self.pass_args(d, &args)?;
+            if let Some(link) = self.callee_link(name, d.span)? {
+                vals.insert(0, link);
+            }
             self.bcx.ins().call(fref, &vals);
             return Ok(());
         }
@@ -3118,6 +3568,29 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                     return Ok(());
                 }
                 "NEW" => return self.new_stmt(&args, d.span),
+                "PACK" | "UNPK" => {
+                    // Both take their operands' *storage* (report §10.2), so each
+                    // actual has to be an address — which is why a local scalar
+                    // that is packed lives in a frame slot (`address_taken`).
+                    // `PACK(x, n)` scales x by 2^n, so only x's storage is
+                    // handed over; `UNPK(x, n)` writes both (report §10.2).
+                    let place = self.actual_place(&args[0])?;
+                    let (x, _) = self.address_of(&place, args[0].span)?;
+                    let second = match args.get(1) {
+                        Some(a) => {
+                            if name == "PACK" {
+                                self.expr(a)?
+                            } else {
+                                let place = self.actual_place(a)?;
+                                self.address_of(&place, a.span)?.0
+                            }
+                        }
+                        None => return Err(not_yet(&format!("{name} without an exponent"), d.span)),
+                    };
+                    let fref = self.rt_ref(if name == "PACK" { Rt::Pack } else { Rt::Unpk });
+                    self.bcx.ins().call(fref, &[x, second]);
+                    return Ok(());
+                }
                 "INC" | "DEC" | "INCL" | "EXCL" => {
                     let target = args
                         .first()
@@ -3159,14 +3632,43 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         ))
     }
 
+    /// The static link a nested callee expects as its first argument: this
+    /// procedure's own frame when the callee is our child, and otherwise the
+    /// frame of the callee's parent, reached by walking the links (DESIGN §9.7).
+    fn callee_link(&mut self, name: &str, span: Span) -> Result<Option<ir::Value>, Diagnostic> {
+        let key = self.callee_key(name).unwrap_or_else(|| name.to_string());
+        let callee_level = match self.b.proc_level.get(&key) {
+            Some(l) if *l > 1 => *l,
+            _ => return Ok(None),
+        };
+        let link = if callee_level == self.level + 1 {
+            self.frame
+                .ok_or_else(|| not_yet(&format!("the frame for the call to `{name}`"), span))?
+        } else {
+            let mut link = self
+                .sl
+                .ok_or_else(|| not_yet(&format!("the link for the call to `{name}`"), span))?;
+            for _ in 0..(self.level.saturating_sub(callee_level)) {
+                link = self
+                    .bcx
+                    .ins()
+                    .load(self.b.ptr, ir::MemFlagsData::new(), link, 0);
+            }
+            link
+        };
+        Ok(Some(link))
+    }
+
     /// A call's formal actual parameters: the resolver turned the parenthesised
     /// group into `Selector::Call` (DESIGN §5 D2).
     fn call_args<'d>(&self, d: &'d Designator) -> Result<&'d [Expr], Diagnostic> {
-        match d.sels.as_slice() {
-            [Selector::Call(args)] => Ok(args),
-            // A parameterless procedure is called without parentheses (report
-            // §9.2), so the resolver has no `Call` selector to make.
-            [] => Ok(&[]),
+        // The *last* selector is the call; anything before it is the callee's own
+        // path (`rc.f(21)` calls the procedure a record field holds). A
+        // parameterless procedure is called without parentheses (report §9.2), so
+        // the resolver has no `Call` selector to make.
+        match d.sels.last() {
+            Some(Selector::Call(args)) => Ok(args),
+            None => Ok(&[]),
             other => Err(not_yet(
                 &format!("the call `{}` ({other:?})", d.base.join(".")),
                 d.span,
@@ -3186,7 +3688,8 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         // with. Another module's: the checker recorded the callee's type at this
         // call site (`call_types`), which is the same source the C back end reads.
         let local = if d.base.len() == 1 {
-            self.b.proc_formals.get(&d.base[0]).cloned()
+            self.callee_key(&d.base[0])
+                .and_then(|k| self.b.proc_formals.get(&k).cloned())
         } else {
             None
         };
@@ -3199,12 +3702,24 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 })
                 .collect(),
             None => {
+                // A parameterless call written without parentheses has no type
+                // recorded (the checker only checks that it takes none), and
+                // there is nothing to pass.
+                if args.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // A call's type is recorded at its designator; when it is not,
+                // the *callee's* designator (the same one without the call
+                // selector) carries it — a record field of procedure type, say.
+                let mut callee_d = d.clone();
+                callee_d.sels.pop();
                 let pty = self
                     .b
                     .sema
                     .call_types
                     .get(&span_key(d.span))
                     .copied()
+                    .or_else(|| self.b.sema.type_at(callee_d.span, self.b.types))
                     .ok_or_else(|| {
                         not_yet(&format!("the call `{}`", d.base.join(".")), d.span)
                     })?;
@@ -3316,12 +3831,15 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         d: &Designator,
         span: Span,
     ) -> Result<ir::SigRef, Diagnostic> {
+        let mut callee_d = d.clone();
+        callee_d.sels.pop();
         let pty = self
             .b
             .sema
             .call_types
             .get(&span_key(d.span))
             .copied()
+            .or_else(|| self.b.sema.type_at(callee_d.span, self.b.types))
             .ok_or_else(|| not_yet(&format!("the call `{}`", d.base.join(".")), d.span))?;
         let (params, result) = match self.b.types.get(pty) {
             Type::Proc { params, result } => (params.clone(), *result),
@@ -3344,6 +3862,32 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         Ok(self.bcx.import_signature(sig))
     }
 
+    /// The key a call names a procedure by: the caller's own path first (a
+    /// child), then outward through the enclosing procedures (a sibling or an
+    /// uncle), and finally the bare name (a module-level procedure). An Oberon
+    /// procedure is visible from the scope that declares it inward, which is
+    /// exactly this walk.
+    fn callee_key(&self, name: &str) -> Option<String> {
+        let mut path = self.path.clone();
+        loop {
+            let key = if path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{path}__{name}")
+            };
+            if self.b.procs.contains_key(&key) {
+                return Some(key);
+            }
+            if path.is_empty() {
+                return None;
+            }
+            path = match path.rsplit_once("__") {
+                Some((outer, _)) => outer.to_string(),
+                None => String::new(),
+            };
+        }
+    }
+
     /// The reference to another module's procedure, which the body's walk
     /// declared.
     fn imported_ref(
@@ -3359,6 +3903,191 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         })
     }
 
+    /// The `SYSTEM.<entry>` a designator names, if it names one (DESIGN §9.10):
+    /// the import *alias* is what makes it an entry, so `IMPORT S := SYSTEM` works
+    /// too, and there is no `SYSTEM.sym` to resolve.
+    fn system_entry<'d>(&self, base: &'d [crate::ast::Ident]) -> Option<&'d str> {
+        if base.len() != 2 {
+            return None;
+        }
+        match alias_of(self.b.module, &base[0]) {
+            Some(m) if m == "SYSTEM" => Some(&base[1]),
+            _ => None,
+        }
+    }
+
+    /// The address a `SYSTEM` address expression denotes, as the C back end's
+    /// `intptr_t` — pointer-wide, because a stack address does not fit in an
+    /// `INTEGER` (R31's story), which is why this is the one expression whose IR
+    /// type is not its Oberon type.
+    fn address_value(&mut self, e: &Expr) -> Result<ir::Value, Diagnostic> {
+        let place = match &e.kind {
+            // `SYSTEM.ADR(x)` *is* the address, and an address is what an address
+            // expression hands on.
+            ExprKind::Designator(d) if matches!(d.sels.last(), Some(Selector::Call(_))) => {
+                return self.call_value(d, e.span)
+            }
+            ExprKind::Designator(d) => self.place(d, e.span)?,
+            _ => return Err(not_yet("the address of this expression", e.span)),
+        };
+        let (addr, _) = self.address_of(&place, e.span)?;
+        // The IR's pointer type *is* an integer of the target's width, so the
+        // address is already the `intptr_t` the C back end hands out.
+        Ok(addr)
+    }
+
+    /// Widen or narrow a value to the width a context wants. The C back end gets
+    /// this from C's own conversions — an `intptr_t` address compared with an
+    /// `int32_t` length, say — and the IR has no implicit ones.
+    /// The IR type a value *has*, which for an `ADR` is the pointer's width and
+    /// not the `INTEGER` its Oberon type says (R31's shape).
+    fn value_width(&self, v: ir::Value) -> ir::Type {
+        self.bcx.func.dfg.value_type(v)
+    }
+
+    /// Two values brought to one width, the wider of the two — C's usual
+    /// arithmetic conversions, which the emitted C relies on and the IR has no
+    /// implicit form of.
+    fn same_width(&mut self, a: ir::Value, b: ir::Value) -> (ir::Value, ir::Value) {
+        let (ta, tb) = (self.value_width(a), self.value_width(b));
+        if ta == tb {
+            return (a, b);
+        }
+        if ta.bits() < tb.bits() {
+            (self.coerce(a, ta, tb), b)
+        } else {
+            (a, self.coerce(b, tb, ta))
+        }
+    }
+
+    fn coerce(&mut self, v: ir::Value, from: ir::Type, to: ir::Type) -> ir::Value {
+        if from == to {
+            return v;
+        }
+        let (fb, tb) = (from.bits(), to.bits());
+        if fb < tb {
+            if from.is_float() || to.is_float() {
+                self.bcx.ins().fpromote(to, v)
+            } else {
+                self.bcx.ins().sextend(to, v)
+            }
+        } else if from.is_float() || to.is_float() {
+            self.bcx.ins().fdemote(to, v)
+        } else {
+            self.bcx.ins().ireduce(to, v)
+        }
+    }
+
+    /// `SYSTEM.SIZE(T)`: the extent the layout gives, in bytes (report §11.1).
+    fn size_of_type(&mut self, e: &Expr, span: Span) -> Result<ir::Value, Diagnostic> {
+        let t = match &e.kind {
+            ExprKind::Designator(d) => self
+                .qident_type(&d.base)
+                .or_else(|| self.b.sema.type_at(e.span, self.b.types))
+                // A *predeclared* type name (report §6.1): `SIZE(INTEGER)` is the
+                // case the report's own table shows, and there is no declaration
+                // to find it in.
+                .or_else(|| match d.base.as_slice() {
+                    [n] => match n.as_str() {
+                        "INTEGER" => Some(self.b.types.integer()),
+                        "CHAR" => Some(self.b.types.char()),
+                        "REAL" => Some(self.b.types.real()),
+                        "BOOLEAN" => Some(self.b.types.boolean()),
+                        "SET" => Some(self.b.types.set()),
+                        "BYTE" => Some(self.b.types.byte()),
+                        _ => None,
+                    },
+                    _ => None,
+                }),
+            _ => None,
+        };
+        let t = t.ok_or_else(|| not_yet("SIZE of this argument", span))?;
+        let size = self
+            .b
+            .layout(t)
+            .map(|l| l.size)
+            .ok_or_else(|| not_yet("SIZE of a type without a layout", span))?;
+        Ok(self.bcx.ins().iconst(I32, size as i64))
+    }
+
+    /// `SYSTEM.GET(a, v)`: one *word* read through the byte address, narrowed to
+    /// v's own type. A `REAL` is one word whose bit pattern *is* the value, so the
+    /// read is a reinterpretation and not `FLT`'s conversion.
+    fn sys_get(&mut self, args: &[Expr], span: Span) -> Result<(), Diagnostic> {
+        let addr = self.address_value(&args[0])?;
+        let dst = self.actual_place(&args[1])?;
+        let ty = place_ty(&dst);
+        let word = self
+            .bcx
+            .ins()
+            .load(I32, ir::MemFlagsData::new(), addr, 0);
+        let v = match self.b.types.get(ty) {
+            Type::Basic(Basic::Real) => self
+                .bcx
+                .ins()
+                .bitcast(types::F32, ir::MemFlagsData::new(), word),
+            Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) => {
+                let masked = self.bcx.ins().band_imm_s(word, 0xFF);
+                self.bcx.ins().ireduce(types::I8, masked)
+            }
+            _ => word,
+        };
+        self.write_place(&dst, v, span)
+    }
+
+    /// `SYSTEM.PUT(a, x)`: the *word* x occupies, stored through the byte address.
+    /// The width is x's, since PUT has no variable of its own to take one from — a
+    /// `CHAR` contributes its low byte and leaves the rest zeroed, a `REAL` is one
+    /// word whose bit pattern is the word, and an integer fills it.
+    fn sys_put(&mut self, args: &[Expr], span: Span) -> Result<(), Diagnostic> {
+        let addr = self.address_value(&args[0])?;
+        let x = self.expr(&args[1])?;
+        let ty = self.type_of(&args[1], span)?;
+        let word = match self.b.types.get(ty) {
+            Type::Basic(Basic::Real) => self
+                .bcx
+                .ins()
+                .bitcast(I32, ir::MemFlagsData::new(), x),
+            Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) => {
+                let widened = self.bcx.ins().uextend(I32, x);
+                self.bcx.ins().band_imm_s(widened, 0xFF)
+            }
+            _ => x,
+        };
+        self.bcx
+            .ins()
+            .store(ir::MemFlagsData::new(), word, addr, 0);
+        Ok(())
+    }
+
+    /// `SYSTEM.BIT(a, n)`: bit n of the word the address points at.
+    fn sys_bit(&mut self, args: &[Expr], _span: Span) -> Result<ir::Value, Diagnostic> {
+        let addr = self.address_value(&args[0])?;
+        let n = self.expr(&args[1])?;
+        let word = self
+            .bcx
+            .ins()
+            .load(I32, ir::MemFlagsData::new(), addr, 0);
+        let shifted = self.bcx.ins().ushr(word, n);
+        Ok(self.bcx.ins().band_imm_s(shifted, 1))
+    }
+
+    /// `SYSTEM.COPY(a, x, n)`: n *words*, four bytes each (report §11.1's `mem[a]`
+    /// is an array of words, and an address here is a byte address).
+    fn sys_copy(&mut self, args: &[Expr], _span: Span) -> Result<(), Diagnostic> {
+        // report §11.1's `COPY(x, y, n)` copies *from* x *to* y, which is the
+        // order the C back end's `memcpy(dst, src, …)` takes its own from.
+        let src = self.address_value(&args[0])?;
+        let dst = self.address_value(&args[1])?;
+        let n = self.expr(&args[2])?;
+        let words = self.bcx.ins().iconst(I32, 4);
+        let bytes = self.bcx.ins().imul(n, words);
+        let wide = self.bcx.ins().sextend(self.b.ptr, bytes);
+        let cfg = self.b.obj_config();
+        self.bcx.call_memcpy(cfg, dst, src, wide);
+        Ok(())
+    }
+
     /// Whether a name is a module-level object of this module (a variable or a
     /// procedure), which is what stops a predeclared name from being taken for
     /// the built-in.
@@ -3370,15 +4099,30 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// predeclared functions the fragment uses are IR (`ABS`, `ODD` and the three
     /// shifts), and a procedure of this module is a call.
     fn call_value(&mut self, d: &Designator, span: Span) -> Result<ir::Value, Diagnostic> {
+        // report §11.1's SYSTEM functions, before anything else: the alias is what
+        // makes the name an entry (DESIGN §9.10).
+        if let Some(entry) = self.system_entry(&d.base).map(str::to_string) {
+            let args = self.call_args(d)?.to_vec();
+            return match entry.as_str() {
+                "ADR" => self.address_value(&args[0]),
+                "SIZE" => self.size_of_type(&args[0], span),
+                "BIT" => self.sys_bit(&args, span),
+                _ => Err(not_yet(&format!("SYSTEM.{entry}"), span)),
+            };
+        }
         // A user's own `MIN` records nothing, so shadowing needs no check: the C
         // back end reads the same table the same way.
         if let Some(v) = self.b.sema.extreme_at(span) {
             return Ok(self.bcx.ins().iconst(I32, i64::from(v)));
         }
         let name = self.base_name(d)?.to_string();
-        if let Some(fref) = self.frefs.get(&name).copied() {
+        let key = self.callee_key(&name);
+        if let Some(fref) = key.as_ref().and_then(|k| self.frefs.get(k)).copied() {
             let args = self.call_args(d)?.to_vec();
-            let vals = self.pass_args(d, &args)?;
+            let mut vals = self.pass_args(d, &args)?;
+            if let Some(link) = self.callee_link(&name, d.span)? {
+                vals.insert(0, link);
+            }
             let call = self.bcx.ins().call(fref, &vals);
             return self
                 .bcx
@@ -3387,94 +4131,86 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 .copied()
                 .ok_or_else(|| not_yet(&format!("the call to `{name}` as a value"), span));
         }
-        // A call through a procedure *variable* (or a procedure parameter): the
-        // callee is a value, so the call is indirect and carries the signature
-        // the checker recorded at this call site.
-        if self.vars.contains_key(&name) || self.b.vars.contains_key(&name) {
-            let place = self.named_place(&name, span)?;
-            let (callee, _) = self.pointer_value(&place, span)?;
-            let sigref = self.proc_signature(d, span)?;
+        // A predeclared function, unless the program declared its own name for
+        // something else (report §4's visibility rule).
+        if !self.vars.contains_key(&name) && !self.shadows(&name) {
             let args = self.call_args(d)?.to_vec();
-            let vals = self.pass_args(d, &args)?;
-            let call = self.bcx.ins().call_indirect(sigref, callee, &vals);
-            return self
-                .bcx
-                .inst_results(call)
-                .first()
-                .copied()
-                .ok_or_else(|| not_yet(&format!("the call to `{name}` as a value"), span));
+            match name.as_str() {
+                // `ABS` reads its operand once, so the IR's own conditional is
+                // enough; the C path needs a helper for exactly the same reason.
+                "ABS" => {
+                    let x = self.expr(&args[0])?;
+                    if self.b.is_real(self.type_of(&args[0], span)?) {
+                        return Ok(self.bcx.ins().fabs(x));
+                    }
+                    let neg = self.bcx.ins().ineg(x);
+                    let below = self.bcx.ins().icmp_imm_s(IntCC::SignedLessThan, x, 0);
+                    return Ok(self.bcx.ins().select(below, neg, x));
+                }
+                "ODD" => {
+                    let x = self.expr(&args[0])?;
+                    return Ok(self.bcx.ins().band_imm_s(x, 1));
+                }
+                "LSL" | "ASR" | "ROR" => {
+                    let x = self.expr(&args[0])?;
+                    let n = self.expr(&args[1])?;
+                    return self.shift(&name, x, n);
+                }
+                "FLOOR" => {
+                    let x = self.expr(&args[0])?;
+                    let floor = self.bcx.ins().floor(x);
+                    return Ok(self.bcx.ins().fcvt_to_sint_sat(I32, floor));
+                }
+                "FLT" => {
+                    let x = self.expr(&args[0])?;
+                    return Ok(self.bcx.ins().fcvt_from_sint(types::F32, x));
+                }
+                "ORD" => {
+                    let t = self.type_of(&args[0], span)?;
+                    if let ExprKind::Str(text) = &args[0].kind {
+                        let first = text.as_bytes().first().copied().unwrap_or(0);
+                        return Ok(self.bcx.ins().iconst(I32, i64::from(first)));
+                    }
+                    let x = self.expr(&args[0])?;
+                    if self.b.value_type(t) == Some(types::I8) {
+                        return Ok(self.bcx.ins().uextend(I32, x));
+                    }
+                    return Ok(x);
+                }
+                "CHR" => {
+                    let x = self.expr(&args[0])?;
+                    return Ok(self.bcx.ins().ireduce(types::I8, x));
+                }
+                "LEN" => {
+                    let n = match &args[0].kind {
+                        ExprKind::Designator(d) => d.base[0].clone(),
+                        _ => return Err(not_yet("LEN of this expression", span)),
+                    };
+                    match self.open.get(&n) {
+                        Some((_, len, _)) => return Ok(*len),
+                        None => return Err(not_yet("LEN of something that is not an array", span)),
+                    }
+                }
+                _ => {}
+            }
         }
+        // A call through a procedure *value*: a variable or a parameter. A
+        // procedure-valued *field* (`rc.f(21)`) is the same shape one step on and
+        // is refused rather than lowered wrongly: it is the last case
+        // `Regress.mod` needs, and the tree says so by name.
+        let mut callee_d = d.clone();
+        callee_d.sels.pop();
+        let place = self.place(&callee_d, span)?;
+        let (callee, _) = self.pointer_value(&place, span)?;
+        let sigref = self.proc_signature(d, span)?;
         let args = self.call_args(d)?.to_vec();
-        match name.as_str() {
-            // `ABS` reads its operand once, so the IR's own conditional is
-            // enough; the C path needs a helper for exactly the same reason.
-            "ABS" => {
-                let x = self.expr(&args[0])?;
-                // `ABS` keeps its operand's type (report §10.2), and reads it
-                // once — which is why the C path needs a helper for the integer
-                // case and why this is a single IR conditional.
-                if self.b.is_real(self.type_of(&args[0], span)?) {
-                    return Ok(self.bcx.ins().fabs(x));
-                }
-                let neg = self.bcx.ins().ineg(x);
-                let below = self.bcx.ins().icmp_imm_s(IntCC::SignedLessThan, x, 0);
-                Ok(self.bcx.ins().select(below, neg, x))
-            }
-            // `FLOOR(x)` is `x DIV 2^0`'s cousin: the C back end truncates
-            // `rt_floor`'s float, so a value outside INTEGER's range is
-            // undefined there; here it saturates, which is a defined answer.
-            "FLOOR" => {
-                let x = self.expr(&args[0])?;
-                let floor = self.bcx.ins().floor(x);
-                Ok(self.bcx.ins().fcvt_to_sint_sat(I32, floor))
-            }
-            // `FLT(i)`: the C back end's `((float)(i))`.
-            "FLT" => {
-                let x = self.expr(&args[0])?;
-                Ok(self.bcx.ins().fcvt_from_sint(types::F32, x))
-            }
-            // `ORD` of a CHAR reads it *unsigned* (§9.5), and of a BOOLEAN is
-            // the 0/1 the C back end already holds.
-            "ORD" => {
-                let t = self.type_of(&args[0], span)?;
-                if let ExprKind::Str(text) = &args[0].kind {
-                    let first = text.as_bytes().first().copied().unwrap_or(0);
-                    return Ok(self.bcx.ins().iconst(I32, i64::from(first)));
-                }
-                let x = self.expr(&args[0])?;
-                if self.b.types.is_char(t) || self.b.types.is_char_like(t) {
-                    return Ok(self.bcx.ins().uextend(I32, x));
-                }
-                Ok(x)
-            }
-            // `CHR(x)` truncates like the C back end's `(char)x`.
-            "CHR" => {
-                let x = self.expr(&args[0])?;
-                Ok(self.bcx.ins().ireduce(types::I8, x))
-            }
-            // `LEN` of a fixed array is folded by the checker; of an open array
-            // it is the hidden length the caller passed (§9.2).
-            "LEN" => {
-                let name = match &args[0].kind {
-                    ExprKind::Designator(d) => d.base[0].clone(),
-                    _ => return Err(not_yet("LEN of this expression", span)),
-                };
-                match self.open.get(&name) {
-                    Some((_, len, _)) => Ok(*len),
-                    None => Err(not_yet("LEN of something that is not an array", span)),
-                }
-            }
-            "ODD" => {
-                let x = self.expr(&args[0])?;
-                Ok(self.bcx.ins().band_imm_s(x, 1))
-            }
-            "LSL" | "ASR" | "ROR" => {
-                let x = self.expr(&args[0])?;
-                let n = self.expr(&args[1])?;
-                self.shift(&name, x, n)
-            }
-            _ => Err(not_yet(&format!("the predeclared function `{name}`"), span)),
-        }
+        let vals = self.pass_args(d, &args)?;
+        let call = self.bcx.ins().call_indirect(sigref, callee, &vals);
+        self.bcx
+            .inst_results(call)
+            .first()
+            .copied()
+            .ok_or_else(|| not_yet(&format!("the call to `{name}` as a value"), span))
     }
 
     /// The report's shifts (report §8.2.2) — the one rule the IR does not share
@@ -3598,6 +4334,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         if value_type == types::F32 {
             return Ok(self.bcx.ins().fcmp(float_cc(op), a, b));
         }
+        let (a, b) = self.same_width(a, b);
         let cc = if self.b.unsigned(lt) {
             unsigned_cc(op)
         } else {
@@ -3802,9 +4539,13 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         if op == BinOp::In {
             let shift = self.bcx.ins().band_imm_s(a, 31);
             let word = self.bcx.ins().ushr(b, shift);
-            let v = self.bcx.ins().band_imm_s(word, 1);
-            return Ok(self.bcx.ins().uextend(I32, v));
+            // The mask test's answer is already a 0/1 word, which is what the C
+            // back end's `(int32_t)(…)` narrows to.
+            return Ok(self.bcx.ins().band_imm_s(word, 1));
         }
+        // One width for both: an address difference is pointer-wide, and its
+        // other operand may be an `INTEGER`.
+        let (a, b) = self.same_width(a, b);
         Ok(match op {
             BinOp::Add => self.bcx.ins().iadd(a, b),
             BinOp::Sub => self.bcx.ins().isub(a, b),
@@ -3995,7 +4736,11 @@ fn case_label(l: &CaseLabel, span: Span) -> Result<i32, Diagnostic> {
     match l {
         CaseLabel::Int(v) => Ok(*v as i32),
         CaseLabel::Char(c) => Ok(i32::from(*c)),
-        CaseLabel::Str(_) | CaseLabel::Named(_) => Err(not_yet("a non-integer CASE label", span)),
+        // A string label is a `CHAR` one (report §9.5's appendix: the labels of a
+        // character `CASE` are written as one-character strings), which is the
+        // byte the C back end takes too.
+        CaseLabel::Str(s) => Ok(i32::from(s.as_bytes().first().copied().unwrap_or(0))),
+        CaseLabel::Named(_) => Err(not_yet("a type CASE label", span)),
     }
 }
 

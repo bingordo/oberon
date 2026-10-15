@@ -1488,7 +1488,19 @@ written down):
   rows remain. Done when `BACKEND=clif bash e2e/run.sh`
   passes every row the C path does — 126 as of W9.2b, and the harness is there to
   say so.
-  **Three and a half of the four are done.** Nested procedures with static links
+  **Everything but one row.** `SYSTEM` is in (all six entries on §9.10's address
+  model, with the C's implicit conversions made explicit in the IR — an `intptr_t`
+  address compared with an `INTEGER` is what needs it), and so is the call through
+  a procedure-valued record field. **`BACKEND=clif bash e2e/run.sh`: 125 pass, 1
+  fails** — `regressions-all-hold`, where `Regress.Run`'s nested `localRecord`
+  calls its nested `which` and `which` reads an enclosing local through a *zero*
+  static link (ASan: `SEGV on address 0x8` in `Regress__localRecord__which`). That
+  is a crash rather than a refusal, which the back end's stance does not allow, so
+  the next run fixes it or refuses that shape by name. The C path is 126/0, the
+  corpus passes on both back ends, and the gate is green.
+
+  *Superseded note.* The rest of this entry describes what the earlier runs of this
+  slice landed. Nested procedures with static links
   are in (a frame per nesting procedure, the hidden link parameter, link walking
   for an enclosing local, links passed at nested calls, symbols keyed by lexical
   path), with `PACK`/`UNPK`, a `CASE` over `CHAR`/`BYTE` and one block per `WHILE`

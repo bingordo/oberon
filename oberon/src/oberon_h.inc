@@ -337,6 +337,8 @@ void ob_rt_trap_pos(const char *msg, int32_t at);
 int32_t ob_rt_is(const ObDesc *d, const ObDesc *target);
 void ob_rt_rec_copy(void *dst, const void *src, int32_t n, const ObDesc *self);
 void ob_rt_guard_at(int32_t cond, int32_t at);
+void ob_rt_pack(float *x, int32_t n);
+void ob_rt_unpk(float *x, int32_t *n);
 uint32_t ob_rt_set(int32_t a, int32_t b);
 void ob_rt_strcopy(char *dst, int32_t n, const char *src);
 int32_t ob_rt_charcmp(const char *a, int32_t na, const char *b, int32_t nb);

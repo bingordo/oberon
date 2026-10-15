@@ -2460,6 +2460,202 @@ the output row, reaches `SYSTEM` through the module's own use. Nested procedures
 with static links and `SYSTEM` are what is left of W9.2d; the tree refuses both by
 name, with the byte, so nothing is half-lowered while they are missing.
 
+### Nested procedures, static links, and the rest of the scope machinery **[in part; `PLAN.md` W9.2d]**
+
+§9.7's scheme, mirrored: a procedure that declares nested procedures owns a
+**frame** — the static link first, then its parameters and its locals, each at the
+next multiple of its own alignment, exactly the C back end's `struct F_<path>` —
+and every one of its locals lives in it, because a nested procedure reaches them
+through it. A nested procedure takes the enclosing frame as a hidden first
+parameter (the C back end adds it for *every* nested procedure, and `csmoke` pins
+that), and an enclosing local is reached by walking the links: `sl` points at the
+*parent's* frame, so a symbol one level up needs no hop and one three levels up
+walks two. A call to a nested procedure passes the link — the caller's own frame
+for a child, and otherwise the frame of the callee's parent reached by walking —
+and the *symbols* are keyed by the lexical path (`Torture__outer__inner`), because
+two procedures called `inner` in different parents are different procedures.
+
+*Found here*, and the reason `Regress.mod` is still refused: a call through a
+procedure-valued **field** (`rc.f(21)`) is the same shape one step further on, and
+the lowering refuses it by name rather than lower it wrongly — the first version
+of the indirect-call path crashed on it, which is exactly the kind of thing the
+`e2e` rows exist to catch.
+
+The other language pieces this slice needed and got, each because a row refused
+by name pointed at it: `PACK`/`UNPK` (through two more object-boundary entry
+points, `ob_rt_pack`/`ob_rt_unpk`, taking their operands' storage — so a local
+scalar that is packed lives in a frame slot), a `CASE` over `CHAR`/`BYTE` with the
+*unsigned* interval tests and one-character-string labels (report §9.5's appendix),
+`ORD` widening only a one-byte ordinal, and one block per `WHILE` guard (a block
+can be entered once: only the loop's back edge jumps to the header again — a
+multi-guard `WHILE` in `Torture.mod` is what found that).
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **119 checks pass, 7 fail**
+(the earlier 67 was the run stopping early at a row that greps emitted C; that row
+now reports instead, so the distance is visible). The seven: `regressions-all-hold`
+(the procedure-valued field above), four `SYSTEM` rows (`ADR`/`SIZE`/`BIT`/`GET`/
+`PUT`/`COPY`, plus the interface and shadowing rows around the builtin import), and
+`the-pointee-keeps-its-name-on-both-sides` (an anonymous composite's name across a
+module boundary). `SYSTEM` is the remaining item; the tree refuses it by name.
+
+### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Nested procedures, static links, and the rest of the scope machinery **[in part; `PLAN.md` W9.2d]**
+
+§9.7's scheme, mirrored: a procedure that declares nested procedures owns a
+**frame** — the static link first, then its parameters and its locals, each at the
+next multiple of its own alignment, exactly the C back end's `struct F_<path>` —
+and every one of its locals lives in it, because a nested procedure reaches them
+through it. A nested procedure takes the enclosing frame as a hidden first
+parameter (the C back end adds it for *every* nested procedure, and `csmoke` pins
+that), and an enclosing local is reached by walking the links: `sl` points at the
+*parent's* frame, so a symbol one level up needs no hop and one three levels up
+walks two. A call to a nested procedure passes the link — the caller's own frame
+for a child, and otherwise the frame of the callee's parent reached by walking —
+and the *symbols* are keyed by the lexical path (`Torture__outer__inner`), because
+two procedures called `inner` in different parents are different procedures.
+
+*Found here*, and the reason `Regress.mod` is still refused: a call through a
+procedure-valued **field** (`rc.f(21)`) is the same shape one step further on, and
+the lowering refuses it by name rather than lower it wrongly — the first version
+of the indirect-call path crashed on it, which is exactly the kind of thing the
+`e2e` rows exist to catch.
+
+The other language pieces this slice needed and got, each because a row refused
+by name pointed at it: `PACK`/`UNPK` (through two more object-boundary entry
+points, `ob_rt_pack`/`ob_rt_unpk`, taking their operands' storage — so a local
+scalar that is packed lives in a frame slot), a `CASE` over `CHAR`/`BYTE` with the
+*unsigned* interval tests and one-character-string labels (report §9.5's appendix),
+`ORD` widening only a one-byte ordinal, and one block per `WHILE` guard (a block
+can be entered once: only the loop's back edge jumps to the header again — a
+multi-guard `WHILE` in `Torture.mod` is what found that).
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **119 checks pass, 7 fail**
+(the earlier 67 was the run stopping early at a row that greps emitted C; that row
+now reports instead, so the distance is visible). The seven: `regressions-all-hold`
+(the procedure-valued field above), four `SYSTEM` rows (`ADR`/`SIZE`/`BIT`/`GET`/
+`PUT`/`COPY`, plus the interface and shadowing rows around the builtin import), and
+`the-pointee-keeps-its-name-on-both-sides` (an anonymous composite's name across a
+module boundary). `SYSTEM` is the remaining item; the tree refuses it by name.
+
+### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Imported descriptors, procedure values, and what is left **[in part; `PLAN.md` W9.2d]**
 
 * **A type that came from an interface is not this module's to define.** Its `TD_`
@@ -2486,6 +2682,202 @@ and 3 at the start of this slice; the C path is 126/0). Both remaining rows are
 the output row, reaches `SYSTEM` through the module's own use. Nested procedures
 with static links and `SYSTEM` are what is left of W9.2d; the tree refuses both by
 name, with the byte, so nothing is half-lowered while they are missing.
+
+### Nested procedures, static links, and the rest of the scope machinery **[in part; `PLAN.md` W9.2d]**
+
+§9.7's scheme, mirrored: a procedure that declares nested procedures owns a
+**frame** — the static link first, then its parameters and its locals, each at the
+next multiple of its own alignment, exactly the C back end's `struct F_<path>` —
+and every one of its locals lives in it, because a nested procedure reaches them
+through it. A nested procedure takes the enclosing frame as a hidden first
+parameter (the C back end adds it for *every* nested procedure, and `csmoke` pins
+that), and an enclosing local is reached by walking the links: `sl` points at the
+*parent's* frame, so a symbol one level up needs no hop and one three levels up
+walks two. A call to a nested procedure passes the link — the caller's own frame
+for a child, and otherwise the frame of the callee's parent reached by walking —
+and the *symbols* are keyed by the lexical path (`Torture__outer__inner`), because
+two procedures called `inner` in different parents are different procedures.
+
+*Found here*, and the reason `Regress.mod` is still refused: a call through a
+procedure-valued **field** (`rc.f(21)`) is the same shape one step further on, and
+the lowering refuses it by name rather than lower it wrongly — the first version
+of the indirect-call path crashed on it, which is exactly the kind of thing the
+`e2e` rows exist to catch.
+
+The other language pieces this slice needed and got, each because a row refused
+by name pointed at it: `PACK`/`UNPK` (through two more object-boundary entry
+points, `ob_rt_pack`/`ob_rt_unpk`, taking their operands' storage — so a local
+scalar that is packed lives in a frame slot), a `CASE` over `CHAR`/`BYTE` with the
+*unsigned* interval tests and one-character-string labels (report §9.5's appendix),
+`ORD` widening only a one-byte ordinal, and one block per `WHILE` guard (a block
+can be entered once: only the loop's back edge jumps to the header again — a
+multi-guard `WHILE` in `Torture.mod` is what found that).
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **119 checks pass, 7 fail**
+(the earlier 67 was the run stopping early at a row that greps emitted C; that row
+now reports instead, so the distance is visible). The seven: `regressions-all-hold`
+(the procedure-valued field above), four `SYSTEM` rows (`ADR`/`SIZE`/`BIT`/`GET`/
+`PUT`/`COPY`, plus the interface and shadowing rows around the builtin import), and
+`the-pointee-keeps-its-name-on-both-sides` (an anonymous composite's name across a
+module boundary). `SYSTEM` is the remaining item; the tree refuses it by name.
+
+### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Nested procedures, static links, and the rest of the scope machinery **[in part; `PLAN.md` W9.2d]**
+
+§9.7's scheme, mirrored: a procedure that declares nested procedures owns a
+**frame** — the static link first, then its parameters and its locals, each at the
+next multiple of its own alignment, exactly the C back end's `struct F_<path>` —
+and every one of its locals lives in it, because a nested procedure reaches them
+through it. A nested procedure takes the enclosing frame as a hidden first
+parameter (the C back end adds it for *every* nested procedure, and `csmoke` pins
+that), and an enclosing local is reached by walking the links: `sl` points at the
+*parent's* frame, so a symbol one level up needs no hop and one three levels up
+walks two. A call to a nested procedure passes the link — the caller's own frame
+for a child, and otherwise the frame of the callee's parent reached by walking —
+and the *symbols* are keyed by the lexical path (`Torture__outer__inner`), because
+two procedures called `inner` in different parents are different procedures.
+
+*Found here*, and the reason `Regress.mod` is still refused: a call through a
+procedure-valued **field** (`rc.f(21)`) is the same shape one step further on, and
+the lowering refuses it by name rather than lower it wrongly — the first version
+of the indirect-call path crashed on it, which is exactly the kind of thing the
+`e2e` rows exist to catch.
+
+The other language pieces this slice needed and got, each because a row refused
+by name pointed at it: `PACK`/`UNPK` (through two more object-boundary entry
+points, `ob_rt_pack`/`ob_rt_unpk`, taking their operands' storage — so a local
+scalar that is packed lives in a frame slot), a `CASE` over `CHAR`/`BYTE` with the
+*unsigned* interval tests and one-character-string labels (report §9.5's appendix),
+`ORD` widening only a one-byte ordinal, and one block per `WHILE` guard (a block
+can be entered once: only the loop's back edge jumps to the header again — a
+multi-guard `WHILE` in `Torture.mod` is what found that).
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **119 checks pass, 7 fail**
+(the earlier 67 was the run stopping early at a row that greps emitted C; that row
+now reports instead, so the distance is visible). The seven: `regressions-all-hold`
+(the procedure-valued field above), four `SYSTEM` rows (`ADR`/`SIZE`/`BIT`/`GET`/
+`PUT`/`COPY`, plus the interface and shadowing rows around the builtin import), and
+`the-pointee-keeps-its-name-on-both-sides` (an anonymous composite's name across a
+module boundary). `SYSTEM` is the remaining item; the tree refuses it by name.
+
+### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
+
+§9.10's address model, mirrored: an address is a *byte* address, and `ADR`'s value
+is as wide as the host's pointers — in the IR the pointer type *is* an integer of
+the target's width, so `ADR(x)` is the address itself and the one expression whose
+IR type is not its Oberon type (R31's story). `GET`/`PUT` move one *word* through
+it, narrowed or widened by the operand's own type — a `CHAR` contributes its low
+byte and zeroes the rest, a `REAL`'s word *is* its bit pattern (a `bitcast`, not
+`FLT`'s conversion) — `BIT` is bit `n` of the word at the address, `SIZE(T)` is the
+layout's extent (including the predeclared types, which no declaration names), and
+`COPY(x, y, n)` is `memcpy` of `n * 4` bytes, *from* x *to* y (report §11.1's own
+order, which is the opposite of `memcpy`'s argument order — the first version of
+this had it swapped, and `Sys.mod`'s `big[1] = 10000H` caught it).
+
+The C's implicit conversions are what the IR has no form of, so the lowerer now
+has one: two values compared or added are brought to the wider of their *actual* IR
+types, and a store narrows to the destination's — which is exactly what an
+`intptr_t` address compared with an `INTEGER` needs.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
+`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
+`localRecord` calls its nested `which`, and `which` reads an enclosing local
+through a *zero* static link (ASan: `SEGV on address 0x8` in
+`Regress__localRecord__which`), so a link is not being passed or not being
+received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
+specific to `Regress` (a nested procedure inside a procedure that is itself nested
+*and* uses a local record). It is a crash rather than a refusal, which is the one
+thing this back end's stance does not allow — the next run must either fix it or
+refuse that shape by name, and it is the only row left.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the

@@ -432,6 +432,14 @@ void ob_rt_rec_copy(void *dst, const void *src, int32_t n, const ObDesc *self) {
  * ("type guard failed at byte N"), which a lowered call cannot do, so the byte is
  * a parameter and the text is formatted here — byte for byte what that literal
  * prints, with `at` negative so the reporter adds no suffix of its own. */
+void ob_rt_pack(float *x, int32_t n) {
+    rt_pack(x, n);
+}
+
+void ob_rt_unpk(float *x, int32_t *n) {
+    rt_unpk(x, n);
+}
+
 void ob_rt_guard_at(int32_t cond, int32_t at) {
     if (!cond) {
         char msg[64];

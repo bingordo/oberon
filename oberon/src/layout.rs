@@ -308,7 +308,7 @@ pub fn ob_fld(pointer_bytes: u64) -> ObFld {
 
 /// The next multiple of `align` at or after `off`. `align` is a power of two, so
 /// this is the mask the C ABI's padding is.
-fn round_up(off: u64, align: u64) -> u64 {
+pub(crate) fn round_up(off: u64, align: u64) -> u64 {
     (off + align - 1) & !(align - 1)
 }
 
