@@ -652,8 +652,8 @@ END M.
         use crate::resolve::{reclassify, Names};
 
         let mut m = parse_module(RECLASSIFY).expect("module must parse");
-        let names = Names::collect(&m);
-        reclassify(&mut m, &names).expect("reclassification must succeed");
+        let mut names = Names::collect(&m);
+        reclassify(&mut m, &mut names).expect("reclassification must succeed");
 
         let value_of = |i: usize| match &m.body[i].kind {
             StmtKind::Assign { value, .. } => value.clone(),
@@ -723,8 +723,8 @@ END M.
         use crate::resolve::{reclassify, Names};
 
         let mut m = parse_module(KITCHEN_SINK).expect("kitchen sink must parse");
-        let names = Names::collect(&m);
-        reclassify(&mut m, &names).expect("reclassification must succeed");
+        let mut names = Names::collect(&m);
+        reclassify(&mut m, &mut names).expect("reclassification must succeed");
         // `CASE t OF Tree: ...` and `t(CenterNode)` inside the sink.
         let (mut guards, mut calls, mut args) = (0, 0, 0);
 
@@ -833,16 +833,16 @@ END M.
 
         let src = "MODULE M; VAR t: T; BEGIN CASE t OF NotAType: END END M.";
         let mut m = parse_module(src).expect("module must parse");
-        let names = Names::collect(&m);
-        let e = reclassify(&mut m, &names).expect_err("must be rejected");
+        let mut names = Names::collect(&m);
+        let e = reclassify(&mut m, &mut names).expect_err("must be rejected");
         assert!(e.message.contains("NotAType"), "{}", e.message);
 
         // The same shape with a declared type is accepted.
         let src = "MODULE M; TYPE T = POINTER TO R; R = RECORD f: INTEGER END;
                    VAR t: T; BEGIN CASE t OF T: END END M.";
         let mut m = parse_module(src).expect("module must parse");
-        let names = Names::collect(&m);
-        reclassify(&mut m, &names).expect("`T` is a declared type");
+        let mut names = Names::collect(&m);
+        reclassify(&mut m, &mut names).expect("`T` is a declared type");
     }
 }
 
@@ -1380,6 +1380,26 @@ PROC Append(p: Writer; b: Buffer)\n"),
             .filter(|d| !d.is_error())
             .map(|d| d.message)
             .collect()
+    }
+
+    #[test]
+    fn an_inner_declaration_shadows_a_type_name_and_an_import_alias() {
+        // R17: the reclassification pass decided guard-vs-call and
+        // module-qualification from module-wide name sets, so an inner
+        // declaration did not shadow them. Both cases below were rejected before
+        // the pass became scope-aware: `Texts.f` was folded into a qualified name
+        // ("`Texts` is not a module") and `Q(T)` was read as a type guard
+        // ("`T` is not a type").
+        let shadowed_alias = "MODULE M;\n  IMPORT Texts;\n  TYPE R = RECORD f: INTEGER END;\n\
+  PROCEDURE Use;\n    VAR Texts: R;\n  BEGIN\n    Texts.f := 1\n  END Use;\nBEGIN Use END M.\n";
+        let e = errors(shadowed_alias, &report_interfaces());
+        assert!(e.is_empty(), "a local `Texts` shadows the import alias: {e:#?}");
+
+        let shadowed_type = "MODULE M;\n  TYPE T = RECORD a: INTEGER END;\n       P = POINTER TO T;\n\
+  VAR p: P;\n  PROCEDURE Q(x: INTEGER): INTEGER; BEGIN RETURN x END Q;\n\
+  PROCEDURE Use;\n    VAR T: INTEGER;\n  BEGIN\n    p := NIL;\n    T := Q(T)\n  END Use;\nBEGIN Use END M.\n";
+        let e = errors(shadowed_type, &[]);
+        assert!(e.is_empty(), "a local `T` shadows the type: {e:#?}");
     }
 
     #[test]

@@ -18,52 +18,72 @@
 //! * The leading selector is a module qualifier iff the base identifier is a
 //!   name bound by the module's import list.
 //!
-//! Only two name sets are needed: the type names visible at the designator and
-//! the import aliases. A production resolver keeps those in the scope chain; the
-//! prototype collects them once for the whole module, which is enough to prove
-//! the rule (an inner declaration can only *shadow* a type name, never change
-//! whether a given occurrence is one).
+//! Both decisions need the names visible *at that designator*: whether an
+//! identifier denotes a type, and whether it is bound by the module's import
+//! list. Those live in a scope chain here, not in one module-wide set, because an
+//! inner declaration shadows an outer one — a local variable named `Texts` is not
+//! the import alias, and a local `T` is not the type `T` (report §4; R17).
 
 use crate::ast::*;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-/// Names the prototype resolver needs. In the real resolver these live in the
-/// scope chain built by `resolve.rs`; the shadowing case is the only difference.
+/// One scope's bindings, by kind: only the two questions the pass asks are
+/// distinguished, but *every* declaration is recorded, because a variable or a
+/// constant of some name shadows a type or an import alias of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Type,
+    Module,
+    Other,
+}
+
+/// The scopes visible at the point being classified, innermost last. The
+/// outermost scope holds the predefined types and the module's own imports and
+/// declarations; a procedure body pushes its parameters and its own declarations.
 #[derive(Debug, Default)]
 pub struct Names {
-    pub types: HashSet<String>,
-    pub modules: HashSet<String>,
+    scopes: Vec<HashMap<String, Kind>>,
 }
 
 impl Names {
-    /// The six predefined type names of report §6.1 plus the module's own
-    /// imports and type declarations (recursively, including procedures).
+    fn push(&mut self, scope: HashMap<String, Kind>) {
+        self.scopes.push(scope);
+    }
+    fn pop(&mut self) {
+        self.scopes.pop();
+    }
+    /// The innermost binding of `name`, so an inner declaration shadows an outer.
+    fn lookup(&self, name: &str) -> Option<Kind> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name).copied())
+    }
+}
+
+impl Names {
+    /// The outermost scope: the predefined types of report §6.1, the module's
+    /// imports, and everything the module declares. Inner scopes are pushed by
+    /// the walk.
     pub fn collect(m: &Module) -> Names {
         let mut n = Names::default();
+        let mut scope: HashMap<String, Kind> = HashMap::new();
         for t in ["BOOLEAN", "CHAR", "INTEGER", "REAL", "BYTE", "SET"] {
-            n.types.insert(t.to_string());
+            scope.insert(t.to_string(), Kind::Type);
         }
         for imp in &m.imports {
-            n.modules.insert(imp.alias.clone());
+            scope.insert(imp.alias.clone(), Kind::Module);
         }
-        n.collect_decls(&m.decls);
+        decl_bindings(&m.decls, &mut scope);
+        n.push(scope);
         n
     }
 
-    fn collect_decls(&mut self, d: &Decls) {
-        for t in &d.types {
-            self.types.insert(t.name.clone());
-        }
-        for p in &d.procs {
-            self.collect_decls(&p.decls);
-        }
-    }
-
     fn is_type(&self, q: &QIdent) -> bool {
-        q.len() == 1 && self.types.contains(&q[0])
+        q.len() == 1 && self.lookup(&q[0]) == Some(Kind::Type)
     }
     fn is_module(&self, name: &str) -> bool {
-        self.modules.contains(name)
+        self.lookup(name) == Some(Kind::Module)
     }
 }
 
@@ -73,9 +93,28 @@ pub struct ReclassifyError {
     pub span: Span,
 }
 
+/// The names a declaration sequence binds in the scope it opens. A nested
+/// procedure's declarations belong to *its* scope, not to this one.
+fn decl_bindings(d: &Decls, scope: &mut HashMap<String, Kind>) {
+    for c in &d.consts {
+        scope.insert(c.name.clone(), Kind::Other);
+    }
+    for t in &d.types {
+        scope.insert(t.name.clone(), Kind::Type);
+    }
+    for v in &d.vars {
+        for (name, _) in &v.names {
+            scope.insert(name.clone(), Kind::Other);
+        }
+    }
+    for p in &d.procs {
+        scope.insert(p.name.clone(), Kind::Other);
+    }
+}
+
 /// Rewrites `Selector::Args` into `Selector::Call` or `Selector::Guard`, and
 /// folds a leading module qualifier into the designator's base.
-pub fn reclassify(m: &mut Module, names: &Names) -> Result<(), ReclassifyError> {
+pub fn reclassify(m: &mut Module, names: &mut Names) -> Result<(), ReclassifyError> {
     for s in &mut m.body {
         reclassify_stmt(s, names)?;
     }
@@ -91,7 +130,17 @@ pub fn reclassify(m: &mut Module, names: &Names) -> Result<(), ReclassifyError> 
     Ok(())
 }
 
-fn reclassify_proc(p: &mut Proc, names: &Names) -> Result<(), ReclassifyError> {
+fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyError> {
+    // A procedure's own scope: its parameters first, then its declarations —
+    // either can shadow an outer type name or import alias.
+    let mut scope: HashMap<String, Kind> = HashMap::new();
+    for sec in &p.params {
+        for (name, _) in &sec.names {
+            scope.insert(name.clone(), Kind::Other);
+        }
+    }
+    decl_bindings(&p.decls, &mut scope);
+    names.push(scope);
     for s in &mut p.body {
         reclassify_stmt(s, names)?;
     }
@@ -110,11 +159,12 @@ fn reclassify_proc(p: &mut Proc, names: &Names) -> Result<(), ReclassifyError> {
     for q in &mut p.decls.procs {
         reclassify_proc(q, names)?;
     }
+    names.pop();
     Ok(())
 }
 
 /// Array lengths and pointer/record base types are expressions/types too.
-fn reclassify_type_expr(t: &mut TypeExpr, names: &Names) -> Result<(), ReclassifyError> {
+fn reclassify_type_expr(t: &mut TypeExpr, names: &mut Names) -> Result<(), ReclassifyError> {
     match t {
         TypeExpr::Array { dims, elem, .. } => {
             for d in dims {
@@ -133,7 +183,7 @@ fn reclassify_type_expr(t: &mut TypeExpr, names: &Names) -> Result<(), Reclassif
     }
 }
 
-fn reclassify_stmt(s: &mut Stmt, names: &Names) -> Result<(), ReclassifyError> {
+fn reclassify_stmt(s: &mut Stmt, names: &mut Names) -> Result<(), ReclassifyError> {
     match &mut s.kind {
         StmtKind::Assign { target, value } => {
             reclassify_designator(target, names)?;
@@ -212,7 +262,7 @@ fn reclassify_stmt(s: &mut Stmt, names: &Names) -> Result<(), ReclassifyError> {
     }
 }
 
-fn reclassify_expr(e: &mut Expr, names: &Names) -> Result<(), ReclassifyError> {
+fn reclassify_expr(e: &mut Expr, names: &mut Names) -> Result<(), ReclassifyError> {
     match &mut e.kind {
         ExprKind::Set(elems) => {
             for el in elems {
@@ -239,7 +289,7 @@ fn reclassify_expr(e: &mut Expr, names: &Names) -> Result<(), ReclassifyError> {
     }
 }
 
-fn reclassify_designator(d: &mut Designator, names: &Names) -> Result<(), ReclassifyError> {
+fn reclassify_designator(d: &mut Designator, names: &mut Names) -> Result<(), ReclassifyError> {
     // D3: a leading `.field` after an import alias is module qualification.
     if d.base.len() == 1 {
         if let Some(Selector::Field(f)) = d.sels.first() {

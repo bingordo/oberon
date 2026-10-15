@@ -259,9 +259,9 @@ impl<'a> Sema<'a> {
     /// The same, but handing back the whole pass: the C emitter needs the type
     /// side table as well (DESIGN §9).
     pub fn check_owned(module: &mut Module, interfaces: &'a [Interface]) -> Sema<'a> {
-        let names = Names::collect(module);
+        let mut names = Names::collect(module);
         let mut sema = Sema::new(interfaces);
-        if let Err(e) = reclassify(module, &names) {
+        if let Err(e) = reclassify(module, &mut names) {
             sema.error(e.span, e.message);
         }
         // The report's outermost scope is the *universe* of predefined
