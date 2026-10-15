@@ -214,9 +214,22 @@ the reader is told, the behaviour is unchanged, and catalogue row 39's note cove
 it); or **leave both** and record that the asymmetry is deliberate, which needs a
 reason better than "it was always that way".
 
-Done when: one of the three is chosen, DESIGN §9.6's row for the scalar `CASE` says
-what the choice is rather than what the code happens to do, and the suites pin it
-(a warning row, or a trap row, or an explicit "no contract here" row).
+**Decided: warn and trap, symmetric with the type-`CASE`.** The reason is the one
+this design uses everywhere else — a silent undefined result is worse than a located
+one — and symmetry settles the rest: a type-`CASE` with no default arm warns, and one
+whose value matches no label traps with its source byte, so a scalar `CASE` should do
+both. The cost is stated rather than hidden: the emitted C for a scalar `CASE`
+*without* a default arm gains a trapping `default` and a warning, so a program that
+relied on the fall-through changes behaviour — which is the point, since that
+fall-through is exactly the silence being removed, and the design's §9.6 row records
+it as a deliberate choice rather than as something that happens to be true.
+
+Done when: DESIGN §9.6's row for the scalar `CASE` says what the choice is rather than
+what the code happens to do, the warning and the trap are emitted (the trap with its
+byte, the warning only when there is no default arm, as for the type-`CASE`), the C
+back end and the Cranelift one agree on it — W9.2b lowers this shape, so the two must
+land together or the second inherits the old silence — and the suites pin both: a
+`trap-` row in `e2e` asserting the exact line, and a row for the warning.
 
 **W2.4 a pointer array cannot see a record declared later in the module** — **done**
 
