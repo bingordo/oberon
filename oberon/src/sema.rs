@@ -1580,9 +1580,32 @@ impl<'a> Sema<'a> {
                                     ),
                                 );
                             }
-                            for e in ix {
+                            // A *constant* index outside the array's bounds is a
+                            // mistake the compiler can name, and warning about it
+                            // does not weaken the run-time check (which stays, and
+                            // still carries the offset). The report leaves the
+                            // index' range to the implementation (§8.1 bounds
+                            // checking is optional), so this is a warning, not an
+                            // error (PLAN.md W7.2).
+                            let lens = self.array_lengths(t);
+                            for (k, e) in ix.iter().enumerate() {
                                 let v = self.expr(e);
                                 self.expect_integer(e.span, v.ty, "an array index");
+                                let constant = match const_eval::eval(e) {
+                                    Ok(c) => c.int(),
+                                    Err(_) => self.const_at(e.span).and_then(|c| c.int()),
+                                };
+                                if let (Some(idx), Some(len)) = (constant, lens.get(k)) {
+                                    if idx < 0 || idx as i64 >= *len as i64 {
+                                        self.warn(
+                                            e.span,
+                                            format!(
+                                                "the index is {idx}, but this dimension has {len} \
+                                                 element(s); the check below will trap (report 8.1)"
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                             var_record_param = false;
                             // `A[E1, E2]` means `A[E1][E2]` (report §8.1), so
@@ -1820,6 +1843,22 @@ impl<'a> Sema<'a> {
             cur = e;
         }
         n
+    }
+
+    /// The length of each dimension of an array type, outermost first. Used to
+    /// name a constant index that cannot be in range (PLAN.md W7.2).
+    fn array_lengths(&self, t: TypeId) -> Vec<u32> {
+        let mut lens = Vec::new();
+        let mut cur = t;
+        while let Some(elem) = self.types.elem(cur) {
+            match self.types.get(cur) {
+                Type::Array { len, .. } => lens.push(*len),
+                // An open array's length is a run-time property of the caller.
+                _ => return lens,
+            }
+            cur = elem;
+        }
+        lens
     }
 
     fn signature(&self, t: TypeId) -> (Vec<Param>, Option<TypeId>) {
