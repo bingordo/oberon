@@ -73,7 +73,7 @@ table and every rule of the descriptor scheme is exercised by `csmoke`, `e2e` or
 These are DESIGN §8.5's own list of four unchecked things, quoted verbatim.
 
 **W1.1 field visibility across modules** (rows 4 and 14's private-field halves,
-report §6.3)
+report §6.3) — **done**
 Why: a field's `*` is accepted, but *who may read it* is not modelled: it is an
 interface-layer rule this pass does not have the data for. Three things are
 missing, and they are a chain:
@@ -87,7 +87,16 @@ missing, and they are a chain:
 Files: `src/types.rs`, `src/cgen.rs`, `src/sym.rs`, `src/sema.rs`.
 Done when: the mark travels through the interface, an access to a private field
 of an imported record is an error, and `check_tests` has a case per row (each
-case names its row number).
+case names its row number). **Done**: `types::Field` carries the mark — the
+reconnaissance in this item was wrong about the prerequisite, since the writer
+already emitted field lists and the reader already parsed them, so the work was
+the *mark*, not the format; `interface_env` marks every type an interface
+declares, so the field selector can tell the record came from another module; the
+writer emits each field's own mark instead of a `*` on all of them; and the
+fixtures had to be corrected, because the report's own `Out.WriteLn` reads `W.buf`
+from `Texts` — `buf` *is* exported in the report's library and the hand-written
+`Texts.sym` said otherwise. Every row of §8.5 is now checked, which is what this
+wave was for.
 
 **W1.2 row 50's locality half** (report §6.5, §10.1) — **done**
 Why: a *local* procedure assigned to a procedure variable is rejected, but one

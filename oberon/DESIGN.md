@@ -781,10 +781,11 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 implemented in `src/sema.rs` and driven by
 `check_tests::catalogue_rows_report_what_they_should`, which has a case per row
 (each naming the row number, so a failure points at the rule; rows with two
-shapes have two cases). One thing is *not* checked yet, listed here rather than
-implied: field **visibility** across modules (rows 4 and 14's private-field
-halves — a field's `*` is accepted and the interface carries it, but who may read
-it is the remaining piece; `PLAN.md` W1.1). Row 50 is checked on both sides now:
+shapes have two cases). **Every row is checked**: field visibility across modules
+(rows 4 and 14's private-field halves) follows the field's own `*`, which travels
+through the interface, so naming an unmarked field of an imported record is an
+error while a module's own unmarked fields stay private to it. Row 50 holds on
+both sides now:
 assigning a *local* procedure to a procedure variable is an error, and so is
 passing one as an actual. Row 54's unused-*procedure* half is checked too: a procedure this
 unit declares and never uses is a warning, with the use recorded where a

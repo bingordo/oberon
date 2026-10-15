@@ -20,7 +20,7 @@ use crate::ast::{
 use crate::const_eval::{self, Const};
 use crate::resolve::{reclassify, Names};
 use crate::sym::{Interface, Item};
-use crate::types::{Basic, Param, Type, TypeId, Types};
+use crate::types::{Field, Basic, Param, Type, TypeId, Types};
 
 /// A procedure's signature as the checker flattened it (DESIGN §9.7): the
 /// procedure's type, one entry per parameter with its mode, and the result.
@@ -182,11 +182,15 @@ pub struct Sema<'a> {
     used_procs: Vec<usize>,
     /// For a name reported as undeclared: the index of that first diagnostic, so
     /// further uses of the same name can be counted onto it instead of repeated.
-    /// Per undeclared name: the index of its first diagnostic, how many further
-    /// *distinct* uses were suppressed, and the span of the last one counted.
-    undeclared: HashMap<String, (usize, usize, u64)>,
+    /// Per undeclared name: the index of its first diagnostic and how many
+    /// further uses were suppressed. Probes that must not report (`lookup`) do
+    /// not count, so this is one entry per *use*.
+    undeclared: HashMap<String, (usize, usize)>,
     /// Where a constant was used, and what it was worth: `const_at` reads this.
     const_uses: HashMap<u64, Const>,
+    /// Record types that came from an interface, and the interface they came
+    /// from: naming one of their *unmarked* fields is an error (rows 4 and 14).
+    imported_types: HashMap<TypeId, usize>,
     next_proc_id: usize,
     imports: Vec<(String, Span)>,
     /// Built type environments of imported modules, by interface index.
@@ -232,6 +236,7 @@ impl<'a> Sema<'a> {
             used_procs: Vec::new(),
             undeclared: HashMap::new(),
             const_uses: HashMap::new(),
+            imported_types: HashMap::new(),
             next_proc_id: 0,
             imports: Vec::new(),
             envs: HashMap::new(),
@@ -407,21 +412,12 @@ impl<'a> Sema<'a> {
                     // Report a name once. Later uses of the same undeclared
                     // name add nothing but noise, so they are counted onto the
                     // first diagnostic instead (PLAN.md W5.2).
-                    // The same occurrence is resolved more than once in places
-                    // (a type-`CASE` label is looked up for its arm's view and
-                    // again for the label check), so only a *new* span is another
-                    // use: counting every failed lookup reports uses that do not
-                    // exist.
                     match self.undeclared.get_mut(&q[0]) {
-                        Some((_, _, last)) if *last == span_key(span) => {}
-                        Some((_, count, last)) => {
-                            *count += 1;
-                            *last = span_key(span);
-                        }
+                        Some((_, count)) => *count += 1,
                         None => {
                             let at = self.diags.len();
                             self.error(span, format!("`{}` is not declared (report 4)", q[0]));
-                            self.undeclared.insert(q[0].clone(), (at, 0, span_key(span)));
+                            self.undeclared.insert(q[0].clone(), (at, 0));
                         }
                     }
                     None
@@ -547,12 +543,12 @@ impl<'a> Sema<'a> {
     /// Attaches `N further uses are suppressed` to each undeclared name's first
     /// diagnostic. Called once, at the end.
     fn finish_undeclared_notes(&mut self) {
-        let entries: Vec<(String, (usize, usize, u64))> = self
+        let entries: Vec<(String, (usize, usize))> = self
             .undeclared
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        for (name, (at, count, _)) in entries {
+        for (name, (at, count)) in entries {
             if count == 0 || at >= self.diags.len() {
                 continue;
             }
@@ -674,6 +670,13 @@ impl<'a> Sema<'a> {
             }
         }
         let env = self.build_type_group(&decls, false);
+        // Every type this interface declares is *imported* as far as a field's
+        // visibility is concerned (rows 4 and 14): naming one of its unmarked
+        // fields is an error. The types are built by the ordinary declaration
+        // path, so the marks go on here rather than inside the builder.
+        for t in env.values() {
+            self.mark_imported(*t, idx);
+        }
         self.resolving.pop();
         if !unreadable.is_empty() {
             // A type the interface declares but we cannot read is a build
@@ -743,7 +746,39 @@ impl<'a> Sema<'a> {
             built = self.types.open_array(built);
         }
         self.ctx.truncate(base);
+        // Everything this interface declares is *imported* as far as a field's
+        // visibility is concerned: naming one of its unmarked fields is an error
+        // (rows 4 and 14).
+        self.mark_imported(built, module_idx);
         built
+    }
+
+    /// Records every record reachable from a type that came from an interface,
+    /// with the interface it came from, so a field access through one can be
+    /// checked against the field's public mark.
+    fn mark_imported(&mut self, t: TypeId, module_idx: usize) {
+        let mut guard = 0;
+        let mut stack = vec![t];
+        while let Some(t) = stack.pop() {
+            guard += 1;
+            if guard > 256 {
+                return;
+            }
+            match self.types.get(t).clone() {
+                Type::Record { base, fields, .. } => {
+                    self.imported_types.insert(t, module_idx);
+                    for f in &fields {
+                        stack.push(f.ty);
+                    }
+                    if let Some(b) = base {
+                        stack.push(b);
+                    }
+                }
+                Type::Pointer { base } => stack.push(base),
+                Type::Array { elem, .. } | Type::OpenArray { elem } => stack.push(elem),
+                _ => {}
+            }
+        }
     }
 
     // ---------------------------------------------------------- declarations
@@ -922,8 +957,8 @@ impl<'a> Sema<'a> {
                         }
                         match self.types.get(t) {
                             Type::Record { base, fields, .. } => {
-                                for (n, _) in fields {
-                                    inherited.push(n.clone());
+                                for f in fields {
+                                    inherited.push(f.name.clone());
                                 }
                                 walk = *base;
                             }
@@ -1056,7 +1091,7 @@ impl<'a> Sema<'a> {
         fields: &[ast::FieldList],
         span: Span,
         ts: &mut TypeScope,
-    ) -> (Option<TypeId>, Vec<(String, TypeId)>) {
+    ) -> (Option<TypeId>, Vec<Field>) {
         let b = match base {
             Some(q) => {
                 let bt = self.type_expr(&TypeExpr::Named(q.clone(), span), ts, false);
@@ -1069,23 +1104,26 @@ impl<'a> Sema<'a> {
             None => None,
         };
         let mut seen: Vec<String> = Vec::new();
-        let mut fs: Vec<(String, TypeId)> = Vec::new();
+        let mut fs: Vec<Field> = Vec::new();
         for fl in fields {
             let fty = self.type_expr(&fl.ty, ts, false);
             for (name, mark) in &fl.names {
                 // A field's `*` marks it *public* (report §6.3: "field
                 // identifiers that are to be visible outside the declaring
-                // module must be marked"). Visibility across modules is an
-                // interface-layer rule, which this pass does not model yet, so
-                // the mark is accepted here and DESIGN §8.5 says so.
-                let _public = *mark;
+                // module must be marked"). The mark travels with the field, so a
+                // later access through a type from an interface can tell whether
+                // it may name the field (rows 4 and 14).
                 // ✔ row 43.
                 if seen.contains(name) {
                     self.error(fl.span, format!("field `{name}` is declared twice (report 6.3)"));
                     continue;
                 }
                 seen.push(name.clone());
-                fs.push((name.clone(), fty));
+                fs.push(Field {
+                    name: name.clone(),
+                    ty: fty,
+                    export: *mark,
+                });
             }
         }
         (b, fs)
@@ -1553,6 +1591,31 @@ impl<'a> Sema<'a> {
                     };
                     match self.types.field(rec, f) {
                         Some(ft) => {
+                            // ✔ rows 4 and 14 (the private-field halves). A field
+                            // declared without the report's `*` is private to its
+                            // module, so naming it through a type that came from
+                            // an interface is an error — unless the type came
+                            // from this module, which is the same check because
+                            // only imported types are recorded (§6.3).
+                            if let Some(idx) = self.imported_types.get(&rec).copied() {
+                                let private = self
+                                    .types
+                                    .get(rec)
+                                    .clone();
+                                if let Type::Record { fields, .. } = private {
+                                    if fields.iter().any(|field| {
+                                        field.name == *f && !field.export
+                                    }) {
+                                        let module = self.interfaces[idx].module.clone();
+                                        self.error(
+                                            d.span,
+                                            format!(
+                                                "field `{f}` is private to module `{module}` (report 6.3)"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
                             var_record_param = var_record_param && self.types.is_record(ft);
                             cur = Sym::Var {
                                 ty: ft,
@@ -2216,10 +2279,15 @@ impl<'a> Sema<'a> {
             // The arm's view of the case variable (see above).
             let arm_view: Option<TypeId> = arm.labels.as_ref().and_then(|labels| {
                 labels.iter().find_map(|l| match &l.lo {
-                    CaseLabel::Named(q) => self.lookup_qual(q, arm.span).and_then(|s| match s {
-                        Sym::Type(t) => Some(t),
-                        _ => None,
-                    }),
+                    // Silent on purpose: `lookup_qual` reports an undeclared
+                    // name, and the label check below is the place that does.
+                    CaseLabel::Named(q) if q.len() == 1 => {
+                        match self.lookup(&q[0]) {
+                            Some(Sym::Type(t)) => Some(t),
+                            _ => None,
+                        }
+                    }
+                    CaseLabel::Named(_) => None,
                     _ => None,
                 })
             });

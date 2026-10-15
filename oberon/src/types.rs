@@ -51,6 +51,16 @@ pub struct Param {
     pub ty: TypeId,
 }
 
+/// One record field: its name, its type, and whether the declaration carried the
+/// report's public mark (report §6.3). The mark travels through an interface so a
+/// client can tell which fields it may name (DESIGN §7).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Field {
+    pub name: String,
+    pub ty: TypeId,
+    pub export: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Basic(Basic),
@@ -62,7 +72,7 @@ pub enum Type {
     Record {
         def: u32,
         base: Option<TypeId>,
-        fields: Vec<(String, TypeId)>,
+        fields: Vec<Field>,
     },
     Pointer { base: TypeId },
     Proc {
@@ -183,7 +193,7 @@ impl Types {
     }
     /// A new record type. Two calls produce two *different* types, exactly as
     /// two `TYPE` declarations do (report §6.3).
-    pub fn record(&mut self, base: Option<TypeId>, fields: Vec<(String, TypeId)>) -> TypeId {
+    pub fn record(&mut self, base: Option<TypeId>, fields: Vec<Field>) -> TypeId {
         let id = self.record_placeholder();
         self.define_record(id, base, fields);
         id
@@ -208,7 +218,7 @@ impl Types {
 
     /// Fill in a placeholder. Panics if `id` is not a record placeholder, which
     /// can only happen through a resolver bug.
-    pub fn define_record(&mut self, id: TypeId, base: Option<TypeId>, fields: Vec<(String, TypeId)>) {
+    pub fn define_record(&mut self, id: TypeId, base: Option<TypeId>, fields: Vec<Field>) {
         match &mut self.types[id.0 as usize] {
             Type::Record {
                 base: b,
@@ -330,8 +340,8 @@ impl Types {
             }
             match self.get(t) {
                 Type::Record { base, fields, .. } => {
-                    if let Some((_, ty)) = fields.iter().find(|(n, _)| n == name) {
-                        return Some(*ty);
+                    if let Some(f) = fields.iter().find(|f| f.name == name) {
+                        return Some(f.ty);
                     }
                     t = (*base)?;
                 }
@@ -705,6 +715,16 @@ mod tests {
     use super::*;
     use crate::ast::UnOp;
 
+    /// A record field for the type-algebra tests: the mark only matters across an
+    /// interface, so these are public.
+    fn field(name: &str, ty: TypeId) -> Field {
+        Field {
+            name: name.to_string(),
+            ty,
+            export: true,
+        }
+    }
+
     /// A small universe that mirrors the report's own examples (§6.3, §6.4).
     struct World {
         t: Types,
@@ -718,11 +738,11 @@ mod tests {
     fn world() -> World {
         let mut t = Types::new();
         let int = t.integer();
-        let node = t.record(None, vec![("key".into(), int)]);
+        let node = t.record(None, vec![field("key", int)]);
         let name_ty = t.array(32, t.char());
         let center = t.record(
             Some(node),
-            vec![("name".into(), name_ty), ("sub".into(), node)],
+            vec![field("name", name_ty), field("sub", node)],
         );
         let p_node = t.pointer(node);
         let p_center = t.pointer(center);
@@ -764,7 +784,7 @@ mod tests {
         assert!(!t.same_type(a, d));
 
         // Two records with identical fields are two types (report §6.3).
-        let f = vec![("x".to_string(), t.integer())];
+        let f = vec![field("x", t.integer())];
         let r1 = t.record(None, f.clone());
         let r2 = t.record(None, f);
         assert!(!t.same_type(r1, r2));
@@ -787,7 +807,7 @@ mod tests {
     fn record_extension_is_reflexive_transitive_and_one_way() {
         let mut w = world();
         let int = w.t.integer();
-        let deep = w.t.record(Some(w.center), vec![("z".into(), int)]);
+        let deep = w.t.record(Some(w.center), vec![field("z", int)]);
         assert!(w.t.extends(w.node, w.node));
         assert!(w.t.extends(w.center, w.node));
         assert!(w.t.extends(deep, w.center));

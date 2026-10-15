@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 use crate::ast::{self, BinOp, CaseLabel, Expr, ExprKind, Module, QIdent, Selector, Span, Stmt, StmtKind, TypeExpr, UnOp};
 use crate::const_eval;
 use crate::sema::Sema;
-use crate::types::{Basic, Param, Type, TypeId, Types};
+use crate::types::{Basic, Field, Param, Type, TypeId, Types};
 
 /// `oberon.h`, emitted alongside the generated modules.
 pub const RUNTIME_HEADER: &str = include_str!("oberon_h.inc");
@@ -350,8 +350,8 @@ impl<'a> Emitter<'a> {
                     let bname = self.type_c_name(b).unwrap_or_default();
                     self.name_type(b, &bname);
                 }
-                for (_, f) in &fields {
-                    self.name_type(*f, "");
+                for f in &fields {
+                    self.name_type(f.ty, "");
                 }
             }
             Type::Pointer { base } => {
@@ -381,8 +381,8 @@ impl<'a> Emitter<'a> {
                 if let Some(b) = base {
                     rank = rank.max(200 + self.type_rank(*b));
                 }
-                for (_, f) in fields {
-                    rank = rank.max(300 + self.type_rank(*f));
+                for f in fields {
+                    rank = rank.max(300 + self.type_rank(f.ty));
                 }
                 rank
             }
@@ -420,8 +420,12 @@ impl<'a> Emitter<'a> {
                         let _ = writeln!(self.typedefs, "    const ObDesc *desc;");
                     }
                 }
-                for (fname, fty) in &fields {
-                    let _ = writeln!(self.typedefs, "    {};", self.binding(*fty, &mangle(fname)));
+                for f in &fields {
+                    let _ = writeln!(
+                        self.typedefs,
+                        "    {};",
+                        self.binding(f.ty, &mangle(&f.name))
+                    );
                 }
                 let _ = writeln!(self.typedefs, "}};");
                 let base_ref = match base {
@@ -1265,8 +1269,12 @@ impl<'a> Emitter<'a> {
             | ExprKind::Real(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
-            | ExprKind::Bool(_)
-            | ExprKind::Set(_) => true,
+            | ExprKind::Bool(_) => true,
+            // A set's bounds are expressions, and `1 IN {ABS(1)}` is exactly the
+            // shape the call check exists for.
+            ExprKind::Set(elems) => elems.iter().all(|el| {
+                self.foldable(&el.lo) && el.hi.as_ref().is_none_or(|h| self.foldable(h))
+            }),
             ExprKind::Designator(d) => d.sels.is_empty(),
             ExprKind::Unary(_, x) => self.foldable(x),
             ExprKind::Binary(_, l, r) => self.foldable(l) && self.foldable(r),
@@ -1287,10 +1295,15 @@ impl<'a> Emitter<'a> {
             (ExprKind::Designator(a), ExprKind::Designator(b)) => {
                 a.base == b.base && a.sels.is_empty() && b.sels.is_empty()
             }
-            (ExprKind::Set(_), ExprKind::Set(_)) => matches!(
-                (const_eval::eval(l), const_eval::eval(r)),
-                (Ok(x), Ok(y)) if x == y
-            ),
+            // Comparing two sets folds only when both are call-free, for the
+            // same reason: the folder recognises a builtin by its spelling.
+            (ExprKind::Set(_), ExprKind::Set(_)) => {
+                self.foldable(l)
+                    && matches!(
+                        (const_eval::eval(l), const_eval::eval(r)),
+                        (Ok(x), Ok(y)) if x == y
+                    )
+            }
             _ => false,
         }
     }
@@ -1375,7 +1388,7 @@ impl<'a> Emitter<'a> {
         for _ in 0..64 {
             match self.types.get(cur) {
                 Type::Record { base, fields, .. } => {
-                    if fields.iter().any(|(n, _)| n == f) {
+                    if fields.iter().any(|field| field.name == *f) {
                         return Some(prefix);
                     }
                     prefix.push_str("base.");
@@ -1446,14 +1459,14 @@ impl<'a> Emitter<'a> {
     fn desc_init_fields(
         &self,
         base: Option<TypeId>,
-        fields: &[(String, TypeId)],
+        fields: &[Field],
         expr: &str,
         out: &mut String,
         indent: &str,
     ) {
-        for (fname, fty) in fields {
-            if self.contains_record(*fty) {
-                self.desc_init(*fty, &format!("{expr}.{}", mangle(fname)), out, indent);
+        for field in fields {
+            if self.contains_record(field.ty) {
+                self.desc_init(field.ty, &format!("{expr}.{}", mangle(&field.name)), out, indent);
             }
         }
         if let Some(b) = base {
@@ -1865,8 +1878,14 @@ impl<'a> Emitter<'a> {
                     .unwrap_or(TypeId(0));
                 // Through a helper: written inline, the operand appears three
                 // times and a call in it would run twice, possibly with two
-                // different results.
-                format!("rt_abs({})", one(self, 0, Some(t)))
+                // different results. `ABS` is defined for REAL too and keeps the
+                // operand's type (report §10.2), so the helper is chosen by type.
+                let helper = if matches!(self.types.get(t), Type::Basic(Basic::Real)) {
+                    "rt_absf"
+                } else {
+                    "rt_abs"
+                };
+                format!("{helper}({})", one(self, 0, Some(t)))
             }
             "ODD" => {
                 let x = one(self, 0, None);
@@ -2040,8 +2059,11 @@ impl<'a> Emitter<'a> {
                     Some(b) => format!("RECORD ({})", self.render_type(*b)),
                     None => "RECORD".to_string(),
                 };
-                for (name, fty) in fields {
-                    let _ = write!(text, " {}*: {};", mangle(name), self.render_type(*fty));
+                for f in fields {
+                    // The mark is the field's own (report §6.3): a client may
+                    // name an exported field and nothing else.
+                    let mark = if f.export { "*" } else { "" };
+                    let _ = write!(text, " {}{mark}: {};", mangle(&f.name), self.render_type(f.ty));
                 }
                 // Drop the separator after the last field: the reader's
                 // `FieldListSequence` is `;`-separated (report §6.3).

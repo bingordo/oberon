@@ -115,6 +115,12 @@ static inline int32_t rt_abs(int32_t x) {
     return (x < 0) ? -x : x;
 }
 
+/* `ABS` is defined for REAL as well and keeps the operand's type (report
+ * §10.2), so REAL gets its own helper rather than an int conversion. */
+static inline float rt_absf(float x) {
+    return (x < 0.0f) ? -x : x;
+}
+
 static inline float rt_floor(float x) {
     int32_t t = (int32_t)x;
     return (float)((x < (float)t) ? (t - 1) : t);

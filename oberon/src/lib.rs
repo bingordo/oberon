@@ -846,6 +846,41 @@ END M.
     }
 }
 
+    #[test]
+    fn a_private_field_of_an_imported_record_cannot_be_named() {
+        // ✔ rows 4 and 14, the private-field halves: a field declared without the
+        // report's `*` is private to its module (report §6.3), and the mark
+        // travels through the interface.
+        let iface = sym::parse(
+            "MODULE Texts\nTYPE Buffer = ARRAY 64 OF CHAR\nTYPE Writer = RECORD buf: Buffer; pos*: INTEGER END\n",
+        )
+        .unwrap();
+
+        let src = "MODULE M; IMPORT Texts; VAR w: Texts.Writer;\nBEGIN w.buf[0] := 0X END M.\n";
+        let (_, diags) = check_module_recovering(src, std::slice::from_ref(&iface));
+        let text = render_diagnostics("M.mod", src, &diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`buf` is private to module `Texts`")),
+            "{text}"
+        );
+
+        // ... while a marked field is exactly what the mark is for.
+        let src = "MODULE M; IMPORT Texts; VAR w: Texts.Writer;\nBEGIN w.pos := 1 END M.\n";
+        let (_, diags) = check_module_recovering(src, std::slice::from_ref(&iface));
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "{}",
+            render_diagnostics("M.mod", src, &diags)
+        );
+
+        // ... and a module's own unmarked field is nobody else's business.
+        let src = "MODULE M; TYPE R = RECORD f: INTEGER END; VAR r: R;\nBEGIN r.f := 1 END M.\n";
+        let (_, diags) = check_module_recovering(src, &[]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
 #[cfg(test)]
 mod emit_tests {
     use super::*;
@@ -999,8 +1034,13 @@ mod diag_tests {
         let (text, _) = report(src);
         assert!(!text.contains("further use of `Zz`"), "{text}");
 
-        // Two genuine occurrences still count.
+        // Two genuine occurrences still count, including two labels of one arm
+        // (which share the arm's span).
         let src = "MODULE M; VAR x: INTEGER;\nBEGIN x := Zz; x := Zz END M.\n";
+        let (text, _) = report(src);
+        assert!(text.contains("1 further use of `Zz` is suppressed"), "{text}");
+
+        let src = "MODULE M; TYPE R = RECORD END; P = POINTER TO R; VAR p: P;\nBEGIN CASE p OF Zz, Zz: END END M.\n";
         let (text, _) = report(src);
         assert!(text.contains("1 further use of `Zz` is suppressed"), "{text}");
     }
@@ -1309,7 +1349,7 @@ mod check_tests {
         vec![
             iface("MODULE Texts\n\
 TYPE Buffer = ARRAY 256 OF CHAR\n\
-TYPE Writer = RECORD buf: Buffer END\n\
+TYPE Writer = RECORD buf*: Buffer END\n\
 PROC OpenWriter(VAR w: Writer)\n\
 PROC Write(w: Writer; ch: CHAR)\n\
 PROC WriteLn(w: Writer)\n\

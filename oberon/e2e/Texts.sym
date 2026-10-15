@@ -1,6 +1,6 @@
 MODULE Texts
 TYPE Buffer = ARRAY 256 OF CHAR
-TYPE Writer = RECORD buf: Buffer END
+TYPE Writer = RECORD buf*: Buffer END
 PROC OpenWriter(VAR w: Writer)
 PROC Write(VAR w: Writer; ch: CHAR)
 PROC WriteString(VAR w: Writer; s: ARRAY OF CHAR)

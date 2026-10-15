@@ -565,11 +565,22 @@ impl Program {
 
         let _ = writeln!(out, "BEGIN");
         let trace = self.per_statement.map(|v| self.explain(v));
+        // A check may only be emitted once the variable it reads has been
+        // defined: the first statement that assigns it is that point (every
+        // variable gets one — see `generate`).
+        let first_def = self
+            .per_statement
+            .and_then(|v| {
+                self.body
+                    .iter()
+                    .position(|s| matches!(s, Stmt::SetM(k, _) if *k == v))
+            })
+            .unwrap_or(0);
         for (i, s) in self.body.iter().enumerate() {
             s.render(g, &[], 1, &mut out);
             if let Some(trace) = &trace {
                 let v = self.per_statement.expect("trace implies a variable");
-                if let Some((_, value)) = trace.get(i) {
+                if let Some((_, value)) = trace.get(i).filter(|_| i >= first_def) {
                     let name = &g.mvars[v];
                     let _ = writeln!(
                         out,
@@ -787,6 +798,23 @@ fn generate(seed: u64) -> Program {
         g.funcs[f].body = fbody;
     }
 
+    // Loop counters and `FOR` controls are created while the body is generated,
+    // and an assignment inside a loop can be skipped (an untaken arm) — so after
+    // the fact, every variable the generator ended up with is defined up front,
+    // with a literal. That removes the last place where the mirror and the C back
+    // end agreed only because statics start at zero.
+    // Counters and `FOR` controls are created *while* the body is generated, and
+    // the assignment that defines one sits inside its loop — which an untaken arm
+    // can skip. So once the variable list is final, every variable the generator
+    // ended up with is defined up front (the ones with an initialiser already
+    // keep their value). That removes the last place where the mirror and the C
+    // back end agreed only because statics start at zero.
+    let mut init: Vec<Stmt> = Vec::new();
+    for k in nmvars..g.mvars.len() {
+        init.push(Stmt::SetM(k, Expr::Int(0)));
+    }
+    init.append(&mut body);
+    let body = init;
     Program {
         g,
         body,
