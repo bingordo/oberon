@@ -508,6 +508,13 @@ struct Program {
     /// variable: the first trap then names the statement that diverged, which is
     /// how a failing seed is triaged.
     per_statement: Option<usize>,
+    /// Write the reserved words in lower case, so the corpus covers the dialect
+    /// W8.10 added end to end. Only whole words are touched, and only those the
+    /// renderer can emit: the generator's own names are `m<i>`, `c<i>`, `F<i>`,
+    /// `R`, `fail`, `acc` and `p<i>`, none of which is a reserved word, while the
+    /// *predeclared identifiers* (`INTEGER`, `CHAR`, `BOOLEAN`) must keep their
+    /// spelling because they are names rather than keywords.
+    lower_keywords: bool,
     /// Adversarial mode (PLAN.md W7.5): after the value checks, one statement
     /// that *must* trap, together with the trap line it must produce. The
     /// violation is not part of `body`, so the mirror and every value check stay
@@ -766,8 +773,46 @@ impl Program {
             out.push_str(&block);
         }
         let _ = writeln!(out, "END Fuzz.");
+        if self.lower_keywords {
+            out = lower_reserved_words(&out);
+        }
         (out, expectation)
     }
+}
+
+/// Every reserved word the renderer can emit, longest first so that no shorter
+/// one can match inside a longer one.
+const RESERVED: &[&str] = &[
+    "PROCEDURE", "REPEAT", "RECORD", "RETURN", "POINTER", "MODULE", "UNTIL", "WHILE",
+    "ELSIF", "ARRAY", "BEGIN", "CONST", "ELSIF", "CASE", "DIV", "ELSE", "EXIT", "FOR",
+    "IF", "MOD", "OF", "OR", "THEN", "TO", "TYPE", "VAR", "BY", "DO", "END", "IS",
+];
+
+/// The module with its reserved words in lower case (PLAN.md W8.10). A word is
+/// replaced only when it is whole and spells a reserved word exactly, so the
+/// predeclared identifiers and the generator's own names are left alone.
+fn lower_reserved_words(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && (bytes[i] as char).is_ascii_alphanumeric() {
+                i += 1;
+            }
+            let word = &src[start..i];
+            match RESERVED.iter().find(|r| **r == word) {
+                Some(r) => out.push_str(&r.to_ascii_lowercase()),
+                None => out.push_str(word),
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn render_func(g: &Gen, f: &Func, out: &mut String) {
@@ -984,6 +1029,7 @@ fn generate(seed: u64) -> Program {
         g,
         seed,
         adversarial: false,
+        lower_keywords: false,
         body,
         per_statement: None,
     }
@@ -1213,6 +1259,7 @@ fn main() {
     let mut seed_list: Option<PathBuf> = None;
     let mut cflags: Vec<String> = Vec::new();
     let mut adversarial = false;
+    let mut lower_keywords = false;
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
@@ -1246,6 +1293,7 @@ fn main() {
             }
             "--keep" => keep = true,
             "--adversarial" => adversarial = true,
+            "--lower" => lower_keywords = true,
             "--cflag" => {
                 i += 1;
                 cflags.push(args[i].clone());
@@ -1278,6 +1326,7 @@ fn main() {
     if let Some(var) = &per_statement {
         let mut program = generate(base);
         program.adversarial = adversarial;
+        program.lower_keywords = lower_keywords;
         program.per_statement = Some(
             program
                 .g
@@ -1292,9 +1341,16 @@ fn main() {
     if print_only {
         let mut program = generate(base);
         program.adversarial = adversarial;
+        program.lower_keywords = lower_keywords;
         print!("{}", program.render());
         return;
     }
+    let modes = Modes {
+        keep,
+        cflags: std::mem::take(&mut cflags),
+        adversarial,
+        lower_keywords,
+    };
     if let Some(path) = &seed_list {
         // A named list is how the seeds that once found a bug stay in the gate:
         // a seed reproduces a program exactly, so a list is a regression suite.
@@ -1308,23 +1364,27 @@ fn main() {
             .filter(|l| !l.is_empty())
             .map(|l| l.parse().unwrap_or_else(|_| panic!("seed-list: not a seed: {l}")))
             .collect();
-        std::process::exit(run_list(&picks, &obc, &work, keep, &cflags, adversarial));
+        std::process::exit(run_list(&picks, &obc, &work, &modes));
     }
-    std::process::exit(run(base, seeds, &obc, &work, keep, &cflags, adversarial));
+    std::process::exit(run(base, seeds, &obc, &work, &modes));
 }
 
-fn run_list(
-    picks: &[u64],
-    obc: &Path,
-    work: &Path,
+/// What the caller asked for: the modes that change what is generated, and the C
+/// flags that change how it is built. One argument, because the runners would
+/// otherwise take one per mode.
+#[derive(Clone, Default)]
+struct Modes {
     keep: bool,
-    cflags: &[String],
+    cflags: Vec<String>,
     adversarial: bool,
-) -> i32 {
+    lower_keywords: bool,
+}
+
+fn run_list(picks: &[u64], obc: &Path, work: &Path, modes: &Modes) -> i32 {
     std::fs::create_dir_all(work).expect("cannot create the work directory");
     let mut failed = 0;
     for &seed in picks {
-        match one(seed, obc, work, keep, cflags, adversarial) {
+        match one(seed, obc, work, modes) {
             Ok(()) => println!("PASS seed-{seed}"),
             Err(why) => {
                 println!("FAIL seed-{seed}: {why}");
@@ -1344,19 +1404,11 @@ fn run_list(
     }
 }
 
-fn run(
-    base: u64,
-    seeds: u64,
-    obc: &Path,
-    work: &Path,
-    keep: bool,
-    cflags: &[String],
-    adversarial: bool,
-) -> i32 {
+fn run(base: u64, seeds: u64, obc: &Path, work: &Path, modes: &Modes) -> i32 {
     std::fs::create_dir_all(work).expect("cannot create the work directory");
     let mut failed = 0;
     for seed in base..base + seeds {
-        match one(seed, obc, work, keep, cflags, adversarial) {
+        match one(seed, obc, work, modes) {
             Ok(()) => println!("PASS seed-{seed}"),
             Err(why) => {
                 println!("FAIL seed-{seed}: {why}");
@@ -1375,16 +1427,10 @@ fn run(
     }
 }
 
-fn one(
-    seed: u64,
-    obc: &Path,
-    work: &Path,
-    keep: bool,
-    cflags: &[String],
-    adversarial: bool,
-) -> Result<(), String> {
+fn one(seed: u64, obc: &Path, work: &Path, modes: &Modes) -> Result<(), String> {
     let mut program = generate(seed);
-    program.adversarial = adversarial;
+    program.adversarial = modes.adversarial;
+    program.lower_keywords = modes.lower_keywords;
     let (src, expectation) = program.render_with_expectation();
     let dir = work.join(format!("seed-{seed}"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1393,7 +1439,7 @@ fn one(
     // A failing seed is the artefact worth keeping: drop the directory of a
     // passing one unless the caller asked for everything.
     let drop_dir = || {
-        if !keep {
+        if !modes.keep {
             let _ = std::fs::remove_dir_all(&dir);
         }
     };
@@ -1402,8 +1448,11 @@ fn one(
     cmd.arg("build").arg(&path).arg("--out").arg(&dir).arg("-o").arg(dir.join("Fuzz"));
     // Extra C flags, so the corpus can be run under the sanitizers the way the
     // golden suite runs its own programs twice (PLAN.md W7.5).
-    for f in cflags {
+    for f in &modes.cflags {
         cmd.arg("--cflag").arg(f);
+    }
+    if modes.lower_keywords {
+        cmd.arg("-Odialect=lower");
     }
     let out = cmd
         .output()

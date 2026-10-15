@@ -34,6 +34,12 @@ BASE=${BASE:-1}
 # collects once at exit (W10.2), so a leak here is a finding rather than a
 # language property.
 #
+# `--lower` renders the same programs with reserved words in lower case and builds
+# them in the `-Odialect=lower` dialect (PLAN.md W8.10), so the one extension that
+# had to be gated is covered end to end by the corpus rather than only by
+# hand-written cases. The values are the same, which is the point: a dialect that
+# changed them would be a different language.
+#
 # The adversarial mode appends one deliberate violation per program (an index
 # past the end, a NIL dereference, a guard that cannot hold, a computed zero
 # divisor, a false assertion) and the run must produce the exact trap line --
@@ -80,6 +86,7 @@ else
     run --seed-list "$LIST" "$@"                    # the value oracle
     echo "----"
     run --seed-list "$LIST" --adversarial "$@"      # the trap oracle
+    run --seed-list "$LIST" --lower "$@"            # the same programs, lower-case dialect
     echo "----"
     run --seeds "$COVER" --base "$BASE" "$@"        # coverage
     echo "----"
@@ -88,6 +95,6 @@ else
     GC=1 run --seed-list "$LIST" "$@"               # the value oracle, under GC stress
     echo "----"
     GC=1 run --seeds "$GCCOVER" --base "$BASE" "$@" # and fresh programs under it
-    echo "SUMMARY fuzz: regression list (values, traps, values under stress) + $COVER coverage + $ADVCOVER adversarial + $GCCOVER under stress${SAN:+ under sanitizers}, exit $status"
+    echo "SUMMARY fuzz: regression list (values, traps, stress, lower-case dialect) + $COVER coverage + $ADVCOVER adversarial + $GCCOVER under stress${SAN:+ under sanitizers}, exit $status"
 fi
 exit $status
