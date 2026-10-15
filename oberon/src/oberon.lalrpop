@@ -197,13 +197,14 @@ ProcDeclSemi: Proc = <p:ProcDecl> ";" => p;
 
 /// `ProcedureDeclaration = ProcedureHeading ";" ProcedureBody ident`
 ProcDecl: Proc = {
-    <lo:@L> "PROCEDURE" <id:IdentDef> <fp:FormalParameters?> ";" <decls:Declarations>
+    <lo:@L> "PROCEDURE" <nlo:@L> <id:IdentDef> <nhi:@R> <fp:FormalParameters?> ";" <decls:Declarations>
         <body:BeginClause> <ret:ReturnClause> "END" <end_name:Ident> <hi:@R> => {
             let (params, result) = match fp {
                 Some(f) => (f.params, f.result),
                 None => (Vec::new(), None),
             };
             Proc {
+                name_span: sp(nlo, nhi),
                 name: id.0,
                 export: id.1,
                 params,

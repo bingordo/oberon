@@ -131,6 +131,9 @@ pub struct Proc {
     pub ret: Option<Expr>,
     /// The identifier repeated after `END`; must equal `name`.
     pub end_name: Ident,
+    /// The span of the *name* (and its export mark), which is what a diagnostic
+    /// about the declaration should point at: `span` covers the whole body.
+    pub name_span: Span,
     pub span: Span,
 }
 

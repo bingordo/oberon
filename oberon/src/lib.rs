@@ -386,7 +386,8 @@ IF (0 <= i) & (i < 100) THEN k := (i + j) DIV 2 END;
 r := 4.567E8 * 12.3;
 j := -k; j := ORD("A"); j := ORD(22X)
   END Walk;
-BEGIN i := 0; s := {2, 3, 5, 7, 11, 13}; Walk(t, i, "hi")
+BEGIN
+i := log2(8); i := 0; s := {2, 3, 5, 7, 11, 13}; Walk(t, i, "hi")
 END Demo.
 "#;
 
@@ -802,7 +803,7 @@ END M.
         walk_stmts(&stmts, &mut guards, &mut calls, &mut args);
         assert_eq!(args, 0, "every `( ... )` selector must be resolved");
         assert_eq!(guards, 1, "`t(CenterNode)` is the only guard in the sink");
-        assert_eq!(calls, 6, "INC, FLT, ABS, ORD, ORD, Walk");
+        assert_eq!(calls, 7, "INC, FLT, ABS, ORD, ORD, Walk, log2");
     }
 
     #[test]
@@ -900,6 +901,36 @@ mod diag_tests {
         assert_eq!(messages(&diags).len(), 1, "{text}");
         assert!(text.contains("M.mod:3:9: error: unexpected `b`"), "{text}");
         assert!(text.contains("= note: expected ;"), "{text}");
+    }
+
+    #[test]
+    fn an_uncalled_procedure_warns_and_a_used_one_does_not() {
+        // ✔ row 54, the other half: the report has no way to mark a procedure as
+        // deliberately unused. A call, a use as a value, an exported procedure
+        // and a nested one are all covered here.
+        let src = "MODULE M;\n  VAR p: PROCEDURE;\n  PROCEDURE Unused; BEGIN END Unused;\n  PROCEDURE Used; BEGIN END Used;\n  PROCEDURE AsValue; BEGIN END AsValue;\n  PROCEDURE Exported*; BEGIN END Exported;\n  PROCEDURE Outer;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN\n    Used;\n    p := AsValue\n  END Outer;\nBEGIN\n  Outer\nEND M.\n";
+        let (text, diags) = report(src);
+        let warnings: Vec<String> = diags
+            .iter()
+            .filter(|d| !d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        // `Unused` at module level, `Inner` nested: both warn. `Used`,
+        // `AsValue`, `Exported` and `Outer` do not, so exactly two diagnostics.
+        assert_eq!(warnings.len(), 2, "{text}\n{warnings:?}");
+        assert!(
+            warnings[0].contains("procedure `Unused` is never used"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("procedure `Inner` is never used"),
+            "{warnings:?}"
+        );
+        // and the caret is on the *name*, not on the whole declaration
+        assert!(
+            text.contains("M.mod:3:13: warning: procedure `Unused` is never used"),
+            "{text}"
+        );
     }
 
     #[test]

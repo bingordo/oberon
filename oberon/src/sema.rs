@@ -109,6 +109,10 @@ enum Sym {
         /// A procedure declared inside another procedure; report §6.5 forbids
         /// assigning one to a procedure variable (check 50).
         local: bool,
+        /// Identity of a procedure *this compilation unit declares*, so a use
+        /// can be attributed to it despite shadowing (check 54's
+        /// unused-procedure half). `None` for an imported or predefined one.
+        id: Option<usize>,
     },
     /// A predeclared procedure of report §10.2.
     Predef(&'static str),
@@ -170,6 +174,13 @@ pub struct Sema<'a> {
     locked: Vec<String>,
     /// Names that were looked up, so an unused import can be reported.
     used: Vec<String>,
+    /// Procedures this unit declares: id, name, the span to point at, and
+    /// whether the declaration is exported (an exported procedure is used by
+    /// its clients, so it can never be unused here).
+    declared_procs: Vec<(usize, String, Span, bool)>,
+    /// Ids of procedures that were used: called, or referenced as a value.
+    used_procs: Vec<usize>,
+    next_proc_id: usize,
     imports: Vec<(String, Span)>,
     /// Built type environments of imported modules, by interface index.
     envs: HashMap<usize, HashMap<String, TypeId>>,
@@ -210,6 +221,9 @@ impl<'a> Sema<'a> {
             interfaces,
             locked: Vec::new(),
             used: Vec::new(),
+            declared_procs: Vec::new(),
+            used_procs: Vec::new(),
+            next_proc_id: 0,
             imports: Vec::new(),
             envs: HashMap::new(),
             resolving: Vec::new(),
@@ -244,6 +258,7 @@ impl<'a> Sema<'a> {
             sema.stmt(s);
         }
         sema.unused_imports(module);
+        sema.unused_procedures();
         dedup_diagnostics(&mut sema.diags);
         sema
     }
@@ -360,7 +375,14 @@ impl<'a> Sema<'a> {
     fn lookup_qual(&mut self, q: &QIdent, span: Span) -> Option<Sym> {
         if q.len() == 1 {
             self.used.push(q[0].clone());
-            return match self.lookup(&q[0]) {
+            let found = self.lookup(&q[0]);
+            if let Some(Sym::Proc { id: Some(id), .. }) = found {
+                // A use of a procedure this unit declares: check 54's
+                // unused-procedure half reads this. Qualified names cannot
+                // reach a local procedure, so they need no case.
+                self.used_procs.push(id);
+            }
+            return match found {
                 Some(s) => Some(s),
                 None => {
                     self.error(span, format!("`{}` is not declared (report 4)", q[0]));
@@ -478,6 +500,21 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// ✔ row 54 (the other half): a procedure this unit declares and never uses
+    /// is worth a warning, since the report has no way to mark one as
+    /// deliberately unused. A procedure that only calls *itself* counts as used,
+    /// which is a known imprecision: the report has no way to say "not
+    /// reachable", and reachability is not what this checks.
+    fn unused_procedures(&mut self) {
+        let declared = self.declared_procs.clone();
+        for (id, name, span, exported) in declared {
+            if exported || self.used_procs.contains(&id) {
+                continue;
+            }
+            self.warn(span, format!("procedure `{name}` is never used"));
+        }
+    }
+
     fn unused_imports(&mut self, m: &Module) {
         // ✔ row 54 (warning half): an import that is never qualified.
         let imports = self.imports.clone();
@@ -539,6 +576,7 @@ impl<'a> Sema<'a> {
                 Some(Sym::Proc {
                     ty: self.types.proc(ps, r),
                     local: false,
+                    id: None,
                 })
             }
         }
@@ -1072,11 +1110,16 @@ impl<'a> Sema<'a> {
             declared.iter().map(|(_, pm)| *pm).collect(),
             result,
         );
+        let id = self.next_proc_id;
+        self.next_proc_id += 1;
+        self.declared_procs
+            .push((id, p.name.clone(), p.name_span, p.export));
         self.declare(
             &p.name,
             Sym::Proc {
                 ty: pty,
                 local: !is_module,
+                id: Some(id),
             },
             p.span,
         );
@@ -1567,14 +1610,16 @@ impl<'a> Sema<'a> {
                 read_only: Some("is a constant, which is read-only (report 9.1)"),
                 ..Typed::value(ty)
             },
-            Sym::Proc { local, .. } => Typed {
-                proc: Some(if *local {
-                    "local procedure"
-                } else {
-                    "procedure"
-                }),
-                ..Typed::value(ty)
-            },
+            Sym::Proc { local, .. } => {
+                Typed {
+                    proc: Some(if *local {
+                        "local procedure"
+                    } else {
+                        "procedure"
+                    }),
+                    ..Typed::value(ty)
+                }
+            }
             Sym::Predef(n) => {
                 // ✔ row 51: report §6.5/§10.1 - a standard procedure cannot be
                 // used as a value.

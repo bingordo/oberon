@@ -96,11 +96,22 @@ Files: `src/sema.rs`.
 Done when: passing a nested procedure where a procedure variable is expected is
 an error, with a test.
 
-**W1.3 row 54's unused-*procedure* half**
+**W1.3 row 54's unused-*procedure* half** — **done**
 Why: unused imports warn; an unused local procedure does not.
 Files: `src/sema.rs` (the `unused_imports` pass is the natural home).
 Done when: a module with an uncalled local procedure warns once, the warning is
 located, and it is visible through `obc check` (the path fixed this session).
+**Done**: `Sema::unused_procedures`, with uses recorded at the one place every
+*use* of a name passes through (`lookup_qual`; the silent probes call `lookup`
+and do not count), identities assigned per declaration so shadowing cannot
+confuse it, and the caret on the procedure's *name* — which needed a span in the
+AST (`Proc::name_span`, captured by the grammar) rather than arithmetic on the
+declaration's span. A call, a use as a value and an exported procedure all count
+as used; a self-recursive but otherwise unreachable procedure counts as used,
+which the code says is the imprecision. Tested by
+`diag_tests::an_uncalled_procedure_warns_and_a_used_one_does_not` (module-level
+and nested, plus four negative cases) and DESIGN §8.5's list of unchecked rules
+is down to three.
 
 **W1.4 settle §13's open questions and delete them** — **done**
 Why: three questions have been open since the design was written, and one is
