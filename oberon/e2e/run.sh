@@ -147,8 +147,10 @@ printf 'MODULE NoEnd;\n  VAR x: INTEGER;\nBEGIN\n  x := 1;\nIF x = 1 THEN x := 2
 "$OBC" check "$DRV/NoEnd.mod" -I . >"$DRV/noend.out" 2>&1 || true
 check "driver-locates-a-module-level-error" "1" \
     "$(grep -c 'error: unexpected `NoEnd`' "$DRV/noend.out")"
+# `;` leads the expected list when it would have fitted: a missing separator is
+# the commonest defect, so the note names it first.
 check "driver-says-what-would-have-fitted" "1" \
-    "$(grep -c '= note: expected END or ;' "$DRV/noend.out")"
+    "$(grep -c '= note: expected ; .*END' "$DRV/noend.out")"
 
 # 7. Regression module: one line of output per defect the review found, each
 #    line's expectation computed from the report rather than from a run.

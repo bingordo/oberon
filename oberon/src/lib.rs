@@ -114,7 +114,29 @@ fn severity_name(severity: sema::Severity) -> &'static str {
 
 /// A syntax error as a first-class diagnostic, so that a parse failure is
 /// located and rendered exactly like a type error (DESIGN §5 D7, §10).
-pub fn diagnostic_for_parse_error(error: &ParseErr<'_>, dropped: Option<usize>) -> Diagnostic {
+/// The note for a recovered error: what the parser threw away to carry on. The
+/// tokens are rendered the way the parser prints them, and LALRPOP's synthetic
+/// ones (`error`, `Eof`) are left out.
+pub fn recovery_note(tokens: &[(usize, Token<'_>, usize)]) -> Option<String> {
+    let text: Vec<String> = tokens
+        .iter()
+        .map(|(_, t, _)| t.to_string())
+        .filter(|t| t != "error" && t != "Eof" && t != "?")
+        .collect();
+    if text.is_empty() {
+        return None;
+    }
+    const SHOWN: usize = 8;
+    let shown = text.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(" ");
+    let more = text.len().saturating_sub(SHOWN);
+    let mut note = format!("the parser skipped `{shown}` to carry on; a later error may be a consequence of this one");
+    if more > 0 {
+        let _ = write!(note, " ({more} more token(s) were skipped)");
+    }
+    Some(note)
+}
+
+pub fn diagnostic_for_parse_error(error: &ParseErr<'_>) -> Diagnostic {
     use lalrpop_util::ParseError as P;
     let expected_note = |expected: &[String]| -> Option<String> {
         if expected.is_empty() {
@@ -123,8 +145,15 @@ pub fn diagnostic_for_parse_error(error: &ParseErr<'_>, dropped: Option<usize>) 
         // LALRPOP names terminals with their own quoting; a reader wants the
         // tokens themselves.
         let clean = |s: &String| s.trim_matches('"').to_string();
+        // A missing separator is the commonest defect, so `;` leads when it
+        // would have fitted; the rest keeps LALRPOP's order.
+        let mut ordered: Vec<&String> = expected.iter().collect();
+        if let Some(i) = ordered.iter().position(|s| clean(s) == ";") {
+            let semi = ordered.remove(i);
+            ordered.insert(0, semi);
+        }
         const SHOWN: usize = 6;
-        let mut shown: Vec<String> = expected.iter().take(SHOWN).map(clean).collect();
+        let mut shown: Vec<String> = ordered.iter().take(SHOWN).map(|s| clean(s)).collect();
         let more = expected.len().saturating_sub(SHOWN);
         let last = shown.pop();
         let mut note = match (shown.is_empty(), last) {
@@ -137,7 +166,7 @@ pub fn diagnostic_for_parse_error(error: &ParseErr<'_>, dropped: Option<usize>) 
         }
         Some(note)
     };
-    let mut d = match error {
+    let d = match error {
         P::InvalidToken { location } => {
             Diagnostic::error(span_of(*location, *location + 1), "the source is not valid here")
         }
@@ -171,12 +200,6 @@ pub fn diagnostic_for_parse_error(error: &ParseErr<'_>, dropped: Option<usize>) 
             Diagnostic::error(span_of(lo, hi), error.to_string()).with_note(error.note())
         }
     };
-    if let Some(n) = dropped.filter(|n| *n > 0) {
-        d = d.with_note(format!(
-            "the parser skipped {n} token(s) to carry on; a later error may be a consequence of \
-             this one"
-        ));
-    }
     d
 }
 
@@ -211,7 +234,7 @@ pub fn render_diagnostics(path: &str, src: &str, diags: &[Diagnostic]) -> String
             let pad = " ".repeat((col as usize - 1).min(text.len()));
             let _ = writeln!(out, "{:width$} | {pad}{}", "", "^".repeat(carets));
         }
-        if let Some(note) = &d.note {
+        for note in &d.notes {
             let _ = writeln!(out, "  = note: {note}");
         }
     }
@@ -227,14 +250,20 @@ pub fn parse_with_diagnostics(input: &str) -> (Option<Module>, Vec<Diagnostic>) 
     let recovered = |errors: &Vec<ErrorRecovery<usize, Token<'_>, LexicalError>>| -> Vec<Diagnostic> {
         errors
             .iter()
-            .map(|r| diagnostic_for_parse_error(&r.error, Some(r.dropped_tokens.len())))
+            .map(|r| {
+                let mut d = diagnostic_for_parse_error(&r.error);
+                if let Some(n) = recovery_note(&r.dropped_tokens) {
+                    d = d.with_note(n);
+                }
+                d
+            })
             .collect()
     };
     match oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input)) {
         Ok(module) => (Some(module), recovered(&errors)),
         Err(fatal) => {
             let mut diags = recovered(&errors);
-            diags.push(diagnostic_for_parse_error(&fatal, None));
+            diags.push(diagnostic_for_parse_error(&fatal));
             (None, diags)
         }
     }
@@ -832,8 +861,51 @@ mod diag_tests {
         let (text, diags) = report(src);
         assert_eq!(messages(&diags).len(), 1, "{text}");
         assert!(text.contains("error: unexpected `M`"), "{text}");
-        assert!(text.contains("expected END or ;"), "{text}");
+        // `;` now leads the expected list (see `expected_note`), so this asserts
+        // what the note must mention rather than the order it mentions it in.
+        assert!(text.contains("expected ;") && text.contains("END"), "{text}");
         assert!(text.contains("6 | END M."), "{text}");
+    }
+
+    #[test]
+    fn a_missing_separator_is_reported_with_both_notes() {
+        // The commonest defect of all: two statements in a row. The reader needs
+        // to know what would have fitted (`;` first) *and* what the recovery
+        // discarded, because the discarded statement is the innocent one and its
+        // own errors are never reported.
+        let src = "MODULE M;\n  VAR x, y: INTEGER;\nBEGIN\n  x := 1\n  y := 2;\n  z := 3\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 2, "{text}");
+        // the missing separator, located at the statement that followed it
+        assert!(text.contains("M.mod:5:3: error: unexpected `y`"), "{text}");
+        assert!(text.contains("= note: expected ;, "), "{text}");
+        assert!(
+            text.contains("= note: the parser skipped `y := 2` to carry on"),
+            "{text}"
+        );
+        // and the check continues, so the real error after it is still found
+        assert!(text.contains("M.mod:6:3: error: `z` is not declared"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_separator_in_a_declaration_names_what_followed() {
+        // `CONST a = 1 b = 2;`: the parse cannot recover inside a declaration
+        // list (DESIGN §5 D7), but the message still has to say what the parser
+        // was doing when it gave up.
+        let src = "MODULE M;\n  CONST a = 1\n        b = 2;\nBEGIN\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{text}");
+        assert!(text.contains("M.mod:3:9: error: unexpected `b`"), "{text}");
+        assert!(text.contains("= note: expected ;"), "{text}");
+    }
+
+    #[test]
+    fn several_notes_are_all_rendered() {
+        // One note per line: a diagnostic used to keep only the last one, so the
+        // expected-token note vanished whenever a recovery added its own.
+        let src = "MODULE M;\nBEGIN\n  x := 1\n  y := 2\nEND M.\n";
+        let (text, _) = report(src);
+        assert_eq!(text.matches("= note: ").count(), 2, "{text}");
     }
 
     #[test]

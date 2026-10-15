@@ -297,7 +297,43 @@ today:
 | **three uses of the same undeclared name** (`Zz := 1; Zz := 2; x := Zz`) | **3** | **fix: report the first use and note the rest** — this is the one repetition the checker still produces |
 | **sixty broken statements in one body** | **60** | **fix: an error limit** — nothing stops a flood |
 
-So the improvement is two small, boring changes, not a rearchitecture:
+### the commonest defect: a missing `;`
+
+Measured at every site a separator can go missing, plus the `;`-first message
+work that came out of it **[landed]**:
+
+| site | today | after the message work |
+|---|---|---|
+| between statements in a body, next starts with an identifier (`x := 1` ⏎ `y := 2;`) | 2 diagnostics: the syntax error, then the *real* error after the skipped statement; the recovery **discards the next statement**, so that statement's own errors are never reported | the two notes now read together: `expected ;, END, DIV, MOD, OR or IN (12 other token(s) would do as well)` and ``the parser skipped `y := 2` to carry on; a later error may be a consequence`` — the first note names the missing token first, the second names the innocent statement that was lost |
+| between statements, next starts with a keyword (`x := 1` ⏎ `IF …`) | same shape, and the keyword makes it unambiguous to a reader at a glance | same |
+| before `BEGIN` (`VAR x: INTEGER` ⏎ `BEGIN`) | one fatal error: recovery cannot resynchronise in declarations (W5.1) | `expected ; or END` now leads with `;` |
+| between `CONST`/`VAR`/record-field/formal-parameter declarations | one fatal error each | same, with `;` leading |
+| between procedures (`END P` ⏎ `PROCEDURE Q;`) | one fatal error | same |
+| in an import list (`IMPORT Texts` ⏎ `Oberon;`) | one fatal error | same |
+| between case arms (a missing `|`) | one fatal error | same |
+| an *extra* `;` between declarations (`VAR x: INTEGER;;`) | one error (`unexpected ;`) | same |
+
+Three things were learned here, and two of them are why the compiler now says
+what it says:
+
+1. *The grammar cannot keep the innocent statement.* Tried and rejected, with
+   evidence: letting the error token stand in for a statement separator
+   (`<s:Statement> <e:!> <rest:StatementSequence>`) produces **4 LALRPOP
+   conflicts**, the same wall as W5.1. So a missing `;` in a body is *reported*,
+   not *repaired* — and the honest fix is to say exactly what was discarded,
+   which is what the recovery note now does. **[landed: `git diff` of
+   `src/oberon.lalrpop` is empty; the experiment was reverted]**
+2. *A diagnostic used to hold one note.* `Diagnostic::with_note` **replaced** the
+   note, so a recovered error showed the recovery note and silently dropped the
+   expected-token note — the reader lost "what would have fitted". `Diagnostic`
+   now has `notes: Vec<String>` (which is what DESIGN §10 said all along) and
+   renders every one. **[landed; `several_notes_are_all_rendered`]**
+3. *`;` leads the expected list.* The set comes from LALRPOP in its own order,
+   so the commonest defect used to be answered with "expected DIV, MOD, OR, IN…".
+   `;` is now first when it would have fitted. **[landed;
+   `a_missing_separator_is_reported_with_both_notes`, and the e2e check pins it]**
+
+Still open in this item — two small, boring changes, not a rearchitecture:
 
 1. *First-use suppression for a name.* A per-check set of names already reported
    turns three diagnostics into one plus `further errors for "Zz" are
@@ -316,6 +352,10 @@ fatal module-level error (the one located message is honest and cheap), and any
 already accurate).
 
 Test cases, which are half the point of the item:
+* the three tests landed above (`a_missing_separator_is_reported_with_both_notes`,
+  `a_missing_separator_in_a_declaration_names_what_followed`,
+  `several_notes_are_all_rendered`) cover the message side; what is still open
+  is pinning the *counts* for every row of the two tables;
 * a `recovery_tests` table in `oberon/src/lib.rs`, one row per probe above as
   (source, expected diagnostics as `(line, column, kind)`), so every count in
   that table becomes pinned: a future cascade or a lost diagnostic fails a test

@@ -121,7 +121,7 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             // The same shape as any other diagnostic (DESIGN §10).
-            let d = oberon_front::diagnostic_for_parse_error(&e, None);
+            let d = oberon_front::diagnostic_for_parse_error(&e);
             eprint!("{}", oberon_front::render_diagnostics(path, &src, &[d]));
             ExitCode::FAILURE
         }

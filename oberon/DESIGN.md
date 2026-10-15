@@ -1124,6 +1124,16 @@ Mix.mod:4:8: error: unexpected `;`
   * A lexical error (`LexicalError`) carries its offset and a note stating the
     vocabulary rule (`not part of Oberon's vocabulary (report 3)`), because its
     `Display` would otherwise be a bare byte offset.
+* Notes **accumulate** (`Diagnostic::notes`): a recovered error carries two, and
+  both matter — what would have fitted here, and what the recovery discarded.
+  Rendering only the last one used to hide the expected-token note, which is how
+  a missing `;` came to be answered with an operator list and no mention of `;`.
+* The expected-token note **leads with `;`** when `;` would have fitted, because a
+  missing separator is the commonest defect, and the recovery note **quotes the
+  tokens it skipped** (``the parser skipped `y := 2` to carry on``) rather than
+  only counting them: the statement the recovery discards is the innocent one,
+  and its own errors are never reported, so the reader has to be told which text
+  it was.
 * Diagnostics are de-duplicated by *(span, severity, message)* and sorted by
   span, because the recovering parser and the checker can meet the same mistake:
   a call statement used to be looked up twice, so an unknown callee was reported

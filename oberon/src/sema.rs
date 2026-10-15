@@ -44,7 +44,7 @@ pub struct Diagnostic {
     pub message: String,
     /// A second line of explanation: what the compiler expected, which report
     /// rule applies, or what the mistaken construct probably meant.
-    pub note: Option<String>,
+    pub notes: Vec<String>,
 }
 
 impl Diagnostic {
@@ -53,7 +53,7 @@ impl Diagnostic {
             severity,
             span,
             message: message.into(),
-            note: None,
+            notes: Vec::new(),
         }
     }
 
@@ -61,8 +61,11 @@ impl Diagnostic {
         Diagnostic::new(Severity::Error, span, message)
     }
 
+    /// Notes accumulate: a syntax error can have both "what would have fitted
+    /// here" and "what the recovery discarded", and the reader needs both
+    /// (DESIGN §10).
     pub fn with_note(mut self, note: impl Into<String>) -> Diagnostic {
-        self.note = Some(note.into());
+        self.notes.push(note.into());
         self
     }
 
