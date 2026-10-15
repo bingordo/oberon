@@ -963,6 +963,73 @@ Done when: each item above has either landed with tests or been declined in DESI
 
 ---
 
+## W9 — a second back end that emits ELF directly, on Cranelift
+
+**W9.1 research the back end, then build it beside the C one** — **open**
+
+Why: every memory-safety and code-generation finding of W7 has been about the *C*
+the emitter writes, not about Oberon-07 — R15 (a guarded read gcc can prove is
+outside the allocation), R20 (a `malloc`-typed `NEW`), the `-Werror` classes that
+make a correct program unwritable, and the `-fwrapv`-style care the runtime needs.
+All of it comes from handing the program to a C compiler that is entitled to assume
+the C is defined and that changes its warnings between versions. Cranelift has no
+such rights: its integer arithmetic wraps by definition, and its traps are ours to
+emit — we call `rt_trap`, so the byte-offset diagnostics the design is built around
+are unchanged. A backend that writes ELF is also a backend with no `cc` in the
+build at all.
+
+*The crates*, verified at crates.io on 2026-10-15: the family is `cranelift`
+0.136.3, `cranelift-codegen` (the generator), `cranelift-frontend` (the IR builder),
+`cranelift-module` (functions and data across modules), `cranelift-object` ("Emit
+Cranelift output to native object files with `object`" — the ELF path), plus
+`cranelift-native` and `cranelift-control`; all `Apache-2.0 WITH LLVM-exception`.
+There is **no crate named `cranelift-backend`**; the name to read is the family
+above, and `cranelift-object` is the one that writes the object file.
+
+*Research, before any code* — each question gets its answer recorded in DESIGN with
+the source it came from:
+
+1. **The object path.** `ObjectModule` + `object::write`, and which `Symbol` and
+   `Section` choices carry our static data: the per-type `ObDesc` objects, the
+   command table (an array of function pointers) and the generated `main`.
+2. **The C ABI boundary.** The runtime stays C, so `rt_*`'s signatures and the
+   `ObDesc` layout become a *frozen interface*: confirm Cranelift's calling
+   convention is the platform's C one for the shapes we pass (scalars and
+   pointers only — records never cross the boundary by value, they are addressed
+   through the pointer the language already passes) and how a data object's
+   address is materialised for `rt_new`/`rt_is`.
+3. **Layout.** Cranelift's IR types are flat; a record is a byte blob reached
+   through a pointer, so the offsets stay ours, computed exactly as the C emitter
+   computes them. Confirm nothing in the IR builder forces a second layout —
+   the descriptor at offset 0 is an interface, not an implementation detail.
+4. **Checks and traps.** Every check stays an explicit branch into a runtime call
+   (`rt_index`-style helpers or `rt_trap`), so no behaviour depends on a hardware
+   fault, and the traceback keeps its source offsets.
+5. **Debug info.** Whether to emit DWARF (`cranelift-object`'s debug support,
+   `gimli`) or to keep traps as the only locator, as the design already argues.
+6. **Integration.** A `--backend=c|clif` switch. The C path stays the reference.
+   `golden` and `csmoke` are C-level oracles and stay on the C path; `e2e` and
+   `fuzz` are back-end-agnostic and become the Cranelift gate.
+7. **What is lost as well as gained.** No preprocessor, no `-O2` to lean on beyond
+   `cranelift-codegen`'s own optimisation levels, and no GCC extensions — the
+   label-address idiom the descriptor tables use on the C side has no counterpart
+   and none is needed.
+
+*Plan*: a lowerer beside `cgen` consuming the same checked AST and `sema` types —
+the phase boundary the design already fixes — building SSA per procedure with
+`cranelift-frontend`'s `FunctionBuilder` (a `VAR` parameter or an address-taken
+local becomes a stack slot; anything else is an SSA value) and emitting through
+`cranelift-object`. The runtime interface is kept fixed, so both back ends link the
+*same* runtime and a mixed build links — which is what makes a second back end
+cheap and keeps the C one honest. Once the prototype is green, the last C
+dependency (the runtime itself, plain C over libc) can be lowered by the same back
+end, and only then is "generates ELF directly" literally true of the whole program.
+
+Done when: the research questions are answered with their sources in DESIGN; a
+prototype builds and runs the `e2e` modules with every row passing; `fuzz`'s seeds
+pass against it; and DESIGN records the ABI decision (runtime in C versus lowered)
+with the reason it was taken.
+
 ## Ideas not yet in the design (adopt or drop)
 
 - Fuzz the *lexer* with random bytes and random token streams: assert no panic
