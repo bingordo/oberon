@@ -89,12 +89,17 @@ Done when: the mark travels through the interface, an access to a private field
 of an imported record is an error, and `check_tests` has a case per row (each
 case names its row number).
 
-**W1.2 row 50's locality half** (report §6.5)
+**W1.2 row 50's locality half** (report §6.5, §10.1) — **done**
 Why: a *local* procedure assigned to a procedure variable is rejected, but one
 passed as an *actual* is not — the check exists on one side of a symmetric rule.
 Files: `src/sema.rs`.
 Done when: passing a nested procedure where a procedure variable is expected is
-an error, with a test.
+an error, with a test. **Done**: `check_actuals` rejects a `local procedure`
+actual when the formal's type is a procedure type (the formal is checked first so
+a plain type mismatch is not reported twice), which makes the rule hold for both
+of the report's halves — `f := Inner` and `Taker(Inner)`. Catalogue row 50 now
+has both shapes, and a probe confirms the module-level case still passes. §8.5's
+list of unchecked rules is down to two (both halves of field visibility, W1.1).
 
 **W1.3 row 54's unused-*procedure* half** — **done**
 Why: unused imports warn; an unused local procedure does not.

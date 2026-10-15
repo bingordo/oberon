@@ -1694,6 +1694,20 @@ impl<'a> Sema<'a> {
         }
         for (f, a) in formals.iter().zip(args) {
             let v = self.expr(a);
+            // ✔ row 50, the locality half: report §6.5/§10.1 — a formal of
+            // procedure type takes "a procedure declared globally, or a variable
+            // (or parameter) of that procedure type", never one declared inside
+            // another procedure. The formal's type is checked first so that a
+            // plain type mismatch is not reported twice.
+            if let Some("local procedure") = v.proc {
+                if matches!(self.types.get(f.ty), Type::Proc { .. }) {
+                    self.error(
+                        a.span,
+                        "a procedure declared inside another procedure cannot be passed as a \
+                         procedure parameter (report 6.5, 10.1)",
+                    );
+                }
+            }
             if f.by_var && !v.lvalue {
                 self.error(
                     a.span,

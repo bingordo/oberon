@@ -778,12 +778,14 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 **Status.** Rows 1-5 are the resolver's and 6-54 the checker's; both are
 implemented in `src/sema.rs` and driven by
 `check_tests::catalogue_rows_report_what_they_should`, which has a case per row
-(each naming the row number, so a failure points at the rule). Three things are
-*not* checked yet, listed here rather than implied: field **visibility** across
-modules (rows 4 and 14's private-field halves — a field's `*` is accepted, but
-who may read it is an interface-layer rule this pass does not model), and the
-locality half of row 50 when a procedure is passed as an *actual* (it is checked
-on assignment). Row 54's unused-*procedure* half is checked: a procedure this
+(each naming the row number, so a failure points at the rule; rows with two
+shapes have two cases). Two things are *not* checked yet, listed here rather than
+implied: field **visibility** across modules (rows 4 and 14's private-field
+halves — a field's `*` is accepted, but who may read it is an interface-layer
+rule this pass does not model), and row 50's locality half for a procedure
+*value* passed to a procedure type (the report's two ways to obtain one are
+declaration and a variable; assigning a *local* procedure is an error, and so is
+passing one). Row 54's unused-*procedure* half is checked: a procedure this
 unit declares and never uses is a warning, with the use recorded where a
 designator resolves to a procedure (so a call, a use as a value and an exported
 procedure all count), and a self-recursive one counting as used, which is the
@@ -1172,7 +1174,7 @@ Mix.mod:4:8: error: unexpected `;`
 | diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `src/lib.rs::diag_tests` **[exists: 15 tests]** |
 | error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `e2e` checks 10–13 **[exists]** |
 | resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `src/lib.rs` **[exists: 3 tests]** |
-| resolver + checker | one case per row of §8.5 (55 cases), plus the report's `Out` module and the kitchen sink checking clean | `src/lib.rs::check_tests` **[exists: 5 tests, 55 catalogue cases]** |
+| resolver + checker | one case per row of §8.5 (rows with two shapes have two cases), plus the report's `Out` module and the kitchen sink checking clean | `src/lib.rs::check_tests` **[exists: 5 tests]** |
 | diagnostic rendering | byte span → `line:col`, message text | `check_tests::diagnostics_carry_usable_spans` **[exists]** |
 | constant folder | `DIV`/`MOD`/shifts/sets fold identically to the runtime helpers | `golden/constexpr.tsv` cross-check **[exists: 52 expressions]** |
 | C emission | emitted C compiles with `-Wall -Wextra -Werror` and the program's stdout matches the expected output | `e2e` **[exists]** |

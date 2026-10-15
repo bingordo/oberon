@@ -1225,6 +1225,19 @@ PROC Append(p: Writer; b: Buffer)\n"),
                  BEGIN END M.",
                 "cannot be assigned to a procedure variable",
             ),
+            // row 50's other half: the report's rule is about the *value*, so it
+            // holds for an actual parameter too (report §10.1, "must be either a
+            // procedure declared globally, or a variable of that procedure
+            // type").
+            (
+                50,
+                "MODULE M; TYPE F = PROCEDURE;\n\
+                 PROCEDURE Taker(f: F); BEGIN END Taker;\n\
+                 PROCEDURE Outer; PROCEDURE Inner; BEGIN END Inner;\n\
+                 BEGIN Taker(Inner) END Outer;\n\
+                 BEGIN END M.",
+                "cannot be passed as a procedure parameter",
+            ),
             (51, "MODULE M; VAR i: INTEGER; BEGIN i := ABS END M.", "cannot be used as a value"),
             (52, "MODULE M; VAR s: SET; BEGIN s := {32} END M.", "outside 0..31"),
             (53, "MODULE M; IMPORT SYSTEM; BEGIN END M.", "module SYSTEM is not available"),
