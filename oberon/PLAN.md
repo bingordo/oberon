@@ -743,7 +743,7 @@ warning on the way to its trap. Declining is also defensible — Wirth's compile
 do not diagnose it — but then §13 should say so, because "the check traps" and
 "the compiler can see it is wrong" are different promises.
 
-**W7.3 the audit (the main deliverable)** — **open**
+**W7.3 the audit (the main deliverable)** — **done**
 Why: "every access is safe" is a claim about *all* the places the emitted C
 touches memory, and it should be a table, not a feeling. Write it into DESIGN
 §9.4, one row per access kind, with what makes it safe and which test exercises
@@ -755,7 +755,11 @@ frame and the static link (R7); descriptor reads for a type guard and for a
 type-`CASE` (including a stale or corrupted `id`); `NEW` and a failing `malloc`
 (R3); and the trap path itself.
 Done when: the table exists, each row names a test, and every row's "safe
-because" is either the type system or a helper visible in the emitted C.
+because" is either the type system or a helper visible in the emitted C. **Done**:
+DESIGN §9.4 carries the table — twelve rows from array indexing to the trap report
+itself — and it is honest about the two exceptions rather than implying
+completeness: `rt_new`'s failure path has no test yet (W7.4's allocation hook) and
+the NIL check is omitted for a side-effecting operand (R26).
 
 **W7.4 the trap matrix in `e2e`** — **open**
 Why: one deliberate violation per kind, each asserting the *offset* reported,

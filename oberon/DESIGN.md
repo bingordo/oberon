@@ -934,6 +934,31 @@ void *rt_new(int32_t size, ObDesc *d);   /* malloc header+payload; NIL on failur
 void  rt_trap(const char *);             /* bounds, NIL, case, ASSERT */
 ```
 
+**Every memory access, and why it is safe.** The design's promise is that a
+memory access in emitted code is either provably in bounds by the type system or
+guarded by something visible in the emitted C — with `SYSTEM` (W4.1, not built) as
+the only deliberate escape. This table is that promise, audited access by access
+(PLAN.md W7.3); the last column names the test that executes the row.
+
+| access | safe because | test |
+|---|---|---|
+| array index, fixed array | `rt_index(i, n, at)` — traps with the offset | `e2e/Trap.mod` (a constant index out of range), `diag_tests::a_constant_index_out_of_range_warns_and_still_traps` (the warning *and* five emitted checks) |
+| array index, open-array parameter | `rt_index` against the hidden length the caller passed | `e2e/Torture.mod`, `csmoke`'s open-array cases |
+| record field | the layout is computed by the emitter, so every field offset is in bounds by construction | `csmoke` (descriptors and layouts), `golden` (the emitted shapes) |
+| pointer dereference (`p.f`, `p^`) | `rt_nil(p, at)` — traps with the offset | `e2e`'s `nil-field-dereference-traps` and `nil-caret-dereference-traps`, `emit_tests::a_pointer_access_is_checked_for_nil`. **Exception**: when the operand has a side effect (an index expression containing a call) the check is *not* emitted, because `rt_nil` reads it twice (R26) |
+| failed type guard `v(T)` | `rt_guard_is` — traps | `e2e`'s `failed-guard-traps` (pointer spelling); the record spelling is R15 |
+| type-`CASE` with no matching label | `rt_trap("CASE: no matching type")` | `csmoke` (the descriptor-id switch), `e2e` |
+| whole-array and whole-record copy | `rt_rec_copy` / `rt_strcopy` / `memcpy` with the length the types give | `golden` (R14's exact-length string case), `csmoke` |
+| string literal initialisation | a bounded copy into the target array | `golden` (R14) |
+| frame and static link | the emitter's own layout; a link is only emitted where the body reaches an enclosing local | `csmoke` (three-level nesting, R7) |
+| `NEW` | `rt_new` allocates header plus payload and returns `NIL` on failure (report §6.4's failure case) | *not yet* — the failure path needs an allocation-failure hook, which is W7.4 |
+| descriptor read (`p.desc`) | the descriptor is at offset 0 of every view of a record, by the layout rule of §9.3 | `csmoke` (type-`CASE` and `IS`), `e2e`'s three-level extension |
+| the trap report itself | writes to `stderr` and aborts; it reads no program data | `e2e`'s trap rows |
+
+The one row without a test is `rt_new`'s failure path, and the one access without
+a check is the exception named in the pointer row. Both are itemised (W7.4, R26)
+rather than implied.
+
 Runtime checks are on by default (`-Ochecks`) and compiled out with `-Ochecks=n`.
 The trap payload is a message and the source position of the operation, so a
 failing program says `foo.Mod:41: index 12 out of range 0..9`.
