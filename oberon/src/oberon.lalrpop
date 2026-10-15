@@ -1,0 +1,517 @@
+//! Oberon-07 concrete syntax (Oberon-07 Report, revision 3.5.2016, appendix),
+//! expressed for LALRPOP and driven by the hand written lexer in `lexer.rs`.
+//!
+//! Two grammar-level decisions make the report's grammar LR(1) clean; both are
+//! documented at the production concerned:
+//!
+//! 1. `statement` in the report is an alternation of `assignment` and
+//!    `ProcedureCall`, which both begin with a `designator`.  Factored here
+//!    into two productions that differ at the lookahead `:=`.
+//! 2. A designator's type guard `v(T0)` and a call's actual parameters have
+//!    the same concrete shape.  The grammar parses `( ... )` after a
+//!    designator as `Selector::Args` only; the semantic phase decides whether
+//!    it is a guard or an argument list.  No `ActualParameters` production
+//!    exists, so `(` never follows a complete designator and there is no
+//!    shift/reduce decision to make.
+
+use crate::ast::*;
+use crate::lexer::{LexicalError, Token};
+
+grammar<'input>;
+
+extern {
+    type Location = usize;
+    type Error = LexicalError;
+
+    enum Token<'input> {
+        "ident"   => Token::Ident(<&'input str>),
+        "integer" => Token::Integer(<u32>),
+        "real"    => Token::Real(<f64>),
+        "string"  => Token::StrLit(<String>),
+        "char"    => Token::CharLit(<u8>),
+
+        "MODULE"    => Token::Module,
+        "IMPORT"    => Token::Import,
+        "CONST"     => Token::Const,
+        "TYPE"      => Token::Type,
+        "VAR"       => Token::Var,
+        "PROCEDURE" => Token::Procedure,
+        "BEGIN"     => Token::Begin,
+        "END"       => Token::End,
+        "RETURN"    => Token::Return,
+        "IF"        => Token::If,
+        "THEN"      => Token::Then,
+        "ELSIF"     => Token::Elsif,
+        "ELSE"      => Token::Else,
+        "CASE"      => Token::Case,
+        "OF"        => Token::Of,
+        "WHILE"     => Token::While,
+        "DO"        => Token::Do,
+        "REPEAT"    => Token::Repeat,
+        "UNTIL"     => Token::Until,
+        "FOR"       => Token::For,
+        "BY"        => Token::By,
+        "TO"        => Token::To,
+        "ARRAY"     => Token::Array,
+        "RECORD"    => Token::Record,
+        "POINTER"   => Token::Pointer,
+        "DIV"       => Token::Div,
+        "MOD"       => Token::Mod,
+        "OR"        => Token::Or,
+        "IN"        => Token::In,
+        "IS"        => Token::Is,
+        "NIL"       => Token::Nil,
+        "TRUE"      => Token::True,
+        "FALSE"     => Token::False,
+
+        ":="  => Token::Assign,
+        "^"   => Token::Caret,
+        "."   => Token::Dot,
+        ".."  => Token::DotDot,
+        ","   => Token::Comma,
+        ";"   => Token::Semi,
+        ":"   => Token::Colon,
+        "|"   => Token::Bar,
+        "+"   => Token::Plus,
+        "-"   => Token::Minus,
+        "*"   => Token::Star,
+        "/"   => Token::Slash,
+        "&"   => Token::Amp,
+        "~"   => Token::Tilde,
+        "="   => Token::EqOp,
+        "#"   => Token::Ne,
+        "<"   => Token::Lt,
+        "<="  => Token::Le,
+        ">"   => Token::Gt,
+        ">="  => Token::Ge,
+        "("   => Token::LParen,
+        ")"   => Token::RParen,
+        "["   => Token::LBrack,
+        "]"   => Token::RBrack,
+        "{"   => Token::LBrace,
+        "}"   => Token::RBrace,
+    }
+}
+
+// ---------------------------------------------------------------- module ---
+
+/// `module = MODULE ident ";" [ImportList] DeclarationSequence [BEGIN
+/// StatementSequence] END ident "."`
+pub CompilationUnit: Module = {
+    <lo:@L> "MODULE" <name:Ident> ";" <imports:ImportList> <decls:Declarations>
+        <body:BeginClause> "END" <end_name:Ident> "." <hi:@R> => Module {
+            name,
+            imports,
+            decls,
+            body,
+            end_name,
+            span: sp(lo, hi),
+        },
+};
+
+ImportList: Vec<Import> = {
+    => Vec::new(),
+    "IMPORT" <first:Import> <rest:ImportTail*> ";" => {
+        let mut v = vec![first];
+        v.extend(rest);
+        v
+    },
+};
+
+ImportTail: Import = "," <i:Import> => i;
+
+/// `import = ident [":=" ident]`
+Import: Import = {
+    <lo:@L> <alias:Ident> <hi:@R> => Import { module: alias.clone(), alias, span: sp(lo, hi) },
+    <lo:@L> <alias:Ident> ":=" <module:Ident> <hi:@R> => Import { alias, module, span: sp(lo, hi) },
+};
+
+BeginClause: Vec<Stmt> = {
+    => Vec::new(),
+    "BEGIN" <s:StatementSequence> => s,
+};
+
+// ----------------------------------------------------------- declarations ---
+
+/// `DeclarationSequence`: CONST, then TYPE, then VAR, then procedures - the
+/// order is fixed by the report, so this stays flat and deterministic.
+Declarations: Decls = <consts:ConstSection> <types:TypeSection> <vars:VarSection> <procs:ProcSection> => Decls {
+    consts,
+    types,
+    vars,
+    procs,
+};
+
+ConstSection: Vec<ConstDecl> = {
+    => Vec::new(),
+    "CONST" <ds:ConstDeclSemi*> => ds,
+};
+ConstDeclSemi: ConstDecl = <d:ConstDecl> ";" => d;
+ConstDecl: ConstDecl = <lo:@L> <id:IdentDef> "=" <value:Expr> <hi:@R> => ConstDecl {
+    name: id.0,
+    export: id.1,
+    value,
+    span: sp(lo, hi),
+};
+
+TypeSection: Vec<TypeDecl> = {
+    => Vec::new(),
+    "TYPE" <ds:TypeDeclSemi*> => ds,
+};
+TypeDeclSemi: TypeDecl = <d:TypeDecl> ";" => d;
+TypeDecl: TypeDecl = <lo:@L> <id:IdentDef> "=" <ty:TypeExpr> <hi:@R> => TypeDecl {
+    name: id.0,
+    export: id.1,
+    ty,
+    span: sp(lo, hi),
+};
+
+VarSection: Vec<VarDecl> = {
+    => Vec::new(),
+    "VAR" <ds:VarDeclSemi*> => ds,
+};
+VarDeclSemi: VarDecl = <d:VarDecl> ";" => d;
+VarDecl: VarDecl = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => VarDecl {
+    names,
+    ty,
+    span: sp(lo, hi),
+};
+
+/// `{ProcedureDeclaration ";"}`.
+///
+/// Note the shape: the `*` must be applied to the *non-nullable*
+/// `ProcDeclSemi`.  Writing this as `{ => Vec::new(), <ProcDeclSemi*> => ... }`
+/// would give `ProcSection` two different ε derivations, which is a genuine
+/// reduce/reduce conflict (a nullable symbol under `*` is always ambiguous).
+ProcSection: Vec<Proc> = <ps:ProcDeclSemi*> => ps;
+ProcDeclSemi: Proc = <p:ProcDecl> ";" => p;
+
+/// `ProcedureDeclaration = ProcedureHeading ";" ProcedureBody ident`
+ProcDecl: Proc = {
+    <lo:@L> "PROCEDURE" <id:IdentDef> <fp:FormalParameters?> ";" <decls:Declarations>
+        <body:BeginClause> <ret:ReturnClause> "END" <end_name:Ident> <hi:@R> => {
+            let (params, result) = match fp {
+                Some(f) => (f.params, f.result),
+                None => (Vec::new(), None),
+            };
+            Proc {
+                name: id.0,
+                export: id.1,
+                params,
+                result,
+                decls,
+                body,
+                ret,
+                end_name,
+                span: sp(lo, hi),
+            }
+        },
+};
+
+/// `[RETURN expression]`: Oberon-07 has at most one return, and it terminates
+/// the body.  That makes every procedure a single-exit region in the backend.
+ReturnClause: Option<Expr> = {
+    => None,
+    "RETURN" <e:Expr> => Some(e),
+};
+
+IdentList: Vec<(Ident, bool)> = <first:IdentDef> <rest:IdentDefTail*> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+};
+IdentDefTail: (Ident, bool) = "," <d:IdentDef> => d;
+/// `identdef = ident ["*"]`
+IdentDef: (Ident, bool) = <name:Ident> <mark:ExportMark?> => (name, mark.is_some());
+ExportMark: () = "*" => ();
+
+// ----------------------------------------------------------------- types ---
+
+TypeExpr: TypeExpr = {
+    <lo:@L> <q:Qualident> <hi:@R> => TypeExpr::Named(q, sp(lo, hi)),
+    <lo:@L> "ARRAY" <first:Expr> <rest:ArrayDim*> "OF" <elem:TypeExpr> <hi:@R> => {
+        let mut dims = vec![first];
+        dims.extend(rest);
+        TypeExpr::Array { dims, elem: Box::new(elem), span: sp(lo, hi) }
+    },
+    <lo:@L> "RECORD" <base:BaseTypeClause?> <fields:FieldLists?> "END" <hi:@R> => TypeExpr::Record {
+        base,
+        fields: fields.unwrap_or_default(),
+        span: sp(lo, hi),
+    },
+    <lo:@L> "POINTER" "TO" <ty:TypeExpr> <hi:@R> => TypeExpr::Pointer(Box::new(ty), sp(lo, hi)),
+    <lo:@L> "PROCEDURE" <fp:FormalParameters?> <hi:@R> => {
+        TypeExpr::Proc(fp.unwrap_or_default(), sp(lo, hi))
+    },
+};
+
+ArrayDim: Expr = "," <e:Expr> => e;
+BaseTypeClause: QIdent = "(" <q:Qualident> ")" => q;
+
+FieldLists: Vec<FieldList> = <first:FieldList> <rest:FieldListTail*> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+};
+FieldListTail: FieldList = ";" <f:FieldList> => f;
+FieldList: FieldList = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => FieldList {
+    names,
+    ty,
+    span: sp(lo, hi),
+};
+
+/// `FormalParameters = "(" [FPSection {";" FPSection}] ")" [":" qualident]`
+FormalParameters: FormalParams = {
+    "(" ")" <result:ResultTypeClause?> => FormalParams {
+        params: Vec::new(),
+        result,
+    },
+    "(" <first:FPSection> <rest:FPSectionTail*> ")" <result:ResultTypeClause?> => {
+        let mut params = vec![first];
+        params.extend(rest);
+        FormalParams { params, result }
+    },
+};
+FPSectionTail: Param = ";" <p:FPSection> => p;
+ResultTypeClause: QIdent = ":" <q:Qualident> => q;
+
+FPSection: Param = <by_ref:VarClause?> <names:IdentList> ":" <ty:FormalType> => Param {
+    names,
+    by_ref: by_ref.is_some(),
+    ty,
+};
+VarClause: () = "VAR" => ();
+
+/// `FormalType = {ARRAY OF} qualident`; only formal parameters may be open
+/// arrays, so this is a separate production from `TypeExpr`.
+FormalType: FormalType = <open:OpenArray*> <base:Qualident> => FormalType {
+    open: open.len(),
+    base,
+};
+OpenArray: () = "ARRAY" "OF" => ();
+
+// ------------------------------------------------------------ statements ---
+
+/// `StatementSequence = statement {";" statement}`; a statement may be empty,
+/// which is what makes `a; ; b` and a trailing `;` legal.
+StatementSequence: Vec<Stmt> = {
+    <s:Statement> => s.into_iter().collect(),
+    <s:Statement> ";" <rest:StatementSequence> => {
+        let mut v: Vec<Stmt> = s.into_iter().collect();
+        v.extend(rest);
+        v
+    },
+};
+
+Statement: Option<Stmt> = {
+    => None,
+    <s:AssignStmt> => Some(s),
+    <s:CallStmt> => Some(s),
+    <s:IfStmt> => Some(s),
+    <s:CaseStmt> => Some(s),
+    <s:WhileStmt> => Some(s),
+    <s:RepeatStmt> => Some(s),
+    <s:ForStmt> => Some(s),
+};
+
+AssignStmt: Stmt = <lo:@L> <target:Designator> ":=" <value:Expr> <hi:@R> => Stmt::new(
+    StmtKind::Assign { target, value },
+    sp(lo, hi),
+);
+
+/// `ProcedureCall = designator [ActualParameters]`.  A bare designator is the
+/// call of a parameterless procedure (`WriteLn`), and it is also how a
+/// procedure value is named.
+CallStmt: Stmt = <lo:@L> <callee:Designator> <hi:@R> => Stmt::new(StmtKind::Call(callee), sp(lo, hi));
+
+IfStmt: Stmt = <lo:@L> "IF" <cond:Expr> "THEN" <body:StatementSequence> <arms:ElsifClause*> <els:ElseClause?> "END" <hi:@R> => {
+    let mut v = vec![(cond, body)];
+    v.extend(arms);
+    Stmt::new(StmtKind::If { arms: v, els }, sp(lo, hi))
+};
+ElsifClause: (Expr, Vec<Stmt>) = "ELSIF" <cond:Expr> "THEN" <body:StatementSequence> => (cond, body);
+ElseClause: Vec<Stmt> = "ELSE" <body:StatementSequence> => body;
+
+WhileStmt: Stmt = <lo:@L> "WHILE" <cond:Expr> "DO" <body:StatementSequence> <arms:WhileElsif*> "END" <hi:@R> => {
+    let mut v = vec![(cond, body)];
+    v.extend(arms);
+    Stmt::new(StmtKind::While { arms: v }, sp(lo, hi))
+};
+WhileElsif: (Expr, Vec<Stmt>) = "ELSIF" <cond:Expr> "DO" <body:StatementSequence> => (cond, body);
+
+RepeatStmt: Stmt = <lo:@L> "REPEAT" <body:StatementSequence> "UNTIL" <cond:Expr> <hi:@R> => Stmt::new(
+    StmtKind::Repeat { body, until: cond },
+    sp(lo, hi),
+);
+
+ForStmt: Stmt = <lo:@L> "FOR" <var:Ident> ":=" <from:Expr> "TO" <to:Expr> <by:ByClause?> "DO" <body:StatementSequence> "END" <hi:@R> => Stmt::new(
+    StmtKind::For { var, from, to, by, body },
+    sp(lo, hi),
+);
+ByClause: Expr = "BY" <e:Expr> => e;
+
+CaseStmt: Stmt = <lo:@L> "CASE" <subject:Expr> "OF" <first:CaseArm> <rest:CaseArmTail*> "END" <hi:@R> => {
+    let mut arms = vec![first];
+    arms.extend(rest);
+    Stmt::new(StmtKind::Case { subject, arms }, sp(lo, hi))
+};
+CaseArmTail: CaseArm = "|" <a:CaseArm> => a;
+/// `case = [CaseLabelList ":" StatementSequence]` - an arm may be empty, which
+/// is the default arm of the case statement.
+CaseArm: CaseArm = <lo:@L> <labels:CaseLabels?> <body:CaseArmBody?> <hi:@R> => CaseArm {
+    labels,
+    body: body.unwrap_or_default(),
+    span: sp(lo, hi),
+};
+CaseArmBody: Vec<Stmt> = ":" <s:StatementSequence> => s;
+CaseLabels: Vec<LabelRange> = <first:LabelRange> <rest:LabelRangeTail*> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+};
+LabelRangeTail: LabelRange = "," <l:LabelRange> => l;
+LabelRange: LabelRange = <lo:CaseLabel> <hi:RangeHi?> => LabelRange { lo, hi };
+RangeHi: CaseLabel = ".." <l:CaseLabel> => l;
+CaseLabel: CaseLabel = {
+    <v:"integer"> => CaseLabel::Int(v),
+    <v:"char"> => CaseLabel::Char(v),
+    <v:"string"> => CaseLabel::Str(v),
+    <q:Qualident> => CaseLabel::Named(q),
+};
+
+// ----------------------------------------------------------- expressions ---
+
+/// `expression = SimpleExpression [relation SimpleExpression]`; relations are
+/// non-associative, so at most one appears.  `IS` takes a qualident rather
+/// than an expression, hence its own production.
+Expr: Expr = {
+    // The span must be the *whole* `v IS T`, not the operand's: the emitter
+    // looks expression types up by span, and sharing it would make the test's
+    // BOOLEAN hide the operand's type.
+    <lo:@L> <l:SimpleExpr> "IS" <ty:Qualident> <hi:@R> => {
+        Expr::new(ExprKind::TypeTest(Box::new(l), ty), sp(lo, hi))
+    },
+    <l:SimpleExpr> <rel:RelTail?> => match rel {
+        None => l,
+        Some((op, r)) => Expr::binary(op, l, r),
+    },
+};
+RelTail: (BinOp, Expr) = <op:RelOp> <r:SimpleExpr> => (op, r);
+RelOp: BinOp = {
+    "=" => BinOp::Eq,
+    "#" => BinOp::Ne,
+    "<" => BinOp::Lt,
+    "<=" => BinOp::Le,
+    ">" => BinOp::Gt,
+    ">=" => BinOp::Ge,
+    "IN" => BinOp::In,
+};
+
+SimpleExpr: Expr = {
+    <first:Term> <rest:AddTail*> => fold_ops(first, rest),
+    <op:SignOp> <first:Term> <rest:AddTail*> => fold_ops(Expr::unary(op, first), rest),
+};
+SignOp: UnOp = {
+    "+" => UnOp::Plus,
+    "-" => UnOp::Neg,
+};
+AddTail: (BinOp, Expr) = <op:AddOp> <t:Term> => (op, t);
+AddOp: BinOp = {
+    "+" => BinOp::Add,
+    "-" => BinOp::Sub,
+    "OR" => BinOp::Or,
+};
+
+Term: Expr = <first:Factor> <rest:MulTail*> => fold_ops(first, rest);
+MulTail: (BinOp, Expr) = <op:MulOp> <f:Factor> => (op, f);
+MulOp: BinOp = {
+    "*" => BinOp::Mul,
+    "/" => BinOp::Div,
+    "DIV" => BinOp::IDiv,
+    "MOD" => BinOp::Mod,
+    "&" => BinOp::And,
+};
+
+Factor: Expr = {
+    <lo:@L> <v:"integer"> <hi:@R> => Expr::new(ExprKind::Int(v), sp(lo, hi)),
+    <lo:@L> <v:"real"> <hi:@R> => Expr::new(ExprKind::Real(v), sp(lo, hi)),
+    <lo:@L> <v:"string"> <hi:@R> => Expr::new(ExprKind::Str(v), sp(lo, hi)),
+    <lo:@L> <v:"char"> <hi:@R> => Expr::new(ExprKind::Char(v), sp(lo, hi)),
+    <lo:@L> "NIL" <hi:@R> => Expr::new(ExprKind::Nil, sp(lo, hi)),
+    <lo:@L> "TRUE" <hi:@R> => Expr::new(ExprKind::Bool(true), sp(lo, hi)),
+    <lo:@L> "FALSE" <hi:@R> => Expr::new(ExprKind::Bool(false), sp(lo, hi)),
+    <set:SetLiteral> => set,
+    <d:Designator> => {
+        let span = d.span;
+        Expr::new(ExprKind::Designator(d), span)
+    },
+    <lo:@L> "(" <e:Expr> ")" <hi:@R> => Expr::new(e.kind, sp(lo, hi)),
+    <lo:@L> "~" <f:Factor> <hi:@R> => Expr::new(ExprKind::Unary(UnOp::Not, Box::new(f)), sp(lo, hi)),
+};
+
+SetLiteral: Expr = <lo:@L> "{" <elems:SetElems?> "}" <hi:@R> => Expr::new(
+    ExprKind::Set(elems.unwrap_or_default()),
+    sp(lo, hi),
+);
+SetElems: Vec<SetElem> = <first:SetElem> <rest:SetElemTail*> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+};
+SetElemTail: SetElem = "," <e:SetElem> => e;
+SetElem: SetElem = <lo:Expr> <hi:ToExpr?> => SetElem { lo, hi };
+ToExpr: Expr = ".." <e:Expr> => e;
+
+// ----------------------------------------------------------- designators ---
+
+/// `designator = qualident {selector}`, where `selector = "." ident | "["
+/// ExpList "]" | "^" | "(" qualident ")"`.
+///
+/// The report's last alternative is the *type guard*; a call's actual
+/// parameters are written `designator [ActualParameters]`, `ActualParameters =
+/// "(" [ExpList] ")"`.  Both are parsed here as `Selector::Args`; the two are
+/// told apart later, from the symbol table, because a single argument that
+/// denotes a *type* can never be a value argument (types and variables share
+/// one namespace in Oberon, so nothing else can occupy that name).
+///
+/// Note that a designator starts with a *single* identifier, not with the
+/// report's `qualident`: `designator = qualident {selector}` with `qualident =
+/// [ident "."] ident` and `selector = "." ident | ...` is **not LR(1)**.  After
+/// `a`, a `.` can begin either the qualident's module qualifier or a record
+/// field selector, and `a.b` is a valid designator either way.  Module
+/// qualification is therefore resolved from the symbol table (an import alias
+/// in front of a `.`), never from the shape of the input.  `Qualident` is only
+/// used where nothing can follow a designator (type names, case labels, `IS`
+/// targets, formal types), where the ambiguity cannot arise.
+Designator: Designator = <lo:@L> <base:Ident> <sels:Selector*> <hi:@R> => Designator {
+    base: vec![base],
+    sels,
+    span: sp(lo, hi),
+};
+
+Selector: Selector = {
+    "." <name:Ident> => Selector::Field(name),
+    "[" <index:ExprList> "]" => Selector::Index(index),
+    "^" => Selector::Deref,
+    "(" <args:ExprList?> ")" => Selector::Args(args),
+};
+
+ExprList: Vec<Expr> = <first:Expr> <rest:ExprListTail*> => {
+    let mut v = vec![first];
+    v.extend(rest);
+    v
+};
+ExprListTail: Expr = "," <e:Expr> => e;
+
+Qualident: QIdent = <first:Ident> <rest:QualTail?> => match rest {
+    None => vec![first],
+    Some(second) => vec![first, second],
+};
+QualTail: Ident = "." <i:Ident> => i;
+
+Ident: Ident = <s:"ident"> => s.to_string();
+
+/// Interface files store *rendered* types (DESIGN §7). They are ordinary Oberon
+/// type syntax, so the interface reader reuses this very production instead of
+/// growing a second parser for its own output.
+pub RenderedType: TypeExpr = <t:TypeExpr> => t;

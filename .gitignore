@@ -1,0 +1,18 @@
+# Build artefacts.  The generated parsers, objects and binaries belong outside
+# the tree, and every run.sh builds into a temporary directory for that reason.
+/oberon/target/
+*.o
+/oberon/golden/constexpr
+/oberon/golden/golden
+/oberon/golden/golden-asan
+/oberon/golden/constexpr-asan
+
+# Third-party reference material: the design cites these by name
+# (books/Oberon07.Report.pdf and the compiler textbooks), but they are not ours
+# to redistribute.  Keep them out of history; the paths in DESIGN.md still
+# describe them.
+/books/
+
+# Editor and OS noise.
+*.swp
+.DS_Store
