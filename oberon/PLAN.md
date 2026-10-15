@@ -179,7 +179,7 @@ documents (`oberon/DESIGN.md`, `oberon/PLAN.md`).
 
 ## W4 — designed with an escape hatch, not built
 
-**W4.1 `SYSTEM`** (R5, report §11.1) — **the item this plan is currently for**
+**W4.1 `SYSTEM`** (R5, report §11.1)
 Why: `src/sema.rs` rejects `IMPORT SYSTEM` outright ("module SYSTEM is not
 available in this implementation (report 11.1)"). Report §11.1 defines five
 portable entries and one proper procedure, all of them deliberately outside the
@@ -242,7 +242,8 @@ out-of-scope bullet is replaced by a pointer here, R5 becomes "implemented, and
 the RISC extras still refused by name", and the generator (W6) has a SYSTEM
 fragment whose `PUT`/`GET` round trips and `SIZE` calls the mirror can predict.
 
-**W4.2 garbage collection** (R3)
+**W4.2 garbage collection** (R3) — *implementation; the design study is W4.5 and
+comes first*
 Why: `NEW` maps to `malloc`; a tracing collector is what real Oberon systems
 have and what long-running programs notice. The hatch is `rt_new`, which the
 document claims can be replaced without touching generated code.
@@ -264,6 +265,78 @@ Why: `obc build` has no up-to-date check (nothing in the driver looks at
 timestamps), so every module of the import graph is re-checked on each run. A
 timestamped interface would skip the front end for unchanged modules.
 Only worth doing if build times become a complaint.
+
+**W4.5 the collector's design: a study, before any code** — **research**
+Why: GC is the one item in W4 whose *interface* decides its cost. A collector
+needs two things from the compiler that we do not have yet, and getting them
+wrong is expensive to undo, so the question is a design question first — and the
+reference implementation answers most of it if you read it rather than guess.
+
+What is already verified from the sources (this session, so the study starts
+from facts rather than folklore):
+* Project Oberon 2013 **does** ship a mark-sweep collector, in `Kernel.Mod`
+  (`Mark*`/`Scan*`). Its type descriptor carries the object's **size** and a
+  **`-1`-terminated list of pointer-field offsets** (read at `descriptor + 16`),
+  which is exactly how it knows where the pointers in an object are.
+* its roots are a **vector of pointer slots passed in by the caller**
+  (`Mark*(pref)` walks it four bytes at a time), with any value below `heapOrg`
+  treated as `NIL` — so the compiler/kernel must be able to *enumerate* roots;
+* marking uses **pointer reversal** (a down/up walk that turns the object graph
+  into its own stack), so a collection needs no auxiliary stack;
+* sweeping rebuilds **segregated free lists** (32/64/128/256 bytes) and keeps an
+  `allocated` counter;
+* on our side: objects already carry a `desc` pointer (`(*q).desc = &TD_Fr__R`),
+  but `ObDesc` is only `{ base, id, name }` — no size and no pointer offsets;
+  module variables are plain static globals, so the global root set is free; and
+  a non-nested procedure's locals are ordinary C locals, which is the one place
+  where roots are *not* enumerable today.
+
+The questions the study has to answer, each with what to read:
+1. **Roots** — the crux. (a) precise: emit a per-frame pointer map and spill
+   pointer locals into a described frame, so the collector can follow `sl` and
+   the frame (this is what the reference compiler must do; confirm how
+   `ORG.Mod`/`ORB.Mod` describe a frame, and whether the Project Oberon book's
+   collector chapter says so — *not yet verified*); (b) conservative: scan the C
+   stack for words that look like heap pointers (Boehm-style), which composes
+   with a descriptor-driven *heap* and needs no frame discipline, at the price
+   of pinned objects and hidden bugs; (c) explicit frames for every procedure
+   (extend today's nested-only `sl` scheme). Recommend one with numbers: code
+   size, allocation-path cost, and what each does to `-Ochecks` and to a trap.
+2. **Descriptors** — add size and the pointer-offset list (and the array case:
+   whether the element type is a pointer, plus the run-time length for open
+   arrays), mirroring the reference layout so the code is recognisable. Then the
+   cross-module constraint: an imported type's layout must reach a client's
+   collector, so this is also a **`.sym` format** question (W3.2) and the format
+   must be stable across modules.
+3. **Trigger and policy** — collect on allocation failure inside `rt_new` with a
+   retry, then `NIL`, which is what DESIGN §8.6 specifies for a failed `NEW`; a
+   private `rt_collect()` for tests; a growth policy; and an `allocated` counter
+   asserted at exit, which is a leak check for free (the reference keeps one).
+4. **What it breaks, honestly** — `SYSTEM` (W4.1) can hide the only reference to
+   an object in an `INTEGER`, so a *precise* collector is unsound for programs
+   that do that: document the convention (Wirth's systems have the same caveat)
+   or take the conservative root scan; ASan, which is a verification mode of ours
+   (W7.5), cannot see inside a collector-managed heap, so the sanitised suites
+   must run with the collector **off** and the collector gets its own stress
+   mode; moving/compacting and generational collectors are out *because* they
+   invalidate addresses that `ADR`/`PUT` may have published — the study should
+   state that rather than leave it implied.
+5. **The harness, which already exists** — allocation-heavy generated programs
+   (W6.1), a mode that collects at every `NEW`, and the `allocated`-counter
+   assertion give a stress test without writing one.
+
+Method: read the reference sources and the book chapter, read VOC's tracing
+collector and its finalizer list (the survey in W8 found both), and for the
+conservative option read Boehm's paper; then write the study as a new section in
+DESIGN (next to §8.6, which currently says `NEW` is `malloc`) with a tradeoff
+table and a recommendation.
+
+Done when: that section exists and answers all five questions with a source per
+claim; §13 gains the decision (adopt a design for W4.2, or leave GC out with the
+study as the record); the *cost* is enumerated per code path (allocator,
+descriptor, one safepoint per `NEW`, frame handling); and W4.2 is updated to
+reference the chosen design rather than the open question. Nothing is implemented
+in this item — W4.2 is the implementation.
 
 ---
 
@@ -598,7 +671,7 @@ Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`
 * `WITH` — superseded by guards, `IS` and type-`CASE`, and Wirth removed it;
 * type-bound procedures/methods (all four dialects) — the report's `IS`/guards/type-`CASE`/procedure variables already cover dynamic dispatch without a vtable model;
 * dynamic and multi-dimensional open arrays, `NEW(v, n)`, `LEN(v, dim)` (all four) — they interact with descriptors and, in the systems that have them, with a tracing collector;
-* tracing garbage collection and finalizers (VOC, Oberon-2 systems) — out of scope with R3; `rt_new` stays the door.
+* tracing garbage collection and finalizers (VOC, Oberon-2 systems) — finalizers stay rejected (the report has no such concept), and GC is no longer simply "out": its design is being studied first (W4.5) with `rt_new` as the door (R3).
 
 **W8.9 a lesson that is not an extension: our overflow stance is ahead of production**
 VOC's C back end does not establish `-fwrapv`, so signed overflow there is undefined C. Our design fixes it deliberately (R4) and R20 is about making that choice *warning-clean* — not about giving it up.
