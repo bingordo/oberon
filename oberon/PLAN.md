@@ -151,7 +151,7 @@ default, which §13 records.
 
 ## W2 — known deviations with a real failure mode
 
-**W2.1 R17: the reclassification pass uses module-wide name sets**
+**W2.1 R17: the reclassification pass uses module-wide name sets** — **done**
 Why: `resolve.rs` splits guard-vs-call and folds module qualification *before*
 the checker builds scopes, so a local variable that shadows an import alias, or
 a nested type name, is classified by the wrong scope. This is a correctness
@@ -160,7 +160,13 @@ Files: `src/resolve.rs`, `src/sema.rs` (it already builds the scopes the pass
 needs).
 Done when: a module whose local shadows an import alias checks correctly (or is
 rejected for the right reason), with a test; then §13's R17 becomes a note
-about the prototype's pass order history rather than a live limitation.
+about the prototype's pass order history rather than a live limitation. **Done**:
+the pass keeps a scope chain — one scope per procedure with its parameters and its
+own declarations, and *every* declaration is recorded, not just types and import
+aliases, because a variable of some name shadows a type of that name (that was the
+actual bug: a local `T` was invisible, so `Q(T)` stayed classified as a guard).
+The two programs that used to be rejected now check clean, with the before/after
+in §13's R17 and a test pinning both.
 
 **W2.2 R15: a *failing* guard with the record spelling is statically out of bounds**
 Why: `p(S).b` where `p` points at `R` reads through a pointer that cannot hold
