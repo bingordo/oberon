@@ -23,7 +23,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use oberon_front::{cgen, check_module, emit_c, emit_interface, parse_module, render_diagnostics, sym, Diagnostic};
+use oberon_front::{
+    cgen, check_module_recovering, emit_c, emit_interface, parse_module, parse_module_recovering,
+    parse_with_diagnostics, render_diagnostics, sym, Diagnostic,
+};
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
 /// punning, and warnings as errors so the emitted C has to be clean.
@@ -174,7 +177,7 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     let mut done: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = Vec::new();
     let root_src = read(&o.root)?;
-    let root = module_name(&root_src)?;
+    let root = module_name(&root_src);
     emit_tree(o, &o.root, &root_src, &root, &mut units, &mut interfaces, &mut done, &mut stack)?;
 
     if o.mode == Mode::Check {
@@ -257,7 +260,19 @@ fn emit_tree(
     }
     stack.push(name.to_string());
 
-    let parsed = parse_module(src).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Parse with recovery: the imports are needed to resolve dependencies even
+    // when the module has syntax errors, and the errors themselves are reported
+    // below together with the semantic ones.
+    let (parsed, syntax) = parse_with_diagnostics(src);
+    let parsed = match parsed {
+        Some(m) => m,
+        None => {
+            // Nothing parsed: the syntax diagnostics are all there is to report,
+            // and they are already located.
+            print!("{}", render_diagnostics(&path.display().to_string(), src, &syntax));
+            return Err(format!("{} does not parse", path.display()));
+        }
+    };
     let imports: Vec<String> = parsed.imports.iter().map(|i| i.module.clone()).collect();
     for m in imports {
         if done.contains(&m) {
@@ -309,12 +324,15 @@ fn emit_tree(
         }
     }
 
-    // Now the imports' interfaces exist, so this module can be checked.
-    let diags = check(src, interfaces)?;
+    // Now the imports' interfaces exist, so this module can be checked. The
+    // parser recovers at statement level, so one run reports syntax errors *and*
+    // type errors rather than stopping at the first of either.
+    let (parsed, diags) = check_module_recovering(src, interfaces);
     if diags.iter().any(Diagnostic::is_error) {
         print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
         return Err(format!("`{name}` does not check"));
     }
+    let _ = parsed;
     let (c, h) = emit_c(src, interfaces)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .map_err(|diags| {
@@ -338,12 +356,6 @@ fn emit_tree(
     done.insert(name.to_string());
     stack.pop();
     Ok(())
-}
-
-fn check(src: &str, interfaces: &[sym::Interface]) -> Result<Vec<Diagnostic>, String> {
-    check_module(src, interfaces)
-        .map(|(_, d)| d)
-        .map_err(|e| format!("{e}"))
 }
 
 fn write_runtime(o: &Opts) -> Result<(), String> {
@@ -406,8 +418,19 @@ fn loader_source(units: &[Unit], command: Option<&(String, String)>) -> String {
     out
 }
 
-fn module_name(src: &str) -> Result<String, String> {
-    parse_module(src).map(|m| m.name).map_err(|e| format!("{e}"))
+/// The module's name, taken from the part that parsed: a syntax error later in
+/// the file must not stop the driver from knowing which module it is looking at.
+/// The module's name, from whatever parsed. A file too broken to parse still has
+/// to reach the diagnostics, so this never fails: the name is only used for
+/// output file names, which nothing reaches when the module does not parse.
+fn module_name(src: &str) -> String {
+    match parse_with_diagnostics(src).0 {
+        Some(m) => m.name,
+        // Nothing parsed: name it after the file, so the message reads naturally.
+        None => parse_module(src)
+            .map(|m| m.name)
+            .unwrap_or_else(|_| "the module".to_string()),
+    }
 }
 
 fn read(path: &Path) -> Result<String, String> {

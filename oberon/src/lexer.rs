@@ -32,25 +32,55 @@ pub enum LexicalError {
     BadReal(String, usize),
 }
 
+impl LexicalError {
+    /// The byte span this error covers, so it can be reported like any other
+    /// diagnostic.
+    pub fn span(&self) -> (usize, usize) {
+        let at = match self {
+            LexicalError::IllegalCharacter(_, off)
+            | LexicalError::UnterminatedComment(off)
+            | LexicalError::UnterminatedString(off)
+            | LexicalError::NumberOutOfRange(_, off)
+            | LexicalError::BadReal(_, off) => *off,
+        };
+        let width = match self {
+            LexicalError::IllegalCharacter(c, _) => c.len_utf8(),
+            LexicalError::NumberOutOfRange(text, _) | LexicalError::BadReal(text, _) => text.len(),
+            LexicalError::UnterminatedComment(_) | LexicalError::UnterminatedString(_) => 1,
+        };
+        (at, at + width.max(1))
+    }
+}
+
 impl fmt::Display for LexicalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LexicalError::IllegalCharacter(c, off) => {
-                write!(f, "illegal character {c:?} at byte {off}")
+            LexicalError::IllegalCharacter(c, _) => {
+                write!(f, "illegal character {c:?}")
             }
-            LexicalError::UnterminatedComment(off) => {
-                write!(f, "unterminated comment starting at byte {off}")
+            LexicalError::UnterminatedComment(_) => write!(f, "unterminated comment"),
+            LexicalError::UnterminatedString(_) => write!(f, "unterminated string"),
+            LexicalError::NumberOutOfRange(text, _) => {
+                write!(f, "`{text}` is outside the range of INTEGER (report 3, 6.1)")
             }
-            LexicalError::UnterminatedString(off) => {
-                write!(f, "unterminated string starting at byte {off}")
+            LexicalError::BadReal(text, _) => {
+                write!(f, "`{text}` is not a representable REAL (report 6.1)")
             }
-            LexicalError::NumberOutOfRange(text, off) => write!(
-                f,
-                "`{text}` at byte {off} is outside the range of INTEGER (report 3, 6.1)"
-            ),
-            LexicalError::BadReal(text, off) => {
-                write!(f, "`{text}` at byte {off} is not a representable REAL")
+        }
+    }
+}
+
+impl LexicalError {
+    /// What the reader should do about it, when that is not obvious.
+    pub fn note(&self) -> &'static str {
+        match self {
+            LexicalError::IllegalCharacter(..) => "not part of Oberon's vocabulary (report 3)",
+            LexicalError::UnterminatedComment(_) => "comments nest and must be closed (report 3)",
+            LexicalError::UnterminatedString(_) => {
+                "a string cannot contain its closing quote (report 3)"
             }
+            LexicalError::NumberOutOfRange(..) => "INTEGER holds 32 bits (report 6.1)",
+            LexicalError::BadReal(..) => "REAL is a 32-bit float (report 6.1)",
         }
     }
 }

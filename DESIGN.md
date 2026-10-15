@@ -345,21 +345,72 @@ report's rule, not a bug, and it buys the back end a guarantee worth having:
 **every procedure body has a single exit point**, so the C emitter never needs to
 synthesise a result variable with multiple assignment sites.
 
-### D7 — error handling
+### D7 — error handling and recovery **[implemented; limits found by conflict]**
 
-v1 reports the first syntax error and stops (`ParseError` already carries the
-offending token, its byte span, and the expected token set; see §14). LALRPOP's
-`!` token plus
+Two properties are wanted, and they are independent:
+
+1. **Every error is located.** A diagnostic carries a byte span, and the
+   rendering (§10) turns it into `file:line:col`, echoes the source line, puts a
+   caret under the span, and adds a note when the rule is not obvious. Message
+   text is not pre-formatted in the parser or the checker: they produce
+   `Diagnostic` values, and one function renders them, so syntax and semantic
+   errors look alike.
+2. **One run reports every error it can.** LALRPOP's `!` token plus
+
+   ```lalrpop
+   grammar<'input, 'err>(errors: &'err mut Vec<ErrorRecovery<usize, Token<'input>, LexicalError>>);
+   ```
+
+   resynchronises, and the recovery is *recorded* rather than swallowed, so the
+   driver reports the syntax errors and the semantic errors found in the same
+   run **[verified by `diag_tests` and by seven `e2e` checks]**.
+
+Recovery is enabled in exactly one place — **the statement sequence**:
 
 ```lalrpop
-grammar<'err>(errors: &'err mut Vec<ErrorRecovery<usize, Token<'input>, LexicalError>>);
+Statement: Option<Stmt> = {
+    => None,
+    <s:AssignStmt> => Some(s),
+    …
+    <e:!> => { errors.push(e); None },
+};
 ```
 
-is the documented mechanism for resynchronising at statement level, and the
-grammar is shaped so that adding `| ! => { errors.push(<>); None }` to
-`Statement` is a local change. We defer it until the front end is otherwise
-complete, because a half-tested recovery rule produces worse diagnostics than
-stopping.
+A statement the parser cannot accept becomes an empty one, the parser skips
+input to the next `;`, and the rest of the body is still parsed. That is the
+recovery that pays, because statements are where syntax errors cluster and where
+recovery is cheap: the skipped tokens are the broken statement.
+
+**Recovery in declaration sections is not attempted, and the reason is a
+measured one.** Four shapes were tried — recovery on the `;` that ends a
+declaration, recovery on the next section keyword, a nullable item under a
+non-nullable list, and a `!` alternative inside the list rule — and LALRPOP
+rejects all four with a *local ambiguity on the error token*: because the report
+lets each declaration section be empty, the section's ε production and the error
+token compete (end the section, or swallow the error?), and LALRPOP's LALR(1)
+construction adds the error token to every lookahead set, so the ε-reduce is a
+live alternative wherever the error can be shifted. The statement case escapes
+this because `StatementSequence` is non-nullable and its single `!` sits in the
+item rule — the same shape applied to declarations does not, because the sections
+*are* nullable.
+
+The consequence is bounded and acceptable: a declaration-level or module-level
+syntax error is reported **once**, located and explained, and the file stops
+there (§3's build order means the driver has nothing to emit anyway). Recovery
+inside a `ProcedureBody` is capped the same way: a broken procedure declaration
+is reported and the file stops, rather than resynchronising inside a body whose
+declarations are then unusable.
+
+Two entry points exist, deliberately:
+
+* `parse_module` fails fast (used where a module is *required* to be well formed,
+  such as reading a `.sym` interface), and
+* `parse_with_diagnostics` / `check_module_recovering` recover.
+
+A *fatal* error — a missing `END`, an unterminated comment, an illegal character
+— is not absorbed by any recovery point, but it is still converted to a located
+diagnostic rather than printed as a `ParseError` **[verified]**, so a reader
+never sees a byte offset.
 
 ---
 
@@ -1028,23 +1079,49 @@ obc run   Foo.mod [-I DIR]... [--command M.P] [--keep]
 
 ## 10. Diagnostics
 
-One `Diagnostic { span, kind, message, notes }` type, printed as
+One `Diagnostic { span, severity, message, notes }` type, printed as
 
 ```
-Out.Mod:12:9: error: assignment to a read-only entity
-    x := 0
-    ^
-note: `x` is a value parameter of structured type (report 9.1)
+Bad.mod:4:3: error: cannot assign NIL to an INTEGER (report 9.1)
+  |
+4 |   x := NIL
+  |   ^^^^^^^^
+  = note: NIL may only be assigned to a pointer or a procedure variable (report 9.1)
+```
+
+and, for a syntax error, in the same shape:
+
+```
+Mix.mod:4:8: error: unexpected `;`
+  |
+4 |   x := ;
+  |        ^
+  = note: expected ident, integer, real, string, char or NIL (7 other token(s) would do as well)
 ```
 
 * The span comes from the AST; `SourceMap::line_col(offset)` turns byte offsets
   into `line:column`, and the source line is echoed with a caret. No phase other
   than the printer needs line/column.
-* Syntax errors come back as `lalrpop_util::ParseError`, whose `Display` already
-  names the offending token and lists the expected set; the prototype's CLI shows
-  this working (`-: Unrecognized token \`)\` found at 28:29 / Expected one of
-  "ident" or "END"`) **[verified]**. We wrap it into the same `Diagnostic` type
-  so the user sees one format.
+* Syntax errors go through the *same* path. `lalrpop_util::ParseError` is
+  converted by `diagnostic_for_parse_error` into a `Diagnostic`, so a syntax error
+  is rendered exactly like a semantic one — no phase prints its own format and no
+  reader ever sees a byte offset **[verified by seven `e2e` checks and ten
+  `diag_tests`]**. Three details that matter:
+  * LALRPOP names terminals with its own quoting; the note strips it, so the
+    reader sees `note: expected ; or END` rather than `Expected one of ";" or
+    "END"`, and the list is trimmed to six names plus a count of the rest.
+  * An unexpected-token or unexpected-end-of-file diagnostic gets the *expected*
+    set as a note, and a recovered error additionally gets `the parser skipped N
+    token(s) to carry on`, which is what tells the reader that a later message
+    may be a consequence rather than a second mistake.
+  * A lexical error (`LexicalError`) carries its offset and a note stating the
+    vocabulary rule (`not part of Oberon's vocabulary (report 3)`), because its
+    `Display` would otherwise be a bare byte offset.
+* Diagnostics are de-duplicated by *(span, severity, message)* and sorted by
+  span, because the recovering parser and the checker can meet the same mistake:
+  a call statement used to be looked up twice, so an unknown callee was reported
+  twice **[found by `diag_tests::one_mistake_is_reported_once`, fixed, and
+  verified]**.
 * Every check in §8.5 emits at most one diagnostic per site, and `ErrorType`
   keeps a single error from cascading.
 
@@ -1057,6 +1134,8 @@ note: `x` is a value parameter of structured type (report 9.1)
 | lexer | the near-miss table in §4 | unit tests on token streams **[exists]** |
 | parser | report examples, all statement/expression forms, guard/call unification, unqualified-vs-qualified names | parse tests asserting AST shape **[exists: 7 tests]** |
 | parser (negative) | syntax errors, illegal characters, unterminated strings/comments, and the *report's own* restriction that `RETURN` is not a statement | `unwrap_err` assertions **[exists]** |
+| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `oberon/src/lib.rs::diag_tests` **[exists: 10 tests]** |
+| error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `oberon/e2e` checks 10–13 **[exists]** |
 | resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `oberon/src/lib.rs` **[exists: 3 tests]** |
 | resolver + checker | one case per row of §8.5 (55 cases), plus the report's `Out` module and the kitchen sink checking clean | `oberon/src/lib.rs::check_tests` **[exists: 4 tests, 55 catalogue cases]** |
 | diagnostic rendering | byte span → `line:col`, message text | `check_tests::diagnostics_carry_usable_spans` **[exists]** |
@@ -1068,7 +1147,7 @@ note: `x` is a value parameter of structured type (report 9.1)
 | whole-program shape | statement lowering of the report's procedures, module init, command table, exported interface, read-only exports | `oberon/golden` **[exists: 66 cases, plain + ASan/UBSan]** |
 | regressions found by review | one output line per defect found in the code review: integer `/`, CHAR ordinal order, folded constants, `CASE` ranges and multi-labels, record-copy descriptors, a local record as a `VAR` record parameter, open-array forwarding, a call through a record field, `PACK`/`UNPK`, `NEW` on a recursive type | `oberon/e2e/Regress.mod` + `regress.expected.txt` **[exists: 11 lines]** |
 | compile-only regressions | a recursive record type; Oberon identifiers that are C keywords; a *failing* guard Dtraps with its offset | `oberon/e2e/run.sh` checks 8 and 9 **[exists]** |
-| the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash oberon/e2e/run.sh` **[exists: 13 checks]** |
+| the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash oberon/e2e/run.sh` **[exists: 24 checks]** |
 | interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `oberon/src/sym.rs` **[exists: 3 tests]** |
 | whole language | the report's example modules (`Out`'s `Write`/`WriteInt`/`WriteLn`, `log2`, `ReadInt`) compiled and executed against a `Texts`/`Oberon` stub | `oberon/e2e` + `oberon/golden` **[exists]** |
 
@@ -1116,7 +1195,8 @@ M0 is complete; everything else is design.
 | R15 | A **failing** guard written with the *record* spelling reads past the object by construction (`p(S).b` where `p` points at an `R`), and the C compiler can see that statically: `-Warray-bounds`/`-Wmaybe-uninitialized` then reject the program under `-Werror`, even though the guard's test traps first. | Accepted and documented rather than silenced: the pointer spelling (`p(Q)`) has no such read and is what the e2e suite uses for the trap case. A program that *tests* for a type it does not hold is expected to use the pointer spelling, which is also the one §9.5's own example uses. |
 | R16 | A structured **value** argument inside a short-circuit operand is copied into its caller-side temporary eagerly, because a temporary is a statement. Guards are no longer affected (§9.5 lowers them as expressions), so this is now limited to a record argument whose *index* expressions contain calls, inside `OR`/`&`. | Documented deviation: the copy happens one step earlier than the operator would evaluate it. Oberon's only side-effecting expressions are calls, and this needs one inside a record actual's index inside a short-circuit operand. |
 | R17 | `resolve.rs` classifies guards and module qualification with *module-wide* name sets, because the prototype's reclassification pass runs before the checker builds scopes. A local variable that shadows an import alias, or a nested type name, is therefore classified by the wrong scope. | Documented limitation of the prototype's pass order, not of the design: the production resolver performs the same classification with the scope chain it is building anyway (§7). A program that shadows an import alias with a local of the same name is affected. |
-| R18 | `--cflags` is split on whitespace, so a flag whose own argument contains spaces cannot be written. | Documented; a path with spaces is passed correctly as a *file* argument (the driver never uses a shell), and a flag needing one can be repeated per argument once the driver grows `--cflag`. |
+| R19 | Declaration-level and module-level syntax errors get no recovery: every shape that would express it is rejected by LALRPOP with a local ambiguity on the error token, because the report lets each declaration section be empty and the section's ε production then competes with the error token. | **Measured**, not assumed: four shapes were tried, all four rejected (D7). The outcome is one located diagnostic instead of a cascade, and statement-level recovery covers the common case. |
+| R18 | `--cflags "…"` is split on whitespace, so a single flag whose own argument contains a space cannot be written that way. | Mitigated by `--cflag ARG`, which appends one argument verbatim and is repeatable; both are in the driver's usage. A path with spaces is passed correctly as a *file* argument, because the driver never goes through a shell. |
 
 Decisions taken during implementation, recorded because the report is silent
 or self-inconsistent and a compiler has to choose once and then be consistent:
@@ -1169,21 +1249,20 @@ Open questions, to be settled with a decision record when M1 starts:
 ## 14. Evidence appendix
 
 ```
-$ cd proto && cargo test
-test tests::empty_statements_are_legal ... ok
-test tests::lexer_near_misses ... ok
-test tests::parses_kitchen_sink ... ok
-test tests::parses_report_out_module ... ok
-test tests::reclassify_leaves_no_unresolved_selector_in_the_kitchen_sink ... ok
-test tests::reclassify_rejects_a_case_label_that_is_neither_type_nor_module ... ok
-test tests::reclassify_splits_guards_calls_and_module_qualification ... ok
-test tests::reports_syntax_errors_without_panicking ... ok
+$ cd oberon && cargo test
+test diag_tests::a_lexical_error_names_the_character_and_what_to_do ... ok
+test diag_tests::a_missing_end_is_reported_where_the_module_gives_out ... ok
+test diag_tests::a_syntax_error_is_located_explained_and_underlined ... ok
+test diag_tests::a_warning_is_rendered_as_a_warning ... ok
+test diag_tests::one_mistake_is_reported_once ... ok
+test diag_tests::recovery_reports_later_errors_in_the_same_run ... ok
+test diag_tests::semantic_errors_accumulate_with_their_own_locations ... ok
+test diag_tests::several_syntax_errors_are_reported_in_one_run ... ok
+test diag_tests::the_common_mistakes_explain_themselves ... ok
+test diag_tests::the_source_line_is_echoed_even_when_the_span_is_at_the_end ... ok
 test tests::type_guard_and_call_share_one_production ... ok
-test tests::type_guard_can_be_followed_by_selectors ... ok
-test sym::tests::parses_the_design_example ... ok
-test sym::tests::rejects_malformed_lines ... ok
 test sym::tests::round_trips_every_item_kind ... ok
-test result: ok. 37 passed; 0 failed
+test result: ok. 47 passed; 0 failed
 ```
 
 * The semantic pass is checked on **valid** programs first: the report's own

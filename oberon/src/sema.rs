@@ -42,12 +42,48 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub span: Span,
     pub message: String,
+    /// A second line of explanation: what the compiler expected, which report
+    /// rule applies, or what the mistaken construct probably meant.
+    pub note: Option<String>,
 }
 
 impl Diagnostic {
+    pub fn new(severity: Severity, span: Span, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            severity,
+            span,
+            message: message.into(),
+            note: None,
+        }
+    }
+
+    pub fn error(span: Span, message: impl Into<String>) -> Diagnostic {
+        Diagnostic::new(Severity::Error, span, message)
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Diagnostic {
+        self.note = Some(note.into());
+        self
+    }
+
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
     }
+}
+
+/// Drop diagnostics that repeat one already reported: two passes over the same
+/// mistake (a call looked up twice, say) must not read as two mistakes.
+pub fn dedup_diagnostics(diags: &mut Vec<Diagnostic>) {
+    let mut seen: Vec<(Severity, u32, u32, String)> = Vec::new();
+    diags.retain(|d| {
+        let key = (d.severity, d.span.lo, d.span.hi, d.message.clone());
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
 }
 
 /// What an identifier denotes (report §4: an object is a constant, a type, a
@@ -205,6 +241,7 @@ impl<'a> Sema<'a> {
             sema.stmt(s);
         }
         sema.unused_imports(module);
+        dedup_diagnostics(&mut sema.diags);
         sema
     }
 
@@ -258,18 +295,16 @@ impl<'a> Sema<'a> {
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
-        self.diags.push(Diagnostic {
-            severity: Severity::Error,
-            span,
-            message: message.into(),
-        });
+        self.diags
+            .push(Diagnostic::new(Severity::Error, span, message));
     }
     fn warn(&mut self, span: Span, message: impl Into<String>) {
-        self.diags.push(Diagnostic {
-            severity: Severity::Warning,
-            span,
-            message: message.into(),
-        });
+        self.diags
+            .push(Diagnostic::new(Severity::Warning, span, message));
+    }
+    fn error_note(&mut self, span: Span, message: impl Into<String>, note: impl Into<String>) {
+        self.diags
+            .push(Diagnostic::error(span, message).with_note(note));
     }
     /// Report and yield the poison type, so one mistake does not cascade.
     fn error_ty(&mut self, span: Span, message: impl Into<String>) -> TypeId {
@@ -1599,6 +1634,36 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// Whether a designator names a *function* procedure, asked without
+    /// reporting anything (see the call-statement check).
+    fn callee_is_function(&self, q: &QIdent) -> Option<bool> {
+        if q.len() == 1 {
+            return match self.lookup(&q[0])? {
+                Sym::Proc { ty, .. } => Some(self.signature(ty).1.is_some()),
+                Sym::Var { ty, .. } if self.types.is_proc(ty) => {
+                    Some(self.signature(ty).1.is_some())
+                }
+                Sym::Predef(n) => Some(PREDEFINED_FUNCTIONS.contains(&n)),
+                _ => None,
+            };
+        }
+        if q.len() != 2 {
+            return None;
+        }
+        let idx = match self.lookup(&q[0]) {
+            Some(Sym::Module(i)) => i,
+            _ => return None,
+        };
+        self.interfaces[idx]
+            .items
+            .iter()
+            .find(|i| item_name(i) == q[1])
+            .and_then(|i| match i {
+                Item::Proc { result, .. } => Some(result.is_some()),
+                _ => None,
+            })
+    }
+
     /// A mutating predefined procedure must be handed a writable variable: the
     /// same rules as an assignment target apply (report §9.1, §9.8, §10.1).
     fn note_mutation(&mut self, a: &Expr) {
@@ -1744,13 +1809,26 @@ impl<'a> Sema<'a> {
                 }
                 // ✔ rows 7, 8, 9, 10: one predicate for all four exceptions.
                 if !self.types.is_assignable(t.ty, v.ty) {
-                    self.error(
-                        s.span,
-                        format!(
-                            "cannot assign {} to the destination (report 9.1)",
-                            self.describe(v.ty)
-                        ),
+                    let note = if self.types.is_numeric(t.ty) && self.types.is_numeric(v.ty) {
+                        // The one conversion Oberon refuses to do silently.
+                        "there is no implicit conversion between INTEGER and REAL; use FLT or FLOOR (report 8.2.2)"
+                    } else if self.types.is_nil(v.ty) {
+                        "NIL may only be assigned to a pointer or a procedure variable (report 9.1)"
+                    } else if self.types.is_record(t.ty) {
+                        "a record may only be assigned from an extension of its own type (report 9.1)"
+                    } else {
+                        ""
+                    };
+                    let msg = format!(
+                        "cannot assign {} to {} (report 9.1)",
+                        self.describe(v.ty),
+                        self.describe(t.ty)
                     );
+                    if note.is_empty() {
+                        self.error(s.span, msg);
+                    } else {
+                        self.error_note(s.span, msg, note);
+                    }
                 }
                 // ✔ rows 50, 51: report §6.5 - a local or predeclared procedure
                 // cannot be the value assigned to a procedure variable.
@@ -1813,12 +1891,10 @@ impl<'a> Sema<'a> {
                     return;
                 }
                 // ✔ row 31: calling a function for its value in statement
-                // position leaves the value unused.
-                let is_function = match self.lookup_qual(&d.base, d.span) {
-                    Some(Sym::Proc { ty, .. }) => self.signature(ty).1.is_some(),
-                    Some(Sym::Predef(n)) => PREDEFINED_FUNCTIONS.contains(&n),
-                    _ => false,
-                };
+                // position leaves the value unused. The question is answered by
+                // a *silent* lookup: `designator` is the one place that reports
+                // a bad callee, so it must not report it twice.
+                let is_function = self.callee_is_function(&d.base).unwrap_or(false);
                 let t = self.designator(d);
                 let _ = t;
                 if is_function {
@@ -2185,9 +2261,13 @@ const PREDEFINED_PROPER: &[&str] = &[
 /// Parse a type as an interface file renders it, using the module grammar.
 fn rendered_type(text: &str) -> Option<TypeExpr> {
     let mut lexer = crate::lexer::Lexer::new(text);
-    crate::oberon::RenderedTypeParser::new()
-        .parse(&mut lexer)
-        .ok()
+    let mut errors = Vec::new();
+    match crate::oberon::RenderedTypeParser::new().parse(&mut errors, &mut lexer) {
+        // An interface rendering is either readable or it is not; there is no
+        // recovery inside one type.
+        Ok(t) if errors.is_empty() => Some(t),
+        _ => None,
+    }
 }
 
 /// The span a type is filed under. Spans are unique per node in practice; two

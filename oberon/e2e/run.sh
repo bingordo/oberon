@@ -106,11 +106,40 @@ else
 fi
 check "driver-output" "$(cat expected.txt)" "$(cat "$DRV/torture.got")"
 
-# A module that does not check is rejected with a located diagnostic.
+# A module that does not check is rejected with a located diagnostic: the file,
+# the line and column, the source line, a caret under the span, and the reason.
 printf 'MODULE Bad;\n  VAR x: INTEGER;\nBEGIN\n  x := NIL\nEND Bad.\n' > "$DRV/Bad.mod"
 "$OBC" check "$DRV/Bad.mod" -I . >"$DRV/bad.out" 2>&1 || true
-check "driver-reports-a-bad-module" "1" \
-    "$(grep -c 'error: cannot assign NIL' "$DRV/bad.out")"
+check "driver-locates-a-semantic-error" "1" \
+    "$(grep -c '^.*Bad.mod:4:3: error: cannot assign NIL to an INTEGER' "$DRV/bad.out")"
+check "driver-shows-the-source-line-under-a-caret" "1" \
+    "$(grep -c '^4 |   x := NIL$' "$DRV/bad.out")"
+check "driver-explains-the-rule" "1" \
+    "$(grep -c '= note:.*pointer or a procedure variable' "$DRV/bad.out")"
+
+# The parser recovers at statement level, so *one* run reports both the syntax
+# error and the type errors after it (the file has three mistakes; the run
+# reports all three, not just the first).
+printf 'MODULE Mix;\n  VAR x: INTEGER;\nBEGIN\n  x := ;\n  y := 2;\n  z := 3\nEND Mix.\n' > "$DRV/Mix.mod"
+"$OBC" check "$DRV/Mix.mod" -I . >"$DRV/mix.out" 2>&1 || true
+check "driver-reports-syntax-and-semantic-errors-together" "3" \
+    "$(grep -c 'error:' "$DRV/mix.out")"
+check "driver-recovers-past-the-syntax-error" "1" \
+    "$(grep -c 'Mix.mod:5:3: error: `y` is not declared' "$DRV/mix.out")"
+
+# Two syntax errors in one body are both reported.
+printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
+"$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true
+check "driver-reports-several-syntax-errors" "2" \
+    "$(grep -c 'error: unexpected `;`' "$DRV/two.out")"
+
+# A missing END is reported where the module gives out, with what was expected.
+printf 'MODULE NoEnd;\n  VAR x: INTEGER;\nBEGIN\n  x := 1;\nIF x = 1 THEN x := 2\nEND NoEnd.\n' > "$DRV/NoEnd.mod"
+"$OBC" check "$DRV/NoEnd.mod" -I . >"$DRV/noend.out" 2>&1 || true
+check "driver-locates-a-module-level-error" "1" \
+    "$(grep -c 'error: unexpected `NoEnd`' "$DRV/noend.out")"
+check "driver-says-what-would-have-fitted" "1" \
+    "$(grep -c '= note: expected END or ;' "$DRV/noend.out")"
 
 # 7. Regression module: one line of output per defect the review found, each
 #    line's expectation computed from the report rather than from a run.

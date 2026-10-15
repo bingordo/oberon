@@ -14,10 +14,12 @@
 //!    exists, so `(` never follows a complete designator and there is no
 //!    shift/reduce decision to make.
 
+use lalrpop_util::ErrorRecovery;
+
 use crate::ast::*;
 use crate::lexer::{LexicalError, Token};
 
-grammar<'input>;
+grammar<'input, 'err>(errors: &'err mut Vec<ErrorRecovery<usize, Token<'input>, LexicalError>>);
 
 extern {
     type Location = usize;
@@ -183,6 +185,13 @@ VarDecl: VarDecl = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => VarDec
 /// `ProcDeclSemi`.  Writing this as `{ => Vec::new(), <ProcDeclSemi*> => ... }`
 /// would give `ProcSection` two different ε derivations, which is a genuine
 /// reduce/reduce conflict (a nullable symbol under `*` is always ambiguous).
+///
+/// Error recovery is deliberately *not* attempted here. A `!` alternative that
+/// resynchronises on a declaration gives LALRPOP a local ambiguity on the error
+/// token (the nullable section can either end or swallow the error), and every
+/// shape that avoids it does so by removing the recovery. Statement sequences
+/// are the exception that works, because there the error token is shifted in a
+/// state with no competing reduction; see DESIGN §5 D7.
 ProcSection: Vec<Proc> = <ps:ProcDeclSemi*> => ps;
 ProcDeclSemi: Proc = <p:ProcDecl> ";" => p;
 
@@ -312,6 +321,14 @@ Statement: Option<Stmt> = {
     <s:WhileStmt> => Some(s),
     <s:RepeatStmt> => Some(s),
     <s:ForStmt> => Some(s),
+    // Recovery (DESIGN §5 D7): a statement the parser cannot accept becomes an
+    // empty one, and the parser skips input until it can continue — at the next
+    // `;`, in practice. The recovery is recorded, not swallowed, so one run can
+    // report every syntax error in the file.
+    <e:!> => {
+        errors.push(e);
+        None
+    },
 };
 
 AssignStmt: Stmt = <lo:@L> <target:Designator> ":=" <value:Expr> <hi:@R> => Stmt::new(

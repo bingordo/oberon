@@ -18,15 +18,42 @@ lalrpop_util::lalrpop_mod!(pub oberon);
 
 use ast::Module;
 use lexer::{Lexer, LexicalError, Token};
-use lalrpop_util::ParseError;
+use lalrpop_util::{ErrorRecovery, ParseError};
 
 pub type ParseErr<'input> = ParseError<usize, Token<'input>, LexicalError>;
 
+/// Parse a module, failing at the first syntax error.
 pub fn parse_module<'input>(input: &'input str) -> Result<Module, ParseErr<'input>> {
-    oberon::CompilationUnitParser::new().parse(Lexer::new(input))
+    let mut errors = Vec::new();
+    let module = oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input))?;
+    match errors.into_iter().next() {
+        // The grammar recovers so that one run can report every syntax error;
+        // this entry point keeps the fail-fast contract its callers expect.
+        Some(first) => Err(first.error),
+        None => Ok(module),
+    }
+}
+
+/// Parse a module, recovering at statement level (DESIGN §5 D7): the module
+/// comes back with the statements that parsed, together with every syntax error
+/// the parser recovered from. Nothing is discarded - a recovered statement
+/// becomes an empty one, and each error carries the input it dropped.
+pub fn parse_module_recovering<'input>(
+    input: &'input str,
+) -> (
+    Option<Module>,
+    Vec<ErrorRecovery<usize, Token<'input>, LexicalError>>,
+) {
+    let mut errors = Vec::new();
+    match oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input)) {
+        Ok(module) => (Some(module), errors),
+        Err(_) => (None, errors),
+    }
 }
 
 pub use sema::Diagnostic;
+
+use std::fmt::Write as _;
 
 /// Check a module and, if it is clean, emit its C translation unit and header.
 /// Returns `Err` with the diagnostics when the module does not check: the
@@ -70,18 +97,167 @@ pub fn line_col(src: &str, offset: u32) -> (u32, u32) {
     (line, (off - line_start) as u32 + 1)
 }
 
-/// Render diagnostics as `file:line:col: severity: message`, one per line.
+/// The source line containing an offset, without its line break.
+fn source_line(src: &str, offset: u32) -> &str {
+    let off = (offset as usize).min(src.len());
+    let start = src[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = src[off..].find('\n').map(|i| off + i).unwrap_or(src.len());
+    &src[start..end]
+}
+
+fn severity_name(severity: sema::Severity) -> &'static str {
+    match severity {
+        sema::Severity::Error => "error",
+        sema::Severity::Warning => "warning",
+    }
+}
+
+/// A syntax error as a first-class diagnostic, so that a parse failure is
+/// located and rendered exactly like a type error (DESIGN §5 D7, §10).
+pub fn diagnostic_for_parse_error(error: &ParseErr<'_>, dropped: Option<usize>) -> Diagnostic {
+    use lalrpop_util::ParseError as P;
+    let expected_note = |expected: &[String]| -> Option<String> {
+        if expected.is_empty() {
+            return None;
+        }
+        // LALRPOP names terminals with their own quoting; a reader wants the
+        // tokens themselves.
+        let clean = |s: &String| s.trim_matches('"').to_string();
+        const SHOWN: usize = 6;
+        let mut shown: Vec<String> = expected.iter().take(SHOWN).map(clean).collect();
+        let more = expected.len().saturating_sub(SHOWN);
+        let last = shown.pop();
+        let mut note = match (shown.is_empty(), last) {
+            (true, Some(only)) => format!("expected {only}"),
+            (false, Some(last)) => format!("expected {} or {last}", shown.join(", ")),
+            _ => return None,
+        };
+        if more > 0 {
+            let _ = write!(note, " ({more} other token(s) would do as well)");
+        }
+        Some(note)
+    };
+    let mut d = match error {
+        P::InvalidToken { location } => {
+            Diagnostic::error(span_of(*location, *location + 1), "the source is not valid here")
+        }
+        P::UnrecognizedEof { location, expected } => {
+            let mut d = Diagnostic::error(
+                span_of(*location, *location),
+                "unexpected end of file: something is missing",
+            );
+            if let Some(n) = expected_note(expected) {
+                d = d.with_note(n);
+            }
+            d
+        }
+        P::UnrecognizedToken { token, expected } => {
+            let (lo, tok, hi) = token;
+            let mut d = Diagnostic::error(span_of(*lo, *hi), format!("unexpected `{tok}`"));
+            if let Some(n) = expected_note(expected) {
+                d = d.with_note(n);
+            }
+            d
+        }
+        P::ExtraToken { token } => {
+            let (lo, tok, hi) = token;
+            Diagnostic::error(
+                span_of(*lo, *hi),
+                format!("unexpected `{tok}` after the end of the module"),
+            )
+        }
+        P::User { error } => {
+            let (lo, hi) = error.span();
+            Diagnostic::error(span_of(lo, hi), error.to_string()).with_note(error.note())
+        }
+    };
+    if let Some(n) = dropped.filter(|n| *n > 0) {
+        d = d.with_note(format!(
+            "the parser skipped {n} token(s) to carry on; a later error may be a consequence of \
+             this one"
+        ));
+    }
+    d
+}
+
+fn span_of(lo: usize, hi: usize) -> ast::Span {
+    ast::Span::new(lo, hi)
+}
+
+/// Render diagnostics the way a compiler should: `file:line:col: severity:
+/// message`, then the offending source line, a caret under the span, and the
+/// note.
 pub fn render_diagnostics(path: &str, src: &str, diags: &[Diagnostic]) -> String {
     let mut out = String::new();
     for d in diags {
         let (line, col) = line_col(src, d.span.lo);
-        let sev = match d.severity {
-            sema::Severity::Error => "error",
-            sema::Severity::Warning => "warning",
-        };
-        out.push_str(&format!("{path}:{line}:{col}: {sev}: {}\n", d.message));
+        let _ = writeln!(
+            out,
+            "{path}:{line}:{col}: {}: {}",
+            severity_name(d.severity),
+            d.message
+        );
+        let text = source_line(src, d.span.lo);
+        if !text.trim().is_empty() {
+            let width = line.to_string().len();
+            let _ = writeln!(out, "{:width$} |", "");
+            let _ = writeln!(out, "{line} | {text}");
+            let (end_line, end_col) = line_col(src, d.span.hi);
+            let carets = if end_line == line && end_col > col {
+                (end_col - col) as usize
+            } else {
+                1
+            };
+            let pad = " ".repeat((col as usize - 1).min(text.len()));
+            let _ = writeln!(out, "{:width$} | {pad}{}", "", "^".repeat(carets));
+        }
+        if let Some(note) = &d.note {
+            let _ = writeln!(out, "  = note: {note}");
+        }
     }
     out
+}
+
+/// Parse a module and turn every syntax error into a located diagnostic —
+/// including the fatal one, which a recovery point could not absorb (a missing
+/// `END`, or a lexical error). The module comes back when the parser got far
+/// enough to build one.
+pub fn parse_with_diagnostics(input: &str) -> (Option<Module>, Vec<Diagnostic>) {
+    let mut errors = Vec::new();
+    let recovered = |errors: &Vec<ErrorRecovery<usize, Token<'_>, LexicalError>>| -> Vec<Diagnostic> {
+        errors
+            .iter()
+            .map(|r| diagnostic_for_parse_error(&r.error, Some(r.dropped_tokens.len())))
+            .collect()
+    };
+    match oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input)) {
+        Ok(module) => (Some(module), recovered(&errors)),
+        Err(fatal) => {
+            let mut diags = recovered(&errors);
+            diags.push(diagnostic_for_parse_error(&fatal, None));
+            (None, diags)
+        }
+    }
+}
+
+/// Parse *and* check a module, reporting syntax errors and semantic errors in
+/// one run: the grammar recovers at statement level, so a file with three bad
+/// statements is still type-checked.
+pub fn check_module_recovering(
+    input: &str,
+    interfaces: &[sym::Interface],
+) -> (Option<Module>, Vec<Diagnostic>) {
+    let (module, mut diags) = parse_with_diagnostics(input);
+    match module {
+        Some(mut m) => {
+            let (_, mut sem) = sema::Sema::check(&mut m, interfaces);
+            diags.append(&mut sem);
+            sema::dedup_diagnostics(&mut diags);
+            diags.sort_by_key(|d| (d.span.lo, d.span.hi));
+            (Some(m), diags)
+        }
+        None => (None, diags),
+    }
 }
 
 /// Parse a module and run the semantic pass over it (DESIGN §7-§8). The module
@@ -617,6 +793,142 @@ END M.
 }
 
 #[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// Render diagnostics for a source, with the path the messages use.
+    fn report(src: &str) -> (String, Vec<Diagnostic>) {
+        let (_, diags) = check_module_recovering(src, &[]);
+        (render_diagnostics("M.mod", src, &diags), diags)
+    }
+
+    fn messages(diags: &[Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|d: &&Diagnostic| d.is_error())
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_syntax_error_is_located_explained_and_underlined() {
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  x := ;\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(diags.len(), 1, "{text}");
+        let d = &diags[0];
+        assert_eq!(line_col(src, d.span.lo), (4, 8));
+        // The message says what is wrong, the note what would fit, and the
+        // rendering shows the line with a caret under the span.
+        assert!(text.contains("M.mod:4:8: error: unexpected `;`"), "{text}");
+        assert!(text.contains("= note: expected ident"), "{text}");
+        assert!(text.contains("4 |   x := ;"), "{text}");
+        assert!(text.contains("|        ^"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_end_is_reported_where_the_module_gives_out() {
+        // No recovery point can absorb this: the parser has to say so, once.
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  x := 1;\nIF x = 1 THEN x := 2\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{text}");
+        assert!(text.contains("error: unexpected `M`"), "{text}");
+        assert!(text.contains("expected END or ;"), "{text}");
+        assert!(text.contains("6 | END M."), "{text}");
+    }
+
+    #[test]
+    fn a_lexical_error_names_the_character_and_what_to_do() {
+        let src = "MODULE M;\nBEGIN\n  x := 1 $ 2\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{text}");
+        assert!(text.contains("M.mod:3:10: error: illegal character '$'"), "{text}");
+        assert!(text.contains("= note: not part of Oberon's vocabulary"), "{text}");
+    }
+
+    #[test]
+    fn recovery_reports_later_errors_in_the_same_run() {
+        // The broken statement is recovered from, so the *semantic* mistakes
+        // after it are still found - which is the point of recovering at all.
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  x := ;\n  y := 2;\n  z := 3\nEND M.\n";
+        let msgs = messages(&report(src).1);
+        assert!(msgs[0].contains("unexpected `;`"), "{msgs:?}");
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert!(msgs[1].contains("`y` is not declared"), "{msgs:?}");
+        assert!(msgs[2].contains("`z` is not declared"), "{msgs:?}");
+    }
+
+    #[test]
+    fn several_syntax_errors_are_reported_in_one_run() {
+        let src = "MODULE M;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND M.\n";
+        let msgs = messages(&report(src).1);
+        let syntax: Vec<&String> = msgs.iter().filter(|m| m.contains("unexpected")).collect();
+        assert_eq!(syntax.len(), 2, "{msgs:?}");
+        assert!(syntax[0].contains("unexpected `;`") && syntax[1].contains("unexpected `;`"));
+    }
+
+    #[test]
+    fn semantic_errors_accumulate_with_their_own_locations() {
+        let src = "MODULE M;\n  VAR x: INTEGER; r: REAL;\nBEGIN\n  x := r;\n  x := 1 + r;\n  x := f(1);\n  x := unknown\nEND M.\n";
+        let (text, diags) = report(src);
+        let msgs = messages(&diags);
+        assert_eq!(msgs.len(), 4, "{text}");
+        // each is located on its own line, in source order
+        let lines: Vec<u32> = diags
+            .iter()
+            .filter(|d: &&Diagnostic| d.is_error())
+            .map(|d| line_col(src, d.span.lo).0)
+            .collect();
+        assert_eq!(lines, vec![4, 5, 6, 7], "{text}");
+    }
+
+    #[test]
+    fn the_common_mistakes_explain_themselves() {
+        // Report §8.2.2's rule is the one that surprises people.
+        let src = "MODULE M;\n  VAR x: INTEGER; r: REAL;\nBEGIN\n  x := r\nEND M.\n";
+        let (text, _) = report(src);
+        assert!(text.contains("cannot assign a REAL to an INTEGER"), "{text}");
+        assert!(text.contains("use FLT or FLOOR"), "{text}");
+
+        // And NIL, which is the other one.
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  x := NIL\nEND M.\n";
+        let (text, _) = report(src);
+        assert!(text.contains("cannot assign NIL to an INTEGER"), "{text}");
+        assert!(text.contains("pointer or a procedure variable"), "{text}");
+    }
+
+    #[test]
+    fn one_mistake_is_reported_once() {
+        // A call statement used to be looked up twice, so an unknown callee was
+        // reported twice.
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  Get(x);\n  Get(x)\nEND M.\n";
+        let msgs = messages(&report(src).1);
+        // Two *statements*, so two errors - but not four.
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+    }
+
+    #[test]
+    fn a_warning_is_rendered_as_a_warning() {
+        // The import has to resolve for the unused-import *warning* to be the
+        // only thing said about it.
+        let iface = sym::parse("MODULE Texts\nPROC Write(ch: CHAR)\n").unwrap();
+        let src = "MODULE M;\n  IMPORT Texts;\nBEGIN\nEND M.\n";
+        let (_, diags) = check_module_recovering(src, &[iface]);
+        let text = render_diagnostics("M.mod", src, &diags);
+        assert!(diags.iter().any(|d| !d.is_error()), "{text}");
+        assert!(text.contains("M.mod:2:10: warning: import `Texts` is never used"), "{text}");
+    }
+
+    #[test]
+    fn the_source_line_is_echoed_even_when_the_span_is_at_the_end() {
+        // An empty statement slot at the end of a module body: the caret has
+        // nowhere to point beyond the line, and must not panic.
+        let src = "MODULE M;\nBEGIN\n  ;\nEND M.\n";
+        let (text, _) = report(src);
+        assert!(text.is_empty() || text.contains("M.mod:"), "{text}");
+    }
+}
+
+#[cfg(test)]
 mod check_tests {
     use super::*;
     use crate::sym::Interface;
@@ -652,7 +964,7 @@ PROC Append(p: Writer; b: Buffer)\n"),
     fn errors(src: &str, interfaces: &[Interface]) -> Vec<String> {
         run(src, interfaces)
             .into_iter()
-            .filter(Diagnostic::is_error)
+            .filter(|d: &Diagnostic| d.is_error())
             .map(|d| d.message)
             .collect()
     }

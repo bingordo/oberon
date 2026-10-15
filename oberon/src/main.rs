@@ -106,19 +106,12 @@ fn main() -> ExitCode {
 
     let check = args.iter().any(|a| a == "-c" || a == "--check");
     if check {
-        return match oberon_front::check_module(&src, &[]) {
-            Ok((_, diags)) => {
-                print!("{}", oberon_front::render_diagnostics(path, &src, &diags));
-                if diags.iter().any(|d| d.is_error()) {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => {
-                eprintln!("{path}: {e}");
-                ExitCode::FAILURE
-            }
+        let (_, diags) = oberon_front::check_module_recovering(&src, &[]);
+        print!("{}", oberon_front::render_diagnostics(path, &src, &diags));
+        return if diags.iter().any(|d| d.is_error()) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
         };
     }
     match oberon_front::parse_module(&src) {
@@ -127,7 +120,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{path}: {e}");
+            // The same shape as any other diagnostic (DESIGN §10).
+            let d = oberon_front::diagnostic_for_parse_error(&e, None);
+            eprint!("{}", oberon_front::render_diagnostics(path, &src, &[d]));
             ExitCode::FAILURE
         }
     }
