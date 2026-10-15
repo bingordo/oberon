@@ -1240,6 +1240,28 @@ prototype builds and runs the `e2e` modules with every row passing; `fuzz`'s see
 pass against it; and DESIGN records the ABI decision (runtime in C versus lowered)
 with the reason it was taken.
 
+**Split, so that the first half is completable rather than open-ended.** The research
+half is done. The prototype is now W9.1 proper, scoped to the **fuzz corpus**:
+`INTEGER` arithmetic and the shifts, `IF`/`WHILE`/`REPEAT`/`FOR`/`CASE`, procedures,
+recursion, and the runtime calls the emitted code makes (`rt_div_at`, `rt_mod_at`,
+`rt_trap_pos`, `rt_index`). That is a *whole* milestone rather than a slice of one —
+the corpus is the strongest oracle in the repository, since each program carries its
+own expected values, and it needs no records, arrays, pointers, descriptors, open
+arrays or type-`CASE`. Passing it proves the things the research left open: the
+module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`, and
+Cranelift's shift rule, which does *not* match the report's and therefore lands
+squarely on the corpus's deliberate large-count shifts.
+
+**W9.2 the rest of the language on the Cranelift back end** — **open**
+
+What W9.1's prototype leaves out, listed so it is not mistaken for done: records and
+their descriptors, `ARRAY` and open-array parameters, `POINTER TO` and `NEW`, type
+guards and the type-`CASE`, `SYSTEM`, `REAL`/`CHAR`/`SET`, and the string and record
+copies. The constraints are already fixed — the descriptor at offset 0, the field
+layout the C emitter computes, the runtime's C ABI — so it is a matter of emitting
+the same shapes through another IR, and `e2e` is the acceptance test it cannot yet
+meet.
+
 **W7.7 a byte for every trap, not only the memory ones** — **done**
 
 The matrix asserted an exact source offset for the index and guard traps, because
