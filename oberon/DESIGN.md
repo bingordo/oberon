@@ -958,13 +958,20 @@ the only deliberate escape. This table is that promise, audited access by access
 | record field | the layout is computed by the emitter, so every field offset is in bounds by construction | `csmoke` (descriptors and layouts), `golden` (the emitted shapes) |
 | pointer dereference (`p.f`, `p^`) | `rt_nil(p, at)` — traps with the offset | `e2e`'s `nil-field-dereference-traps` and `nil-caret-dereference-traps`, `emit_tests::a_pointer_access_is_checked_for_nil`. **Exception**: when the operand has a side effect (an index expression containing a call) the check is *not* emitted, because `rt_nil` reads it twice (R26) |
 | failed type guard `v(T)` | `rt_guard_is` — traps | `e2e`'s `failed-guard-traps` (pointer spelling); the record spelling is R15 |
-| type-`CASE` with no matching label | `rt_trap("CASE: no matching type")` | `csmoke` (the descriptor-id switch), `e2e` |
+| type-`CASE` with no matching label | `rt_trap_pos("CASE: no matching type", subject)` — traps with the offset | `csmoke` (the descriptor-id switch), `e2e`'s `trap-case-no-match` (which asserts the exact line) |
 | whole-array and whole-record copy | `rt_rec_copy` / `rt_strcopy` / `memcpy` with the length the types give | `golden` (R14's exact-length string case), `csmoke` |
 | string literal initialisation | a bounded copy into the target array | `golden` (R14) |
 | frame and static link | the emitter's own layout; a link is only emitted where the body reaches an enclosing local | `csmoke` (three-level nesting, R7) |
-| `NEW` | `rt_new` allocates header plus payload and returns `NIL` on failure (report §6.4's failure case) | *not yet* — the failure path needs an allocation-failure hook, which is W7.4 |
+| `NEW` | `rt_new` allocates header plus payload and returns `NIL` on failure (report §6.4's failure case); it is the only route to the heap | `e2e`'s `a-failing-new-yields-nil`, which forces the failure with `OB_ALLOC_FAIL_AT` (the hook W7.4 added), and `fuzz` (which allocates through it) |
 | descriptor read (`p.desc`) | the descriptor is at offset 0 of every view of a record, by the layout rule of §9.3 | `csmoke` (type-`CASE` and `IS`), `e2e`'s three-level extension |
-| the trap report itself | writes to `stderr` and aborts; it reads no program data | `e2e`'s trap rows |
+| the trap report itself | writes to `stderr` and aborts; it reads no program data | `e2e`'s trap matrix: every row asserts the exact message *and* the source offset *and* that the process died by abort |
+
+Every check in the emitted code is locatable, not only the memory ones (W7.7):
+`DIV by zero`, `MOD by zero`, `assertion failed` and `CASE: no matching type`
+report `(at byte N of the source)` like the index and `NIL` checks do, because the
+runtime has the offset in hand at each of those call sites. The two-argument
+`rt_div`/`rt_mod`/`rt_guard` remain as wrappers over the positioned variants,
+since `golden`'s hand-written fixtures call them without an offset.
 
 The one row without a test is `rt_new`'s failure path, and the one access without
 a check is the exception named in the pointer row. Both are itemised (W7.4, R26)

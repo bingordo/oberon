@@ -1067,7 +1067,11 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(out, "    break; }}");
             }
             if !default_taken {
-                let _ = writeln!(out, "    default: rt_trap(\"CASE: no matching type\"); break;");
+                let _ = writeln!(
+                    out,
+                    "    default: rt_trap_pos(\"CASE: no matching type\", {}); break;",
+                    subject.span.lo
+                );
             }
             let _ = writeln!(out, "    }}");
             return;
@@ -1360,10 +1364,10 @@ impl<'a> Emitter<'a> {
                 BinOp::Sub => format!("({a} & ~{b})"),
                 BinOp::Mul => format!("({a} & {b})"),
                 BinOp::Div => format!("({a} ^ {b})"),
-                _ => self.binary_plain(op, &a, &b, lt, rt),
+                _ => self.binary_plain(op, &a, &b, lt, rt, l.span.lo),
             };
         }
-        self.binary_plain(op, &a, &b, lt, rt)
+        self.binary_plain(op, &a, &b, lt, rt, l.span.lo)
     }
 
     /// Whether evaluating this expression can call something — an Oberon call is
@@ -1497,7 +1501,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn binary_plain(&self, op: BinOp, a: &str, b: &str, lt: TypeId, rt: TypeId) -> String {
+    /// `at` is the byte offset of the expression, which a division by zero
+    /// reports: every trap in the emitted code is locatable (DESIGN 9.4).
+    fn binary_plain(&self, op: BinOp, a: &str, b: &str, lt: TypeId, rt: TypeId, at: u32) -> String {
         match op {
             BinOp::Or => format!("({a} || {b})"),
             BinOp::And => format!("({a} && {b})"),
@@ -1509,11 +1515,11 @@ impl<'a> Emitter<'a> {
             // same helper. REAL division and SET symmetric difference are not
             // affected.
             BinOp::Div if self.types.is_integer_like(lt) && self.types.is_integer_like(rt) => {
-                format!("rt_div({a}, {b})")
+                format!("rt_div_at({a}, {b}, {at})")
             }
             BinOp::Div => format!("({a} / {b})"),
-            BinOp::IDiv => format!("rt_div({a}, {b})"),
-            BinOp::Mod => format!("rt_mod({a}, {b})"),
+            BinOp::IDiv => format!("rt_div_at({a}, {b}, {at})"),
+            BinOp::Mod => format!("rt_mod_at({a}, {b}, {at})"),
             BinOp::In => format!("rt_in({b}, {a})"),
             BinOp::Eq => format!("({a} == {b})"),
             BinOp::Ne => format!("({a} != {b})"),
@@ -2138,7 +2144,11 @@ impl<'a> Emitter<'a> {
                 let b = self.expr(&args[0], Some(self.types.boolean()));
                 let pre = self.take_prelude();
                 out.push_str(&pre);
-                let _ = writeln!(out, "    rt_guard({b}, \"assertion failed\");");
+                let _ = writeln!(
+                    out,
+                    "    rt_guard_at({b}, \"assertion failed\", {});",
+                    d.span.lo
+                );
             }
             "NEW" => {
                 let p = self.designator_of_mut(&args[0], level);

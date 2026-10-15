@@ -49,8 +49,12 @@ static inline void rt_trap(const char *msg) {
     rt_trap_pos(msg, -1);
 }
 
+static inline void rt_guard_at(int32_t cond, const char *msg, int32_t at) {
+    if (!cond) rt_trap_pos(msg, at);
+}
+
 static inline void rt_guard(int32_t cond, const char *msg) {
-    if (!cond) rt_trap(msg);
+    rt_guard_at(cond, msg, -1);
 }
 
 /* Bounds checks carry the source offset of the designator, which is what makes
@@ -70,8 +74,8 @@ static inline int32_t rt_index_at(int32_t i, int32_t n, int32_t at) {
  * report's `0 <= r < y` (report 8.2.2); for y < 0 it floors, which is how
  * every Oberon implementation behaves.  y == -1 is special-cased because the
  * hardware traps on INT32_MIN / -1 and the wrap is what two's complement says. */
-static inline int32_t rt_div(int32_t x, int32_t y) {
-    if (y == 0) rt_trap("DIV by zero");
+static inline int32_t rt_div_checked(int32_t x, int32_t y, int32_t at) {
+    if (y == 0) rt_trap_pos("DIV by zero", at);
     if (y == -1) return (int32_t)(0u - (uint32_t)x);
     int32_t q = x / y;
     int32_t r = x % y;
@@ -79,13 +83,28 @@ static inline int32_t rt_div(int32_t x, int32_t y) {
     return q;
 }
 
-static inline int32_t rt_mod(int32_t x, int32_t y) {
-    if (y == 0) rt_trap("MOD by zero");
+/* The arithmetic is one function and the two entry points differ only in what a
+ * trap reports: the emitter passes the expression's offset, the hand-written
+ * fixtures that call `rt_div(x, y)` directly do not have one (DESIGN 9.4). */
+static inline int32_t rt_div(int32_t x, int32_t y) {
+    return rt_div_checked(x, y, -1);
+}
+
+#define rt_div_at(x, y, at) rt_div_checked((x), (y), (at))
+
+static inline int32_t rt_mod_checked(int32_t x, int32_t y, int32_t at) {
+    if (y == 0) rt_trap_pos("MOD by zero", at);
     if (y == -1) return 0;
     int32_t r = x % y;
     if (r != 0 && (r < 0) != (y < 0)) r = r + y;
     return r;
 }
+
+static inline int32_t rt_mod(int32_t x, int32_t y) {
+    return rt_mod_checked(x, y, -1);
+}
+
+#define rt_mod_at(x, y, at) rt_mod_checked((x), (y), (at))
 
 /* The report's table (§8.2.2) defines these as `x * 2^n` and `x DIV 2^n`, so a
  * count of 32 or more is defined rather than a no-op: multiplying by 2^32 wraps

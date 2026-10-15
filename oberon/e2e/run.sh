@@ -249,26 +249,26 @@ BEGIN
   NEW(p);
   CASE p OF PS: END
 END T6.
-' 'oberon: trap: CASE: no matching type'
+' 'oberon: trap: CASE: no matching type (at byte 137 of the source)'
 trap_case div-by-zero 'MODULE T7;
   VAR i, j: INTEGER;
 BEGIN
   j := 0;
   i := 7 DIV j
 END T7.
-' 'oberon: trap: DIV by zero'
+' 'oberon: trap: DIV by zero (at byte 55 of the source)'
 trap_case mod-by-zero 'MODULE T8;
   VAR i, j: INTEGER;
 BEGIN
   j := 0;
   i := 7 MOD j
 END T8.
-' 'oberon: trap: MOD by zero'
+' 'oberon: trap: MOD by zero (at byte 55 of the source)'
 trap_case failing-assert 'MODULE T9;
 BEGIN
   ASSERT(1 = 2)
 END T9.
-' 'oberon: trap: assertion failed'
+' 'oberon: trap: assertion failed (at byte 19 of the source)'
 
 # `NEW` failing is *specified* to yield NIL (report §6.4), so the hook makes it
 # observable: the program traps itself if the allocation did not fail.

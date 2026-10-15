@@ -1087,14 +1087,19 @@ prototype builds and runs the `e2e` modules with every row passing; `fuzz`'s see
 pass against it; and DESIGN records the ABI decision (runtime in C versus lowered)
 with the reason it was taken.
 
-**W7.7 a byte for every trap, not only the memory ones** — **open**
+**W7.7 a byte for every trap, not only the memory ones** — **done**
 
-The matrix asserts an exact source offset for the index and guard traps, because
-those messages carry one. `DIV by zero`, `MOD By zero`, `assertion failed` and
-`CASE: no matching type` carry none (DESIGN §9.4's table gives them their message
-only), so a user who trips one has no location — the runtime has the offset in hand
-at every one of those sites already, since each is emitted as a call. Adopt the
-same `(at byte N of the source)` suffix, then extend the matrix's expectations.
+The matrix asserted an exact source offset for the index and guard traps, because
+those messages carry one, while `DIV by zero`, `MOD by zero`, `assertion failed`
+and `CASE: no matching type` carried none — so a user who tripped one had no
+location, though the runtime had the offset in hand at every one of those sites.
+**Done**: `rt_div_checked`/`rt_mod_checked`/`rt_guard_at` take the expression's
+offset and the `CASE` default calls `rt_trap_pos`, all four messages now read
+`(at byte N of the source)`, and the matrix's four rows assert the exact line
+(`DIV by zero (at byte 55 …)`, `MOD by zero (at byte 55 …)`, `assertion failed
+(at byte 19 …)`, `CASE: no matching type (at byte 137 …)`). The two-argument
+`rt_div`/`rt_mod`/`rt_guard` remain as wrappers, because `golden`'s hand-written
+fixtures call them directly and have no offset to pass.
 
 ## W10 — a garbage collector
 
