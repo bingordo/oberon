@@ -9,8 +9,10 @@
 # expectation taken from the compiler.
 #
 # The default run is the standard suite: every seed that once found a defect
-# (regressions.txt), then a block for coverage. SEEDS/BASE select one contiguous
-# range instead, for an ad-hoc run; either way a seed reproduces on any machine.
+# (regressions.txt) as a value oracle, as a trap oracle and once under the
+# sanitizers, then a block for coverage and a smaller adversarial one.
+# SEEDS/BASE select one contiguous range instead, for an ad-hoc run; either way a
+# seed reproduces a program exactly, on any machine.
 set -e
 cd -- "$(dirname -- "$0")"
 
@@ -19,16 +21,43 @@ OBC=${OBC:-../target/debug/obc}
 WORK=${WORK:-findings}
 LIST=${LIST:-regressions.txt}
 COVER=${COVER:-100}
+ADVCOVER=${ADVCOVER:-25}
 BASE=${BASE:-1}
 
+# SAN=1 builds every generated program with the sanitizers the golden suite uses,
+# which makes a clean run evidence about the *emitted* code rather than about the
+# program's own arithmetic (PLAN.md W7.5). Leak detection stays on: the fragment
+# allocates nothing yet, so a leak would be a finding rather than a language
+# property -- when it does allocate, W10 decides what a leak means.
+#
+# The adversarial mode appends one deliberate violation per program (an index
+# past the end, a NIL dereference, a guard that cannot hold, a computed zero
+# divisor, a false assertion) and the run must produce the exact trap line --
+# message *and* source byte. That is the only test of those paths that does not
+# come from a hand-written case.
+FLAGS=()
+if [ -n "${SAN:-}" ]; then
+    FLAGS=(--cflag -fsanitize=address,undefined --cflag -fno-sanitize-recover=all --cflag -g)
+    export ASAN_OPTIONS=detect_leaks=1
+    export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+fi
+
 status=0
+run() { "$OBG" --obc "$OBC" --work "$WORK" "${FLAGS[@]}" "$@" || status=$?; }
+
 if [ -n "${SEEDS:-}" ]; then
-    "$OBG" --seeds "$SEEDS" --base "$BASE" --obc "$OBC" --work "$WORK" "$@" || status=$?
-    echo "SUMMARY fuzz: seeds $BASE..$((BASE + SEEDS - 1)), exit $status"
+    run --seeds "$SEEDS" --base "$BASE" "$@"
+    echo "SUMMARY fuzz: seeds $BASE..$((BASE + SEEDS - 1))${SAN:+ under sanitizers}, exit $status"
 else
-    "$OBG" --seed-list "$LIST" --obc "$OBC" --work "$WORK" "$@" || status=$?
+    run --seed-list "$LIST" "$@"                    # the value oracle
     echo "----"
-    "$OBG" --seeds "$COVER" --base "$BASE" --obc "$OBC" --work "$WORK" "$@" || status=$?
-    echo "SUMMARY fuzz: regression list + seeds $BASE..$((BASE + COVER - 1)), exit $status"
+    run --seed-list "$LIST" --adversarial "$@"      # the trap oracle
+    echo "----"
+    SAN=1 run --seed-list "$LIST" "$@"              # ... and once under sanitizers
+    echo "----"
+    run --seeds "$COVER" --base "$BASE" "$@"        # coverage
+    echo "----"
+    run --seeds "$ADVCOVER" --base "$BASE" --adversarial "$@"
+    echo "SUMMARY fuzz: regression list (values, traps, sanitizers) + $COVER coverage + $ADVCOVER adversarial, exit $status"
 fi
 exit $status

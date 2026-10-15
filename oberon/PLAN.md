@@ -172,7 +172,7 @@ actual bug: a local `T` was invisible, so `Q(T)` stayed classified as a guard).
 The two programs that used to be rejected now check clean, with the before/after
 in §13's R17 and a test pinning both.
 
-**W2.2 R15: a *failing* guard with the record spelling is statically out of bounds**
+**W2.2 R15: a *failing* guard with the record spelling is statically out of bounds** — **done**, and the cause was elsewhere
 Why: `p(S).b` where `p` points at `R` reads through a pointer that cannot hold
 an `S`; the guard's tag test traps first at run time, but gcc's
 `-Warray-bounds`/`-Wmaybe-uninitialized` can see the read statically and reject
@@ -182,7 +182,12 @@ Candidate fixes: lower the guarded access through a union of the possible
 record layouts, or through an opaque `char *` plus `memcpy` (both keep the trap
 first); a local pragma is the fallback, documented rather than silent.
 Done when: the same program compiles under both spellings with gcc *and* clang
-and still traps with the right offset.
+and still traps with the right offset. **Done**: the obstacle was `rt_new` being
+`static inline` in the header, which let gcc fold `malloc(sizeof(R))` and prove the
+guarded write was outside the allocation; it is defined in `oberon_runtime.c` now,
+and the failing record-spelling write compiles and traps with the guard's offset
+under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
+program built with `--cc clang`). The pointer spelling was already tested.
 
 **W2.3 R16: a structured value argument inside a short-circuit operand is copied eagerly**
 Why: a record argument inside `AND`/`OR` whose own index expressions contain
@@ -688,7 +693,8 @@ exactly the details a hand-written corpus forgets: an identifier has no `_`
 and `ROL` are not predefined procedures (§10.2), and DESIGN §13's prose used
 `MAX(INTEGER)` in three places, which is now corrected.
 
-**W6.4 a gap the generator could not work around** — **open**
+**W6.4 a gap the generator could not work around** — **decided: the deviation is
+recorded in DESIGN §5 D8**
 The report's `case = [CaseLabelList ":" StatementSequence]` allows a *default*
 arm written as a bare statement sequence, `| S`. Our grammar requires the labels
 and the `:` to appear together, so `| S` is rejected. This is not an oversight:
@@ -699,7 +705,11 @@ and LALR(1) cannot look two tokens ahead — the reference compiler's recursive
 descent can. Options: a hand-written case-arm parser, a two-token lookahead
 trick, or documenting the deviation and requiring the empty-label-arm spelling
 `| END`. Doing nothing is also defensible (no Oberon-07 program *needs* a default
-arm), but the decision should be written down in DESIGN §5.
+arm), but the decision should be written down in DESIGN §5. **Decided and
+recorded**: the grammar keeps `CaseArm = labels? body?`, the default arm is spelled
+`| : S` (verified: `| : S` is accepted, `| S` is rejected with a diagnostic naming
+the missing colon), and DESIGN §5 D8 states the conflict, the options and why this
+one was taken.
 
 ---
 
@@ -800,16 +810,19 @@ rather than emitted wrong; finishing it means hoisting the operand into a
 statement, which is the emitter's temporary machinery (R16) and wants the same
 treatment as the fold's call rule.
 
-**W7.2 a constant out-of-range index is not diagnosed — open, a decision**
+**W7.2 a constant out-of-range index is not diagnosed — **done** (warn, and still
+trap)
 Why: `a[10]` on `ARRAY 4 OF INTEGER` compiles, and `e2e/Trap.mod` *relies* on
 that (its comment says the check must trap and say where). Nothing is wrong with
 the run-time behaviour — it traps, with the offset — but a provably wrong index
 is a program bug that a compiler can name for free: the index is folded already
 (`rt_index(((int32_t)10u), 4, 62)` appears in the emitted C), so the folder knows
 both the value and the length.
-Decision: warn (not error) when the folded index is outside `0 .. LEN-1` or the
-folded string is longer than its target, and update `Trap.mod` to expect the
-warning on the way to its trap. Declining is also defensible — Wirth's compilers
+**Done** as decided: the compiler *warns* (not errors) when the folded index is
+outside `0 .. LEN-1`, `Trap.mod` carries the warning on the way to its trap, and
+`diag_tests::a_constant_index_out_of_range_warns_and_still_traps` pins both halves
+— the warning *and* the emitted check, so "the compiler can see it is wrong" and
+"the check still traps" are both promised and both tested. Declining is also defensible — Wirth's compilers
 do not diagnose it — but then §13 should say so, because "the check traps" and
 "the compiler can see it is wrong" are different promises.
 
@@ -858,7 +871,7 @@ field cannot be written under `-Werror` at all — gcc sees the read is outside 
 allocation (R15) — so the matrix's guard rows use the guard as a value and the
 pointer spelling, and R15 keeps its record.
 
-**W7.5 the generator as a memory-safety oracle** — **open**
+**W7.5 the generator as a memory-safety oracle** — **done**
 Why: the self-checks in W6.1 verify *values*; they cannot see a wrong length, a
 stale frame pointer or a descriptor read that happens to land inside the heap.
 Two additions, both cheap because the machinery exists:
@@ -872,7 +885,21 @@ Two additions, both cheap because the machinery exists:
    traps at the expected offset and corrupts nothing. That is the only test that
    exercises the guard paths rather than the value paths.
 Done when: a few hundred seeds are ASan/UBSan-clean, and the adversarial mode's
-traps all report their expected offsets.
+traps all report their expected offsets. **Done**: `SAN=1` builds every generated
+program with `-fsanitize=address,undefined -fno-sanitize-recover=all` and the
+sanitizer environment the golden suite uses — 300 seeds from base 2000 and the
+nine regression seeds are clean, with leak detection on. `--adversarial` appends
+one deliberate violation per program, after the value checks so that a wrong value
+still fails first: an index one past `arr`'s end, `pa.x := 1` with `pa = NIL`, a
+guard that asks for a pointer to the extension while the object is the base, a
+divisor computed to be zero (DIV and MOD), and `ASSERT(FALSE)`. The generator
+renders the violation and computes the trap line it must produce from that same
+render, byte included, and the harness compares the line rather than merely
+requiring a trap — proved by mutation: adding five to the expected byte makes it
+report ``expected `… at byte 3655 …`, got: … at byte 3650 …``. 200 seeds from base
+3000 and the nine regression seeds pass, and the standard suite now runs the
+regression list three ways (values, traps, sanitized) plus 100 coverage seeds and
+25 adversarial ones.
 
 ---
 

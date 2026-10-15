@@ -508,6 +508,14 @@ struct Program {
     /// variable: the first trap then names the statement that diverged, which is
     /// how a failing seed is triaged.
     per_statement: Option<usize>,
+    /// Adversarial mode (PLAN.md W7.5): after the value checks, one statement
+    /// that *must* trap, together with the trap line it must produce. The
+    /// violation is not part of `body`, so the mirror and every value check stay
+    /// valid, and the trap is the only thing left to observe -- which is the
+    /// only way those checks (bounds, NIL, guard, divisor, assertion) are
+    /// exercised rather than reasoned about.
+    adversarial: bool,
+    seed: u64,
 }
 
 impl Program {
@@ -530,6 +538,46 @@ impl Program {
         out
     }
 
+    /// One deliberate violation, its trap line, and where in the block the byte
+    /// the runtime reports comes from. The runtime reports the byte of the
+    /// *designator* the check guards, so each variant says where that token
+    /// starts inside the block it returns.
+    fn violation(seed: u64, m: &str) -> (String, usize, &'static str) {
+        match seed % 6 {
+            0 => {
+                let block = "  arr[4] := 1\n".to_string();
+                let rel = block.find("arr").unwrap();
+                (block, rel, "index out of range")
+            }
+            1 => {
+                let block = "  pa.x := 1\n".to_string();
+                let rel = block.find("pa").unwrap();
+                (block, rel, "NIL pointer dereference")
+            }
+            2 => {
+                // `pa` points at an `ARec` while the guard asks for a pointer to
+                // the extension `AExt`: the tag test fails and reports itself.
+                let block =
+                    "  NEW(pa);\n  IF pa(AExtPtr) # NIL THEN arr[0] := 1 END\n".to_string();
+                let rel = block.find("pa(AExtPtr)").unwrap();
+                (block, rel, "type guard failed")
+            }
+            3 | 4 => {
+                let op = if seed % 6 == 3 { "DIV" } else { "MOD" };
+                let prefix = format!("  {m} := ");
+                let block = format!("{prefix}{m} {op} ({m} - {m});\n");
+                let rel = prefix.len();
+                let msg = if seed % 6 == 3 { "DIV by zero" } else { "MOD by zero" };
+                (block, rel, msg)
+            }
+            _ => {
+                let block = "  ASSERT(FALSE)\n".to_string();
+                let rel = block.find("ASSERT").unwrap();
+                (block, rel, "assertion failed")
+            }
+        }
+    }
+
     /// The expected value of every module variable, from the mirror.
     fn expectations(&self) -> Vec<i32> {
         let mut m = vec![0i32; self.g.mvars.len()];
@@ -541,6 +589,12 @@ impl Program {
     }
 
     fn render(&self) -> String {
+        self.render_with_expectation().0
+    }
+
+    /// The module, and -- in adversarial mode -- the trap line the program must
+    /// produce. Both come from one render, so the bytes cannot drift apart.
+    fn render_with_expectation(&self) -> (String, Option<String>) {
         let g = &self.g;
         let mut out = String::new();
         let _ = writeln!(out, "MODULE Fuzz;");
@@ -552,12 +606,27 @@ impl Program {
             }
         }
 
+        if self.adversarial {
+            // The machinery the violations need. It is declared but never used
+            // by the generated part of the program, so it cannot affect a value
+            // the mirror predicts.
+            // Names the generator never produces: it names its procedures
+            // `F0`, `F1` and `R`, and its variables `m<i>`/`c<i>`/`fail`.
+            let _ = writeln!(out, "  TYPE");
+            let _ = writeln!(out, "    ARec = RECORD x: INTEGER END;");
+            let _ = writeln!(out, "    AExt = RECORD (ARec) y: INTEGER END;");
+            let _ = writeln!(out, "    APtr = POINTER TO ARec; AExtPtr = POINTER TO AExt;");
+        }
+
         let _ = writeln!(out, "  VAR");
         for name in &g.mvars {
             let _ = writeln!(out, "    {name}: INTEGER;");
         }
         // The trap trigger: out of range for its own length, on purpose.
         let _ = writeln!(out, "    fail: ARRAY 1 OF INTEGER;");
+        if self.adversarial {
+            let _ = writeln!(out, "    arr: ARRAY 4 OF INTEGER; pa: APtr;");
+        }
 
         for f in &g.funcs {
             render_func(g, f, &mut out);
@@ -600,8 +669,23 @@ impl Program {
                 expected[k]
             );
         }
+        // The deliberate violation, after the checks: a wrong *value* still
+        // fails first and with a different line, so the harness compares the
+        // trap it expects rather than merely requiring one.
+        let mut expectation = None;
+        if self.adversarial {
+            let (block, rel, msg) = Self::violation(self.seed, &g.mvars[0]);
+            let at = out.len() + rel;
+            expectation = Some(if msg == "type guard failed" {
+                // This message carries its own byte rather than a suffix.
+                format!("type guard failed at byte {at}")
+            } else {
+                format!("oberon: trap: {msg} (at byte {at} of the source)")
+            });
+            out.push_str(&block);
+        }
         let _ = writeln!(out, "END Fuzz.");
-        out
+        (out, expectation)
     }
 }
 
@@ -817,6 +901,8 @@ fn generate(seed: u64) -> Program {
     let body = init;
     Program {
         g,
+        seed,
+        adversarial: false,
         body,
         per_statement: None,
     }
@@ -1044,6 +1130,8 @@ fn main() {
     let mut explain: Option<String> = None;
     let mut per_statement: Option<String> = None;
     let mut seed_list: Option<PathBuf> = None;
+    let mut cflags: Vec<String> = Vec::new();
+    let mut adversarial = false;
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
@@ -1076,6 +1164,11 @@ fn main() {
                 explain = Some(args[i].clone());
             }
             "--keep" => keep = true,
+            "--adversarial" => adversarial = true,
+            "--cflag" => {
+                i += 1;
+                cflags.push(args[i].clone());
+            }
             "--seed-list" => {
                 i += 1;
                 seed_list = Some(PathBuf::from(&args[i]));
@@ -1103,6 +1196,7 @@ fn main() {
     }
     if let Some(var) = &per_statement {
         let mut program = generate(base);
+        program.adversarial = adversarial;
         program.per_statement = Some(
             program
                 .g
@@ -1115,7 +1209,9 @@ fn main() {
         return;
     }
     if print_only {
-        print!("{}", generate(base).render());
+        let mut program = generate(base);
+        program.adversarial = adversarial;
+        print!("{}", program.render());
         return;
     }
     if let Some(path) = &seed_list {
@@ -1131,16 +1227,23 @@ fn main() {
             .filter(|l| !l.is_empty())
             .map(|l| l.parse().unwrap_or_else(|_| panic!("seed-list: not a seed: {l}")))
             .collect();
-        std::process::exit(run_list(&picks, &obc, &work, keep));
+        std::process::exit(run_list(&picks, &obc, &work, keep, &cflags, adversarial));
     }
-    std::process::exit(run(base, seeds, &obc, &work, keep));
+    std::process::exit(run(base, seeds, &obc, &work, keep, &cflags, adversarial));
 }
 
-fn run_list(picks: &[u64], obc: &Path, work: &Path, keep: bool) -> i32 {
+fn run_list(
+    picks: &[u64],
+    obc: &Path,
+    work: &Path,
+    keep: bool,
+    cflags: &[String],
+    adversarial: bool,
+) -> i32 {
     std::fs::create_dir_all(work).expect("cannot create the work directory");
     let mut failed = 0;
     for &seed in picks {
-        match one(seed, obc, work, keep) {
+        match one(seed, obc, work, keep, cflags, adversarial) {
             Ok(()) => println!("PASS seed-{seed}"),
             Err(why) => {
                 println!("FAIL seed-{seed}: {why}");
@@ -1160,11 +1263,19 @@ fn run_list(picks: &[u64], obc: &Path, work: &Path, keep: bool) -> i32 {
     }
 }
 
-fn run(base: u64, seeds: u64, obc: &Path, work: &Path, keep: bool) -> i32 {
+fn run(
+    base: u64,
+    seeds: u64,
+    obc: &Path,
+    work: &Path,
+    keep: bool,
+    cflags: &[String],
+    adversarial: bool,
+) -> i32 {
     std::fs::create_dir_all(work).expect("cannot create the work directory");
     let mut failed = 0;
     for seed in base..base + seeds {
-        match one(seed, obc, work, keep) {
+        match one(seed, obc, work, keep, cflags, adversarial) {
             Ok(()) => println!("PASS seed-{seed}"),
             Err(why) => {
                 println!("FAIL seed-{seed}: {why}");
@@ -1183,9 +1294,17 @@ fn run(base: u64, seeds: u64, obc: &Path, work: &Path, keep: bool) -> i32 {
     }
 }
 
-fn one(seed: u64, obc: &Path, work: &Path, keep: bool) -> Result<(), String> {
-    let program = generate(seed);
-    let src = program.render();
+fn one(
+    seed: u64,
+    obc: &Path,
+    work: &Path,
+    keep: bool,
+    cflags: &[String],
+    adversarial: bool,
+) -> Result<(), String> {
+    let mut program = generate(seed);
+    program.adversarial = adversarial;
+    let (src, expectation) = program.render_with_expectation();
     let dir = work.join(format!("seed-{seed}"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("Fuzz.mod");
@@ -1198,13 +1317,14 @@ fn one(seed: u64, obc: &Path, work: &Path, keep: bool) -> Result<(), String> {
         }
     };
 
-    let out = Command::new(obc)
-        .arg("build")
-        .arg(&path)
-        .arg("--out")
-        .arg(&dir)
-        .arg("-o")
-        .arg(dir.join("Fuzz"))
+    let mut cmd = Command::new(obc);
+    cmd.arg("build").arg(&path).arg("--out").arg(&dir).arg("-o").arg(dir.join("Fuzz"));
+    // Extra C flags, so the corpus can be run under the sanitizers the way the
+    // golden suite runs its own programs twice (PLAN.md W7.5).
+    for f in cflags {
+        cmd.arg("--cflag").arg(f);
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("cannot run {}: {e}", obc.display()))?;
     if !out.status.success() {
@@ -1222,6 +1342,24 @@ fn one(seed: u64, obc: &Path, work: &Path, keep: bool) -> Result<(), String> {
         .arg(&exe)
         .output()
         .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+    if let Some(expected) = expectation {
+        // Adversarial: the program must abort with exactly this line, and a
+        // sanitizer report is a failure rather than a trap.
+        let err = String::from_utf8_lossy(&run.stderr).to_string();
+        if run.status.success() {
+            return Err(format!(
+                "an adversarial program ran to completion; expected `{expected}`"
+            ));
+        }
+        if err.contains("AddressSanitizer") || err.contains("runtime error:") {
+            return Err(format!("a sanitizer reported on an adversarial program\n{err}"));
+        }
+        if !err.contains(&expected) {
+            return Err(format!("expected `{expected}`, got: {}", err.trim()));
+        }
+        drop_dir();
+        return Ok(());
+    }
     if run.status.success() {
         drop_dir();
         return Ok(());

@@ -242,6 +242,39 @@ BEGIN
   s := p(S)
 END T4.
 ' 'oberon: trap: type guard failed at byte 124'
+# The *record* spelling of a failing guard, as an assignment target: the write
+# must compile under the documented line and trap with the guard's offset. It used
+# to be rejected, because gcc folds an inlined `malloc(sizeof(R))` and could then
+# prove the write lay outside the allocation (DESIGN R15, PLAN.md W2.2).
+guard_record=$(cat <<'GuardREOF'
+MODULE GuardR;
+  TYPE R = RECORD f: INTEGER END; S = RECORD (R) g: INTEGER END;
+       P = POINTER TO R; PS = POINTER TO S;
+  VAR p: P;
+BEGIN
+  NEW(p);          (* p points at an R *)
+  p(S).g := 1      (* the guard fails, and the write must not be rejected *)
+END GuardR.
+GuardREOF
+)
+trap_case guard-record-spelling-as-target "$guard_record" 'oberon: trap: type guard failed at byte 186'
+# ... and the same program under clang, which the same design row promises.
+if command -v clang >/dev/null 2>&1; then
+    printf '%s' "$guard_record" > "$DRV/GuardR.mod"
+    if "$OBC" build "$DRV/GuardR.mod" --cc clang --out "$DRV" -o "$DRV/guardr" 2>"$DRV/guardr.log"; then
+        status=0
+        sh -c '"$0" >/dev/null 2>"$1"' "$DRV/guardr" "$DRV/guardr.err" || status=$?
+        check "guard-record-spelling-clang-traps" "1" \
+            "$(grep -c 'type guard failed at byte' "$DRV/guardr.err")"
+        check "guard-record-spelling-clang-aborts" "134" "$status"
+    else
+        echo "FAIL guard-record-spelling-clang: clang rejected the emitted C"
+        sed -n '1,6p' "$DRV/guardr.log"
+        fail=$((fail + 1))
+    fi
+else
+    echo "SKIP guard-record-spelling-clang: no clang on this machine"
+fi
 trap_case case-no-match 'MODULE T6;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P;

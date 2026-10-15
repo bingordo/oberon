@@ -434,6 +434,32 @@ A *fatal* error — a missing `END`, an unterminated comment, an illegal charact
 diagnostic rather than printed as a `ParseError` **[verified]**, so a reader
 never sees a byte offset.
 
+### D8 — the `CASE` default arm is spelled `| : S`, not `| S` **[decided; deviation recorded]**
+
+The report's `case = [CaseLabelList ":" StatementSequence]` puts the label list and
+its colon in one optional group, so a *default* arm is written as a bare statement
+sequence: `| S`. Our grammar parses `CaseArm = labels? body?` with
+`body = ":" StatementSequence` — both optional, independently — so the default arm
+is spelled `| : S` (an empty label list followed by the colon), and the arm `|` on
+its own is the default with no statements. The report's bare `| S` is therefore
+*rejected*, with a diagnostic that names what was expected:
+`error: unexpected `:=` … = note: expected END, ., .., ,, : or |`, pointing at the
+missing colon.
+
+This is not an oversight and not fixable in the grammar: the two forms share a
+first set (a statement sequence may start with the same qualident a type or
+constant label may), so telling `| k := 2` from `| k: …` needs two tokens of
+lookahead, which LALR(1) does not have and the reference compiler's recursive
+descent does. The options were a hand-written case-arm parser, a two-token
+lookahead trick in the lexer, or this: keep the grammar and record the deviation.
+The deviation costs source portability for one spelling — a program written for
+another compiler that uses the default arm must insert the colon — while the
+*semantics* (a default arm, and an empty one) are fully expressible, and the
+existing diagnostic already says which token is missing. Rejecting `| : S` instead
+would leave no way to write a default arm at all, which is worse; accepting both
+would need the lookahead. Revisit only if a corpus of real Oberon-07 sources
+becomes the target, in which case the case-arm parser is the honest fix.
+
 ---
 
 ## 6. AST
@@ -956,8 +982,8 @@ the only deliberate escape. This table is that promise, audited access by access
 | array index, fixed array | `rt_index(i, n, at)` — traps with the offset | `e2e/Trap.mod` (a constant index out of range), `diag_tests::a_constant_index_out_of_range_warns_and_still_traps` (the warning *and* five emitted checks) |
 | array index, open-array parameter | `rt_index(i, name__len, at)` against the hidden length the caller passed | `e2e`'s `trap-index-in-open-array` (added in W7.4; before it, this row was *false*: an open-array index was emitted with no check at all, and the parameter was dereferenced as if it were a pointer to the array) |
 | record field | the layout is computed by the emitter, so every field offset is in bounds by construction | `csmoke` (descriptors and layouts), `golden` (the emitted shapes) |
-| pointer dereference (`p.f`, `p^`) | `rt_nil(p, at)` — traps with the offset | `e2e`'s `nil-field-dereference-traps` and `nil-caret-dereference-traps`, `emit_tests::a_pointer_access_is_checked_for_nil`. **Exception**: when the operand has a side effect (an index expression containing a call) the check is *not* emitted, because `rt_nil` reads it twice (R26) |
-| failed type guard `v(T)` | `rt_guard_is` — traps | `e2e`'s `failed-guard-traps` (pointer spelling); the record spelling is R15 |
+| pointer dereference (`p.f`, `p^`) | `rt_nil(p, at)` — traps with the offset | `e2e`'s `nil-field-dereference-traps` and `nil-caret-dereference-traps`, `fuzz`'s adversarial mode (a dereference of a zeroed pointer variable), `emit_tests::a_pointer_access_is_checked_for_nil`. **Exception**: when the operand has a side effect (an index expression containing a call) the check is *not* emitted, because `rt_nil` reads it twice (R26) |
+| failed type guard `v(T)` | `rt_guard_is` — traps | `e2e`'s `failed-guard-traps` (pointer spelling) and `fuzz`'s adversarial mode (a guard asking for the extension while the object is the base); the record spelling is R15 |
 | type-`CASE` with no matching label | `rt_trap_pos("CASE: no matching type", subject)` — traps with the offset | `csmoke` (the descriptor-id switch), `e2e`'s `trap-case-no-match` (which asserts the exact line) |
 | whole-array and whole-record copy | `rt_rec_copy` / `rt_strcopy` / `memcpy` with the length the types give | `golden` (R14's exact-length string case), `csmoke` |
 | string literal initialisation | a bounded copy into the target array | `golden` (R14) |
@@ -1260,6 +1286,8 @@ Mix.mod:4:8: error: unexpected `;`
 | interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `src/sym.rs` **[exists: 3 tests]** |
 | random programs | the generator's fragment: `INTEGER` arithmetic, the four shift builtins, `IF`/`WHILE`/`REPEAT`/`FOR`/`CASE`, procedures and recursion, each program carrying its own expected values | `bash fuzz/run.sh` **[exists: `src/bin/obgen.rs`; in the gate — `fuzz/regressions.txt` names every seed that once found a defect, then a coverage block runs]** |
 | the seed corpus as a regression suite | each seed that once found a defect, kept in a fixed list with the reason it is there, then a block for coverage; a seed reproduces a program exactly on any machine | `fuzz/regressions.txt` + `bash fuzz/run.sh` **[exists: 9 listed seeds + 100 coverage seeds]** |
+| the *emitted* code under sanitizers | every generated program built with `-fsanitize=address,undefined -fno-sanitize-recover=all`, leak detection on, so a clean run is evidence about the code rather than about the program's arithmetic | `SAN=1 bash fuzz/run.sh` **[exists: 300 seeds clean, plus the regression list in every default run]** |
+| the trap paths, deliberately | each generated program ends with one violation that *must* trap (index past the end, NIL dereference, a guard that cannot hold, a computed zero divisor, a false assertion), and the run must produce the exact trap line — message *and* source byte — which the generator computes from the same render | `bash fuzz/run.sh` (`--adversarial`) **[exists: 200 seeds + the regression list]** |
 | whole language | the report's example modules (`Out`'s `Write`/`WriteInt`/`WriteLn`, `log2`, `ReadInt`) compiled and executed against a `Texts`/`Oberon` stub | `e2e` + `golden` **[exists]** |
 
 The two existing suites are kept as-is rather than rewritten: this crate keeps the
@@ -1304,7 +1332,7 @@ section or risk each item comes from.
 | R12 | Registering a *parameterized* exported procedure in the command table would invoke it through a `void (*)(void)` pointer — undefined behaviour. | **Found** by the `golden` link model and fixed in §9.8: only parameterless procedures are registered, which is what report §11 defines a command to be. |
 | R13 | With `BY = 0` the emitted `FOR` header and the report's while-desugaring disagree (infinite loop vs. zero iterations). | Unreachable: check 34 rejects `BY = 0`. The equivalence in §9.6 is therefore stated for `k != 0` only, which is every program the checker accepts; `golden` compares the two forms on all five range shapes. |
 | R14 | `rt_strcopy` leaves no NUL when the source exactly fills the destination, and a later `strcmp`-style comparison would read past the array. Reachable via a same-length `ARRAY n OF CHAR` array assignment, which §8.2 permits. | **Found** by `golden` and fixed in two places: §9.6 distinguishes the padded string-literal copy from the bounded array-to-array copy, and §9.5 compares `CHAR` arrays with `rt_charcmp`, which is bounded by the shorter operand and stops at a NUL in either — it never assumes termination. |
-| R15 | A **failing** guard written with the *record* spelling reads past the object by construction (`p(S).b` where `p` points at an `R`), and the C compiler can see that statically: `-Warray-bounds`/`-Wmaybe-uninitialized` then reject the program under `-Werror`, even though the guard's test traps first. | Accepted and documented rather than silenced: the pointer spelling (`p(Q)`) has no such read and is what the e2e suite uses for the trap case. A program that *tests* for a type it does not hold is expected to use the pointer spelling, which is also the one §9.5's own example uses. |
+| R15 | A **failing** guard written with the *record* spelling reads past the object by construction (`p(S).b` where `p` points at an `R`), and the C compiler could see that statically: `-Warray-bounds`/`-Wmaybe-uninitialized` then rejected the program under `-Werror`, even though the guard's test traps first. | **Fixed** (PLAN.md W2.2), and the cause was not the guard at all: `rt_new` was `static inline` in the runtime header, so gcc folded `malloc(sizeof(R))` into the caller and could prove from *that* that the guarded write lay outside the allocation. `rt_new` is defined in `oberon_runtime.c` now, which no translation unit can see through without LTO; the guard's own check still traps first, with its offset. Both spellings are now tested: `e2e`'s `trap-guard-record-spelling-as-target` (gcc) and `guard-record-spelling-clang-traps` (clang, the same program), beside the pointer spelling's `failed-guard-traps`. Accepted residual: a *failing* guard that reads a derived field under `-fsanitize=address` is still a report rather than a trap, since ASan sees the access at the same point the guard checks it. |
 | R16 | A structured **value** argument inside a short-circuit operand is copied into its caller-side temporary eagerly, because a temporary is a statement. Guards are no longer affected (§9.5 lowers them as expressions), so this is now limited to a record argument whose *index* expressions contain calls, inside `OR`/`&`. | Documented deviation: the copy happens one step earlier than the operator would evaluate it. Oberon's only side-effecting expressions are calls, and this needs one inside a record actual's index inside a short-circuit operand. |
 | R17 | `resolve.rs` classified guards and module qualification with *module-wide* name sets, so an inner declaration did not shadow them: a procedure-local `Texts` was still the import alias and a procedure-local `T` was still the type. | **Fixed.** The pass carries a scope chain now (`resolve.rs`: one scope per procedure, with its parameters and declarations; every declaration is recorded, not just types and import aliases, because a variable of some name shadows a type of that name). Evidence: before the fix, `Texts.f` with a local `Texts` was rejected as "`Texts` is not a module" and `Q(T)` with a local `T` as "`T` is not a type"; both check clean now, pinned by `check_tests::an_inner_declaration_shadows_a_type_name_and_an_import_alias`. |
 | R18 | `--cflags "…"` is split on whitespace, so a single flag whose own argument contains a space cannot be written that way. | Mitigated by `--cflag ARG`, which appends one argument verbatim and is repeatable; both are in the driver's usage. A path with spaces is passed correctly as a *file* argument, because the driver never goes through a shell. |

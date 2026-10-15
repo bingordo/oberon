@@ -11,6 +11,25 @@
 
 #include "oberon.h"
 
+/* `NEW`: one allocation point for the whole language, so a failing allocation
+ * has one answer -- the pointer becomes `NIL` (report 6.4) -- and the collector
+ * of W10 has one place to hook. */
+void *rt_new(size_t size, const ObDesc *d) {
+    void *p;
+    static int32_t allocations = 0;
+    const char *fail_at = getenv("OB_ALLOC_FAIL_AT");
+    allocations += 1;
+    if (fail_at != NULL && atoi(fail_at) == allocations) return NULL;
+    /* A record may be larger than any 32-bit extent and `NEW` passes
+     * `sizeof(T)`: the size survives the call, so it is `size_t` here rather
+     * than narrowed to the word the descriptor records. */
+    if (size < sizeof(const ObDesc *)) size = sizeof(const ObDesc *);
+    p = malloc(size);
+    if (p == NULL) return NULL;
+    *(const ObDesc **)p = d;
+    return p;
+}
+
 /* One report line per trap, then abort: a failed guard, a bounds violation, a
  * NIL dereference or a CASE with no match (DESIGN 9.4). */
 void ob_trap_report_at(const char *msg, int32_t at) {
