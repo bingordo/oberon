@@ -9,10 +9,10 @@ Three artefacts in this repository back the claims below and are meant to be kep
 
 | Artefact | What it is | Status |
 |---|---|---|
-| `oberon/` | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 37 tests pass, clippy clean |
+| `oberon/` | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 47 tests pass, clippy clean |
 | `oberon/csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
 | `oberon/golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
-| `oberon/e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 13 checks pass; it found the emitter and checker bugs listed in §14 |
+| `oberon/e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 24 checks pass; it found the emitter and checker bugs listed in §14 |
 
 Everything marked **[design]** below is not yet implemented; everything marked
 **[verified]** was executed in this repository (commands in §14).
@@ -1137,7 +1137,7 @@ Mix.mod:4:8: error: unexpected `;`
 | diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `oberon/src/lib.rs::diag_tests` **[exists: 10 tests]** |
 | error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `oberon/e2e` checks 10–13 **[exists]** |
 | resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `oberon/src/lib.rs` **[exists: 3 tests]** |
-| resolver + checker | one case per row of §8.5 (55 cases), plus the report's `Out` module and the kitchen sink checking clean | `oberon/src/lib.rs::check_tests` **[exists: 4 tests, 55 catalogue cases]** |
+| resolver + checker | one case per row of §8.5 (55 cases), plus the report's `Out` module and the kitchen sink checking clean | `oberon/src/lib.rs::check_tests` **[exists: 5 tests, 55 catalogue cases]** |
 | diagnostic rendering | byte span → `line:col`, message text | `check_tests::diagnostics_carry_usable_spans` **[exists]** |
 | constant folder | `DIV`/`MOD`/shifts/sets fold identically to the runtime helpers | `oberon/golden/constexpr.tsv` cross-check **[exists: 52 expressions]** |
 | C emission | emitted C compiles with `-Wall -Wextra -Werror` and the program's stdout matches the expected output | `oberon/e2e` **[exists]** |
