@@ -34,7 +34,11 @@ BACKEND=${BACKEND:-c}
 
 OBG=${OBG:-../target/debug/obgen}
 OBC=${OBC:-../target/debug/obc}
-WORK=${WORK:-findings}
+# One directory per run: a failing seed's module is kept there for triage, so two
+# runs sharing one path clobber each other's artifacts and can turn a good run into
+# a spurious failure (found by running the corpus on two back ends at once). The
+# path is printed with every failure, and the parent directory is gitignored.
+WORK=${WORK:-findings/run-$$}
 LIST=${LIST:-regressions.txt}
 COVER=${COVER:-30}
 ADVCOVER=${ADVCOVER:-10}
