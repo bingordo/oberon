@@ -1260,6 +1260,43 @@ with the stress mode on (its self-checks are the "no live object was freed" orac
 and the standard suite is green with it off, so the collector costs nothing when it
 is idle.
 
+**W10.3 collector pauses** — **open, a feature in its own right**
+
+The collector §15 decides on is stop-the-world, so a pause is proportional to the
+live set *plus* the whole heap: marking walks the reachable graph and conservatively
+scans the stack, and sweeping walks the allocation list whether an object is live or
+not. Two things make the worst case the common one rather than a corner: the trigger
+is a *failing* allocation, which is exactly when the heap is fullest, and a deep
+recursion lengthens the stack scan in proportion to its depth. For the scale this
+compiler is aimed at that is a fine trade — the design says so — but it is a
+property a user will meet, so it deserves its own item rather than a footnote.
+
+What to reach for, in order of cost, each with the source that describes it:
+
+1. **Trigger on a threshold**, not only on failure: the same total work spread over
+   time, and it removes the grow-to-the-limit-then-pause shape. It needs the heap's
+   high-water mark per program, which is the same instrument as (4).
+2. **Incremental marking** — the *Compiler Design Handbook*'s chapter 6, §6.5
+   ("Incremental and Concurrent Non-Moving Collectors"). Non-moving is what makes
+   this reachable at all: without compaction a mutator can keep running while the
+   mark advances, with only a barrier at the points where it hands a pointer over.
+3. **Concurrent marking**, then **generational** (§6.4) if allocation rates say so:
+   generational cuts pause times most and costs write barriers plus the
+   intergenerational-pointer bookkeeping, which is a real change to the *emitter*,
+   not just the runtime — every store to a pointer field would need it.
+4. **Shorter conservative scans** before any of that: an instrument that reports the
+   pause distribution (`OB_GC_STATS=1`, the shape `OB_ALLOC_FAIL_AT` and
+   `OB_GC_STRESS` already have), so the choice is made from measurements rather than
+   from the argument above. The Cranelift back end's stack maps (W9) are the real
+   fix for the stack half: they make the scan precise, and they bound it by the
+   *live* frames rather than by depth.
+
+Done when: a named benchmark's pause distribution is measured and recorded (worst
+and median, with the heap it ran in), a stated bound is met or explicitly declined
+with the reason, and the correctness oracle is unchanged — `fuzz` with
+`OB_GC_STRESS=1` and the standard suite both still green. "We measured, and this is
+the bound we accept" is a legitimate outcome; "it seems fine" is not.
+
 ## Ideas not yet in the design (adopt or drop)
 
 - Fuzz the *lexer* with random bytes and random token streams: assert no panic

@@ -245,14 +245,33 @@ pub struct Lexer<'input> {
     input: &'input str,
     b: &'input [u8],
     pos: usize,
+    /// Accept reserved words spelled in lower case (PLAN.md W8.10). Off by
+    /// default, because the report makes capital and lower-case letters distinct
+    /// (report §3), so a *report* program that uses `Begin` as an identifier would
+    /// tokenise differently — which is what makes this the one extension that
+    /// needs a switch rather than being additive.
+    fold_keywords: bool,
 }
 
 impl<'input> Lexer<'input> {
+    /// The report's lexer: reserved words are recognised in the spelling the
+    /// report fixes, and nothing else.
     pub fn new(input: &'input str) -> Self {
         Lexer {
             input,
             b: input.as_bytes(),
             pos: 0,
+            fold_keywords: false,
+        }
+    }
+
+    /// The same, folding reserved-word case (PLAN.md W8.10, `-Olower`).
+    pub fn with_folded_keywords(input: &'input str) -> Self {
+        Lexer {
+            input,
+            b: input.as_bytes(),
+            pos: 0,
+            fold_keywords: true,
         }
     }
 
@@ -408,7 +427,12 @@ impl<'input> Iterator for Lexer<'input> {
             let text = &self.input[start..p];
             self.pos = p;
             for (kw, tok) in KEYWORDS {
-                if *kw == text {
+                let hit = if self.fold_keywords {
+                    kw.eq_ignore_ascii_case(text)
+                } else {
+                    *kw == text
+                };
+                if hit {
                     return Some(Ok((start, tok.clone(), self.pos)));
                 }
             }
