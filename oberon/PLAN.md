@@ -12,7 +12,7 @@ cargo test                  # 50 unit tests
 bash golden/run.sh          # the golden cases, run twice: plain and under ASan/UBSan
 bash csmoke/run.sh          # 67 C-level cases
 bash e2e/run.sh             # 26 checks, end to end through the driver
-cargo clippy --all-targets -- -D warnings    # not green yet: W0.1
+cargo clippy --all-targets -- -D warnings    # green (W0.1)
 ```
 
 `bash fuzz/run.sh` (SEEDS/BASE select the run) is deliberately *not* in that
@@ -43,7 +43,7 @@ generator itself (W6.1).
 
 ## W0 — make the document's own claims true
 
-**W0.1 clippy is not clean**
+**W0.1 clippy is not clean** — **done**
 Why: the preamble says "clippy clean"; `cargo clippy --all-targets` reports 244
 warnings, *all* in LALRPOP's generated parser
 (`target/…/out/oberon.rs`, `clippy::ptr_arg` — `&mut Vec` is what LALRPOP's
@@ -51,13 +51,20 @@ warnings, *all* in LALRPOP's generated parser
 Files: `src/lib.rs` (the `lalrpop_mod!` site).
 Done when: an `#[allow(clippy::ptr_arg)]` — scoped to the generated module, not
 the crate — makes `cargo clippy --all-targets -- -D warnings` exit 0, and the
-clippy line is part of the gate above.
+clippy line is part of the gate above. **Done**: `lalrpop_mod!` carries the
+attribute (LALRPOP's recovery hook is `&mut Vec<..>` by its own API, which is why
+`ptr_arg` fires 244 times inside the generated file and nowhere in ours), and the
+gate block below no longer carries a caveat.
 
-**W0.2 two sections are still marked `[design]` although they are executed daily**
+**W0.2 two sections are still marked `[design]` although they are executed daily** — **done**
 Why: §9.2 (type mapping) and §9.3 (records, extension, descriptors) are marked
 `[design]`, but `src/cgen.rs` implements them and `e2e`/`csmoke` run them.
 Done when: those markers say what is actually unverified (if anything), so that
-`grep '\[design' DESIGN.md` returns only the legend.
+`grep '\[design' DESIGN.md` returns only the legend. **Done**: §9.2 and §9.3 are
+now `[verified]` with the suites that execute them named — the document's own
+legend defines `[design]` as "not yet implemented", and every row of the mapping
+table and every rule of the descriptor scheme is exercised by `csmoke`, `e2e` or
+`golden`. `grep '\[design' DESIGN.md` now returns the legend and nothing else.
 
 ---
 
@@ -95,7 +102,7 @@ Files: `src/sema.rs` (the `unused_imports` pass is the natural home).
 Done when: a module with an uncalled local procedure warns once, the warning is
 located, and it is visible through `obc check` (the path fixed this session).
 
-**W1.4 settle §13's open questions and delete them**
+**W1.4 settle §13's open questions and delete them** — **done**
 Why: three questions have been open since the design was written, and one is
 already answered by the implementation:
 - `ARRAY 0 OF T` — **already an error**: `an array length must be positive
@@ -106,6 +113,14 @@ already answered by the implementation:
   implementation warns by default. Decide (recommendation: keep warning by
   default, since the suite's clean modules do not import anything unused) and
   make design and code agree.
+
+**Done**: all three are now decisions in DESIGN §13 and the stale "Open
+questions" block is gone (it was addressed "when M1 starts", and M1 is finished).
+`ARRAY 0 OF T` was already an error and is pinned by catalogue row 41; the
+field-hiding rule is now *implemented* rather than only allowed — the checker
+warns per field name, with the diagnostic naming why (`diag_tests::
+a_field_that_hides_an_inherited_field_warns`); unused imports keep warning by
+default, which §13 records.
 
 ---
 

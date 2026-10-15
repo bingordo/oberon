@@ -14,7 +14,10 @@ pub mod sema;
 pub mod sym;
 pub mod types;
 
-lalrpop_util::lalrpop_mod!(pub oberon);
+// LALRPOP's generated parser takes `&mut Vec<ErrorRecovery<..>>` for the
+// recovery hook, which is its API, not a choice of ours: `clippy::ptr_arg`
+// fires 244 times inside the generated file and nowhere in ours (PLAN.md W0.1).
+lalrpop_util::lalrpop_mod!(#[allow(clippy::ptr_arg)] pub oberon);
 
 use ast::Module;
 use lexer::{Lexer, LexicalError, Token};
@@ -897,6 +900,29 @@ mod diag_tests {
         assert_eq!(messages(&diags).len(), 1, "{text}");
         assert!(text.contains("M.mod:3:9: error: unexpected `b`"), "{text}");
         assert!(text.contains("= note: expected ;"), "{text}");
+    }
+
+    #[test]
+    fn a_field_that_hides_an_inherited_field_warns() {
+        // Report §6.3 permits it, so it stays legal — but `x.f` then means the
+        // derived field, which is worth saying (DESIGN §13).
+        let src = "MODULE M;\n  TYPE B = RECORD f: INTEGER END;\n       D = RECORD (B) f: CHAR END;\nBEGIN\nEND M.\n";
+        let (text, diags) = report(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{text}");
+        assert_eq!(
+            diags.iter().filter(|d| !d.is_error()).count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("M.mod:3:"), "{text}");
+        assert!(
+            text.contains("warning: field `f` hides a field of the base record"),
+            "{text}"
+        );
+        // and a field that does not hide anything stays silent
+        let src = "MODULE M;\n  TYPE B = RECORD f: INTEGER END;\n       D = RECORD (B) g: CHAR END;\nBEGIN\nEND M.\n";
+        let (text, diags) = report(src);
+        assert!(diags.is_empty(), "{text}");
     }
 
     #[test]

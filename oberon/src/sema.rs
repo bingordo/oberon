@@ -805,6 +805,41 @@ impl<'a> Sema<'a> {
                 let ph = ts.placeholders[name];
                 let (b, fs) = self.record_body(base, fields, *span, &mut ts);
                 self.types.define_record(ph, b, fs);
+                // New decision (DESIGN §13): report §6.3 permits a field to hide
+                // an inherited field of the same name, and it stays legal — but
+                // `x.f` then means the derived field silently, so say so.
+                if let Some(bt) = b {
+                    let mut inherited: Vec<String> = Vec::new();
+                    let mut walk = Some(bt);
+                    let mut guard = 0;
+                    while let Some(t) = walk {
+                        guard += 1;
+                        if guard > 64 {
+                            break;
+                        }
+                        match self.types.get(t) {
+                            Type::Record { base, fields, .. } => {
+                                for (n, _) in fields {
+                                    inherited.push(n.clone());
+                                }
+                                walk = *base;
+                            }
+                            _ => break,
+                        }
+                    }
+                    for f in fields {
+                        for (fname, _) in &f.names {
+                            if inherited.iter().any(|n| n == fname) {
+                                self.warn(
+                                    f.span,
+                                    format!(
+                                        "field `{fname}` hides a field of the base record; `x.{fname}` means this one (report 6.3)"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
                 // A record body is built here rather than through `type_expr`,
                 // so its span has to be recorded explicitly: the emitter
                 // resolves declarations through this table.

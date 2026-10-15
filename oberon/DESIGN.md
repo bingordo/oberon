@@ -860,7 +860,7 @@ be chosen. Wrapping is what every Oberon implementation does and what
 `INC(x)` around the largest `INTEGER` implies, so we pin it **[verified: the whole
 `csmoke` suite is built with `-fwrapv`]**.
 
-### 9.2 Type mapping **[design; the semantics of the non-trivial ones verified]**
+### 9.2 Type mapping **[verified; `csmoke` executes every row, `e2e` compiles and runs programs that use them]**
 
 | Oberon | C |
 |---|---|
@@ -877,7 +877,7 @@ be chosen. Wrapping is what every Oberon implementation does and what
 | `NIL` | `NULL` |
 | `ARRAY OF T` (open formal) | `T *name, int32_t name__len` |
 
-### 9.3 Records, extension, and type descriptors **[design; descriptor scheme verified in C]**
+### 9.3 Records, extension, and type descriptors **[verified; `csmoke` for the layout and `rt_is`/`rt_rec_copy`, `e2e` for `IS`, guards and a type-`CASE` on a three-level extension, `golden` for the emitted shapes]**
 
 Report §6.3/§6.4 make records extensible and pointers type-tested, so the layout
 must support `IS`, guards, and `CASE` on a record/pointer variable:
@@ -1277,19 +1277,19 @@ or self-inconsistent and a compiler has to choose once and then be consistent:
    mechanism (a gated grammar, §5), the scope boundary — the language only, since
    ETH's library and system modules are a separate port — and the trigger that
    would change the answer.
-8. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
+8. **A field may hide an inherited field's name, with a warning.** Report §6.3
+   permits it (a derived record may declare a field whose name the base already
+   has), and rejecting it would reject legal programs; but `x.f` then means the
+   derived field silently, so the checker warns. Implemented in the record
+   declaration path, per field name.
+9. **`ARRAY 0 OF T` is an error** — an implementation restriction, not a report
+   rule: a zero-length array has no legal index, so every access to it would trap
+   (report §6.2 is silent; ETH's compilers reject it). Pinned by catalogue row 41.
+10. **Unused imports are warnings, on by default.** A warning that is off by
+   default is a warning nobody sees; the CLI prints it, it does not change the
+   exit code, and the suites' clean modules import nothing unused.
+11. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
    and assignment per §9.1.2), but is not an integer operand.
-
-Open questions, to be settled with a decision record when M1 starts:
-
-1. Should the checker allow a field name that hides a base record's field
-   (the report's scoping rule permits it, `p.f` would silently mean the derived
-   field)? Proposal: allow with a warning, because rejecting it would reject
-   legal report §6.3 programs.
-2. Should `ARRAY 0 OF T` be legal? Proposal: error (matches ETH compilers),
-   documented as an implementation restriction.
-3. Should unused imports be warnings or errors? Proposal: warning, and off by
-   default.
 
 ---
 
