@@ -12,10 +12,16 @@ MODULE Regress;
     Rec = RECORD f: Fn END;
 
   VAR i, k: INTEGER; ch: CHAR; mant: REAL; e: INTEGER;
+      ord: INTEGER; neverRead: INTEGER;
       b: Base; d: Derived; n: NodePtr; rc: Rec; v: ARRAY 3 OF INTEGER;
 
   PROCEDURE twice(x: INTEGER): INTEGER;
   BEGIN RETURN x * 2 END twice;
+
+  (* Writes a module variable its own argument reads, so the order the operands
+     of an expression are evaluated in is observable (DESIGN R23). *)
+  PROCEDURE bump(n: INTEGER): INTEGER;
+  BEGIN ord := ord + n; RETURN ord END bump;
 
   PROCEDURE inner(a: ARRAY OF INTEGER): INTEGER;
     VAR i, t: INTEGER;
@@ -93,7 +99,23 @@ MODULE Regress;
     Out.WriteInt(n.key, W); Out.WriteInt(ORD(n IS NodePtr), W); Out.WriteLn;
     (* CHAR constants and a set built at run time *)
     ch := "A";
-    Out.WriteInt(ORD(ch), W); Out.WriteInt(ORD(ch <= "B"), W); Out.WriteLn
+    Out.WriteInt(ORD(ch), W); Out.WriteInt(ORD(ch <= "B"), W); Out.WriteLn;
+    (* operands are evaluated left to right, whatever order C would pick: the
+       read of `ord` precedes the call that writes it (R23) *)
+    ord := 1; Out.WriteInt(ord + bump(10), W);
+    ord := 1; Out.WriteInt(bump(10) + ord, W);
+    ord := 1; Out.WriteInt(bump(1) * bump(2), W);
+    ord := 1; Out.WriteInt(ORD(ord < bump(5)), W);
+    (* and `&` still skips its right operand when the left one is false *)
+    ord := 0; Out.WriteInt(ORD(FALSE & (bump(5) = 5)), W); Out.WriteInt(ord, W);
+    Out.WriteLn;
+    (* a tree compared with itself folds; gcc rejects the comparison otherwise *)
+    i := 5; Out.WriteInt(ORD(-i > -i), W); Out.WriteInt(ORD((i + 1) < (i + 1)), W);
+    Out.WriteInt(ORD(ABS(i) = ABS(i)), W); Out.WriteLn;
+    (* a constant subexpression that overflows is folded, not handed to C as
+       arithmetic: gcc warns about that and the build line rejects it (R20) *)
+    Out.WriteInt(2147483647 * 2, W);
+    Out.WriteInt(ORD(-(0 - 2147483647 - 1) < 0), W); Out.WriteLn
   END Run;
 BEGIN
 END Regress.

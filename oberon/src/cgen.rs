@@ -102,6 +102,9 @@ pub struct Emitter<'a> {
     /// evaluated once — never out of a loop.
     prelude: String,
     anon: usize,
+    /// Non-zero while rendering the right operand of `&&` or `||`, whose value
+    /// must not be computed unless the operand is reached.
+    in_conditional: usize,
 }
 
 pub fn emit_module(module: &Module, types: &Types, sema: &Sema<'_>) -> (String, String) {
@@ -129,6 +132,7 @@ impl<'a> Emitter<'a> {
             frames: Vec::new(),
             prelude: String::new(),
             anon: 0,
+            in_conditional: 0,
         }
     }
 
@@ -213,6 +217,17 @@ impl<'a> Emitter<'a> {
         self.frames.push(Frame { frame: String::new(), level: 1, path: "init".into() });
         self.push_scope();
         let _ = writeln!(tail, "void {}__init(void) {{", self.module);
+        // Oberon does not require a module to read its own variables, and a
+        // `static` C variable the file never mentions is a `-Werror` failure
+        // (R20). Marking them costs a read of a zeroed static, exactly as the
+        // parameter marks do (PLAN.md W6.2).
+        for v in &module.decls.vars {
+            for (name, export) in &v.names {
+                if !*export {
+                    let _ = writeln!(tail, "    (void){};", self.cname(name));
+                }
+            }
+        }
         for v in &module.decls.vars {
             let ty = self.decl_type(&v.ty);
             for (name, _) in &v.names {
@@ -793,6 +808,51 @@ impl<'a> Emitter<'a> {
         std::mem::take(&mut self.prelude)
     }
 
+    /// Fixes a value in the prelude and hands back the name it was fixed under.
+    ///
+    /// Oberon's reference compilers evaluate operands left to right, while C
+    /// leaves the order of the operands of `+`, `*`, `/` — and of a call's
+    /// arguments — unspecified, so `m0 + R(3)` where `R` writes `m0` may come out
+    /// either way. Fixing both operands in source order makes the emitted C say
+    /// what the language says (DESIGN R23; the generator found it, PLAN.md W6.2).
+    fn materialise(&mut self, t: TypeId, value: &str) -> String {
+        self.anon += 1;
+        let tmp = format!("tmp__{}", self.anon);
+        let decl = self.binding(t, &tmp);
+        if self.in_conditional > 0 {
+            // Inside a `&&`/`||` operand the value must not be computed unless
+            // that operand is reached, so only the declaration is hoisted (it
+            // evaluates nothing) and the assignment stays where the value is —
+            // a comma expression, which C sequences.
+            let _ = writeln!(self.prelude, "    {decl};");
+            format!("(({tmp} = {value}), {tmp})")
+        } else {
+            let _ = writeln!(self.prelude, "    {decl} = {value};");
+            tmp
+        }
+    }
+
+    /// The same, for something that has to be fixed as an address (a string or
+    /// an array operand of a comparison), which sequences the index expressions
+    /// inside it.
+    fn materialise_addr(&mut self, c_ty: &str, value: &str) -> String {
+        self.anon += 1;
+        let tmp = format!("tmp__{}", self.anon);
+        if self.in_conditional > 0 {
+            let _ = writeln!(self.prelude, "    {c_ty} *{tmp};");
+            format!("(({tmp} = {value}), {tmp})")
+        } else {
+            let _ = writeln!(self.prelude, "    {c_ty} *{tmp} = {value};");
+            tmp
+        }
+    }
+
+    /// A value that has no C assignment: an array (a record never reaches the
+    /// operators that sequence operands, and an open array is a pointer).
+    fn is_aggregate(&self, t: TypeId) -> bool {
+        matches!(self.types.get(t), Type::Array { .. })
+    }
+
     fn stmt(&mut self, s: &Stmt, out: &mut String, level: usize) {
         match &s.kind {
             StmtKind::Assign { target, value } => {
@@ -1227,8 +1287,32 @@ impl<'a> Emitter<'a> {
         } else {
             None
         };
+        // `&&` and `||` are sequenced by C already — and sequencing them by
+        // hand would evaluate the right operand eagerly, which is the one thing
+        // short-circuiting exists to prevent.
+        let sequenced = !matches!(op, BinOp::And | BinOp::Or)
+            && (self.has_call(l) || self.has_call(r));
+        let array_of_operands = {
+            let char_cmp = self.types.is_char_like(lt) && self.types.is_char_like(rt);
+            !char_cmp
+                && ((self.types.is_char_array(lt) && !self.types.is_char_like(lt))
+                    || (self.types.is_char_array(rt) && !self.types.is_char_like(rt)))
+        };
         let mut a = self.expr(l, want);
-        let mut b = self.expr(r, want);
+        if sequenced && !array_of_operands && !self.is_aggregate(lt) {
+            a = self.materialise(want.unwrap_or(lt), &a);
+        }
+        let mut b = if matches!(op, BinOp::And | BinOp::Or) {
+            self.in_conditional += 1;
+            let b = self.expr(r, want);
+            self.in_conditional -= 1;
+            b
+        } else {
+            self.expr(r, want)
+        };
+        if sequenced && !array_of_operands && !self.is_aggregate(rt) {
+            b = self.materialise(want.unwrap_or(rt), &b);
+        }
         // Two single characters compare as ordinals: a C `char` may be signed,
         // in which case `255X > 1X` would come out backwards (report §8.2.4).
         // A *string* of more than one character is a character array, and goes
@@ -1247,7 +1331,17 @@ impl<'a> Emitter<'a> {
             // Bounded comparison: an ARRAY n OF CHAR need not be terminated
             // (DESIGN §9.5, risk R14).
             let (na, nb) = (self.char_len(lt), self.char_len(rt));
-            let cmp = format!("rt_charcmp((const char *)&({a}), {na}, (const char *)&({b}), {nb})");
+            if sequenced {
+                a = self.materialise_addr("const char", &format!("(const char *)&({a})"));
+                b = self.materialise_addr("const char", &format!("(const char *)&({b})"));
+            }
+            // With the addresses already fixed, the temporaries *are* the
+            // arguments; without them the addresses are taken in place.
+            let cmp = if sequenced {
+                format!("rt_charcmp({a}, {na}, {b}, {nb})")
+            } else {
+                format!("rt_charcmp((const char *)&({a}), {na}, (const char *)&({b}), {nb})")
+            };
             return match op {
                 BinOp::Eq => format!("({cmp} == 0)"),
                 BinOp::Ne => format!("({cmp} != 0)"),
@@ -1319,17 +1413,28 @@ impl<'a> Emitter<'a> {
     /// designator. `Expr`'s derived `PartialEq` includes source *spans*, so two
     /// occurrences of `x` in `x = x` never compare equal as parsed — which is why
     /// this compares the structure that matters and nothing else.
+    /// Two trees that are the same expression and cannot differ between two
+    /// evaluations, so `x > x` folds to a constant. Excluded: a call (it may
+    /// differ per call and may have side effects) and a selector (a dereference,
+    /// an index and a type guard can *trap*, and folding would drop the trap).
     fn same_plain(&self, l: &Expr, r: &Expr) -> bool {
+        !self.has_call(l) && self.trap_free(l) && self.same_tree(l, r)
+    }
+
+    /// Structural equality that ignores spans: `l.kind == r.kind` would compare
+    /// the spans the parser recorded, which differ between two occurrences of
+    /// the same designator.
+    fn same_tree(&self, l: &Expr, r: &Expr) -> bool {
         match (&l.kind, &r.kind) {
             (ExprKind::Int(a), ExprKind::Int(b)) => a == b,
+            (ExprKind::Real(a), ExprKind::Real(b)) => a.to_bits() == b.to_bits(),
             (ExprKind::Char(a), ExprKind::Char(b)) => a == b,
-            (ExprKind::Bool(a), ExprKind::Bool(b)) => a == b,
             (ExprKind::Str(a), ExprKind::Str(b)) => a == b,
-            (ExprKind::Designator(a), ExprKind::Designator(b)) => {
-                a.base == b.base && a.sels.is_empty() && b.sels.is_empty()
-            }
-            // Comparing two sets folds only when both are call-free, for the
-            // same reason: the folder recognises a builtin by its spelling.
+            (ExprKind::Bool(a), ExprKind::Bool(b)) => a == b,
+            (ExprKind::Nil, ExprKind::Nil) => true,
+            // A constant set is equal when the folder gives the same value; its
+            // elements are expressions with spans, so it cannot be compared
+            // structurally like the rest.
             (ExprKind::Set(_), ExprKind::Set(_)) => {
                 self.foldable(l)
                     && matches!(
@@ -1337,7 +1442,58 @@ impl<'a> Emitter<'a> {
                         (Ok(x), Ok(y)) if x == y
                     )
             }
+            (ExprKind::Designator(a), ExprKind::Designator(b)) => {
+                a.base == b.base && self.same_sels(&a.sels, &b.sels)
+            }
+            (ExprKind::Unary(op, x), ExprKind::Unary(po, y)) => op == po && self.same_tree(x, y),
+            (ExprKind::Binary(op, a, b), ExprKind::Binary(po, c, d)) => {
+                // `a + b >= b + a` is a comparison of a value with itself too,
+                // and gcc proves it and rejects the C for it (R20). Only the
+                // operators that commute are reordered: not `/`, `DIV`, `MOD`
+                // or `-`, and not a set difference.
+                op == po
+                    && ((self.same_tree(a, c) && self.same_tree(b, d))
+                        || (matches!(op, BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or)
+                            && self.same_tree(a, d)
+                            && self.same_tree(b, c)))
+            }
+            (ExprKind::TypeTest(x, t), ExprKind::TypeTest(y, u)) => t == u && self.same_tree(x, y),
             _ => false,
+        }
+    }
+
+    fn same_sels(&self, l: &[Selector], r: &[Selector]) -> bool {
+        l.len() == r.len()
+            && l.iter().zip(r).all(|(a, b)| match (a, b) {
+                (Selector::Field(x), Selector::Field(y)) => x == y,
+                (Selector::Deref, Selector::Deref) => true,
+                (Selector::Guard(x), Selector::Guard(y)) => x == y,
+                (Selector::Index(x), Selector::Index(y)) => self.same_args(x, y),
+                (Selector::Call(x), Selector::Call(y)) => self.same_args(x, y),
+                _ => false,
+            })
+    }
+
+    fn same_args(&self, l: &[Expr], r: &[Expr]) -> bool {
+        l.len() == r.len() && l.iter().zip(r).all(|(a, b)| self.same_tree(a, b))
+    }
+
+    /// Side-effect-free and trap-free: a literal, a selector-free designator, a
+    /// constant set, or those combined by an operator. Structural equality of
+    /// two such trees may be folded because both sides give the same value.
+    fn trap_free(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Int(_)
+            | ExprKind::Real(_)
+            | ExprKind::Char(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Nil => true,
+            ExprKind::Designator(d) => d.sels.is_empty(),
+            ExprKind::Set(_) => self.foldable(e),
+            ExprKind::Unary(_, x) => self.trap_free(x),
+            ExprKind::Binary(_, a, b) => self.trap_free(a) && self.trap_free(b),
+            ExprKind::TypeTest(x, _) => self.trap_free(x),
         }
     }
 
@@ -1817,6 +1973,12 @@ impl<'a> Emitter<'a> {
             };
             actuals.push(link);
         }
+        // C leaves the order of a call's *arguments* unspecified too, and a
+        // callee can write a variable another argument reads (the generator
+        // found it: `F0(ABS(F0(100, acc)), LSL(ASR(m0, 0), 1))`). A value
+        // actual is fixed in a temporary, in source order, when any actual can
+        // have a side effect; an address actual has to stay an address.
+        let seq = args.iter().any(|a| self.has_call(a));
         for (i, a) in args.iter().enumerate() {
             let formal = params
                 .get(i)
@@ -1868,7 +2030,14 @@ impl<'a> Emitter<'a> {
             } else {
                 got.or(Some(formal.ty))
             };
-            actuals.push(self.expr(a, want));
+            let mut text = self.expr(a, want);
+            if seq {
+                match got {
+                    Some(t) if !self.is_aggregate(t) => text = self.materialise(t, &text),
+                    _ => {}
+                }
+            }
+            actuals.push(text);
         }
         (callee, actuals.join(", "))
     }

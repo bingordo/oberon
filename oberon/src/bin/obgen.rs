@@ -1043,6 +1043,7 @@ fn main() {
     let mut print_only = false;
     let mut explain: Option<String> = None;
     let mut per_statement: Option<String> = None;
+    let mut seed_list: Option<PathBuf> = None;
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
@@ -1075,6 +1076,10 @@ fn main() {
                 explain = Some(args[i].clone());
             }
             "--keep" => keep = true,
+            "--seed-list" => {
+                i += 1;
+                seed_list = Some(PathBuf::from(&args[i]));
+            }
             other => {
                 eprintln!("obgen: unknown argument {other}");
                 std::process::exit(2);
@@ -1113,7 +1118,46 @@ fn main() {
         print!("{}", generate(base).render());
         return;
     }
+    if let Some(path) = &seed_list {
+        // A named list is how the seeds that once found a bug stay in the gate:
+        // a seed reproduces a program exactly, so a list is a regression suite.
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("obgen: cannot read {}: {e}", path.display());
+            std::process::exit(2);
+        });
+        let picks: Vec<u64> = text
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.parse().unwrap_or_else(|_| panic!("seed-list: not a seed: {l}")))
+            .collect();
+        std::process::exit(run_list(&picks, &obc, &work, keep));
+    }
     std::process::exit(run(base, seeds, &obc, &work, keep));
+}
+
+fn run_list(picks: &[u64], obc: &Path, work: &Path, keep: bool) -> i32 {
+    std::fs::create_dir_all(work).expect("cannot create the work directory");
+    let mut failed = 0;
+    for &seed in picks {
+        match one(seed, obc, work, keep) {
+            Ok(()) => println!("PASS seed-{seed}"),
+            Err(why) => {
+                println!("FAIL seed-{seed}: {why}");
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "SUMMARY obgen: {} listed seed(s), {} passed, {failed} failed",
+        picks.len(),
+        picks.len() - failed
+    );
+    if failed == 0 {
+        0
+    } else {
+        1
+    }
 }
 
 fn run(base: u64, seeds: u64, obc: &Path, work: &Path, keep: bool) -> i32 {

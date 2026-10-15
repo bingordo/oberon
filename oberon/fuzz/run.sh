@@ -8,19 +8,27 @@
 # computes something else -- with no output expected from the program and no
 # expectation taken from the compiler.
 #
-# SEEDS/BASE select the run; the default is short enough for the gate, and any
-# seed is reproducible on any machine.
+# The default run is the standard suite: every seed that once found a defect
+# (regressions.txt), then a block for coverage. SEEDS/BASE select one contiguous
+# range instead, for an ad-hoc run; either way a seed reproduces on any machine.
 set -e
 cd -- "$(dirname -- "$0")"
 
 OBG=${OBG:-../target/debug/obgen}
 OBC=${OBC:-../target/debug/obc}
-SEEDS=${SEEDS:-25}
-BASE=${BASE:-1}
 WORK=${WORK:-findings}
+LIST=${LIST:-regressions.txt}
+COVER=${COVER:-100}
+BASE=${BASE:-1}
 
 status=0
-"$OBG" --seeds "$SEEDS" --base "$BASE" --obc "$OBC" --work "$WORK" "$@" || status=$?
-
-echo "SUMMARY fuzz: seeds $BASE..$((BASE + SEEDS - 1)), exit $status"
+if [ -n "${SEEDS:-}" ]; then
+    "$OBG" --seeds "$SEEDS" --base "$BASE" --obc "$OBC" --work "$WORK" "$@" || status=$?
+    echo "SUMMARY fuzz: seeds $BASE..$((BASE + SEEDS - 1)), exit $status"
+else
+    "$OBG" --seed-list "$LIST" --obc "$OBC" --work "$WORK" "$@" || status=$?
+    echo "----"
+    "$OBG" --seeds "$COVER" --base "$BASE" --obc "$OBC" --work "$WORK" "$@" || status=$?
+    echo "SUMMARY fuzz: regression list + seeds $BASE..$((BASE + COVER - 1)), exit $status"
+fi
 exit $status

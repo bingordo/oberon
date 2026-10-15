@@ -8,16 +8,20 @@ An item is done when **the four suites and clippy pass** and the evidence it
 promises exists as a test or a suite check:
 
 ```
-cargo test                  # 50 unit tests
-bash golden/run.sh          # the golden cases, run twice: plain and under ASan/UBSan
+cargo test                  # 71 unit tests
+bash golden/run.sh          # 67 golden cases, run twice: plain and under ASan/UBSan
 bash csmoke/run.sh          # 67 C-level cases
-bash e2e/run.sh             # 26 checks, end to end through the driver
+bash e2e/run.sh             # 55 checks, end to end through the driver
+bash fuzz/run.sh            # the seeds that once found a defect, then 100 for coverage
 cargo clippy --all-targets -- -D warnings    # green (W0.1)
 ```
 
-`bash fuzz/run.sh` (SEEDS/BASE select the run) is deliberately *not* in that
-list yet: it found three defects on its first run (W6.2) and stays out until
-they are fixed, or it would be a gate that always fails.
+`bash fuzz/run.sh` joins it (W6.2): by default it runs `fuzz/regressions.txt` —
+every seed that once found a defect, each with the reason it is listed, because a
+seed reproduces a program exactly on any machine — and then a 100-seed coverage
+block. `SEEDS`/`BASE` select one contiguous range instead, for an ad-hoc run;
+`COVER` sets the block's size. It reported five seeds failing when it was first
+written and they are all fixed, which is the point of keeping the list.
 
 Recently closed, for context: DIAG's located diagnostics and statement-level
 recovery (DESIGN §5 D7, §10), the CLI's warning path (a clean module used to
@@ -309,7 +313,9 @@ out-of-scope bullet is replaced by a pointer here, R5 becomes "implemented, and
 the RISC extras still refused by name", and the generator (W6) has a SYSTEM
 fragment whose `PUT`/`GET` round trips and `SIZE` calls the mirror can predict.
 
-**W4.2 garbage collection** (R3) — *implementation; the design study is W4.5 and
+**W4.2 garbage collection** (R3) — *superseded in form by W10.1, which carries the
+same study and states the variables the decision turns on; kept here as the
+original entry point. The design study is W4.5 and
 comes first*
 Why: `NEW` maps to `malloc`; a tracing collector is what real Oberon systems
 have and what long-running programs notice. The hatch is `rt_new`, which the
@@ -565,7 +571,7 @@ guards, modules and imports, a shrinking pass for a failing seed, runs long
 enough for the gate (W6.2 has to be fixed first), and a `SYSTEM` fragment whose
 `PUT`/`GET` round trips and `SIZE` calls the mirror can predict (W4.1).
 
-**W6.2 the first run: the emitted C is not warning-clean** — **open**
+**W6.2 the first run: the emitted C is not warning-clean** — **done**
 Why it matters: the documented build line (`-std=c11 -O2 -fwrapv -Wall -Wextra
 -Werror`, DESIGN §9.1) is what the e2e suite uses as its guarantee, so emitted C
 that a *legal* program provokes a warning from is a bug in the compiler, not in
@@ -589,7 +595,17 @@ three distinct causes:
 
 Done when: `bash fuzz/run.sh` passes for a few hundred seeds and joins the gate,
 with one regression fixture per cause in `e2e/` (or a row in `Regress.mod`) so
-the suites catch a return of any of them. **Progress**: the fold, the parameter
+the suites catch a return of any of them. **Done**: six causes, each with a
+fixture — the constant overflow (`Regress.mod` prints `2147483647 * 2`), the
+unused parameter and the unused local (`e2e`'s `unused-entities-still-compile`
+builds a module with an unread variable, parameter and procedure), the
+tautological comparison (`-i > -i` and `(i + 1) < (i + 1)`), a self-comparison
+whose operands contain *calls* (`ABS(i) = ABS(i)`), and the *order* of operand
+evaluation (four rows in `Regress.mod`). The seventh — gcc proving a *symbolic*
+overflow, `(MAX - m2) + (MAX + m2)`, which no value fold can reach — is answered
+by `-Wno-overflow` in the documented line, whose justification is the same as
+`-fwrapv`'s (§9.1). Evidence: `fuzz/regressions.txt`'s nine seeds, seeds 1..100,
+200 seeds from 1000 and 400 from 5000 all pass; `e2e` is 55 checks. **Progress**: the fold, the parameter
 marks and the named-`CONST` lookup landed, and each landing changed the signal:
 
 | state | C rejections | value mismatches | passing |
@@ -687,7 +703,7 @@ arm), but the decision should be written down in DESIGN §5.
 
 ---
 
-**W6.6 the generator's three standing failures** — **open**
+**W6.6 the generator's three standing failures** — **done**
 
 `fuzz` reports three seeds failing (7, 9, 17 of 25), each as a program whose own
 self-check traps — a *value* the module computed differently from the value the
@@ -701,7 +717,10 @@ expectation is wrong, not the program's value.
 
 Done when: each seed is either fixed in the compiler or its expectation corrected
 in the generator, with the reason recorded — and the seeds are in the gate, not
-merely reproducible by hand.
+merely reproducible by hand. **Done**: fixed in the *compiler*, and the reason is
+DESIGN R23 with its mechanism in §9.5 — operands and arguments are now evaluated
+in source order. The three seeds are in `fuzz/regressions.txt`, and the same file
+carries the two seeds that found the argument case (1098, 1116).
 
 Progress, by instrumenting seed 17 (the module's checks replaced with `Out.WriteInt`
 of each variable, so the program's values could be read beside the generator's):

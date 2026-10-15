@@ -35,13 +35,16 @@ Every change keeps these green (PLAN.md's preamble is the same list):
 cargo test --manifest-path oberon/Cargo.toml
 bash oberon/golden/run.sh      # 67 cases, plain and under ASan/UBSan
 bash oberon/csmoke/run.sh      # 67 C-level cases
-bash oberon/e2e/run.sh         # 30 checks, end to end through the driver
+bash oberon/e2e/run.sh         # 55 checks, end to end through the driver
+bash oberon/fuzz/run.sh        # the seeds that once found a defect, then 100 more
 cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings
 ```
 
-`bash oberon/fuzz/run.sh` (SEEDS/BASE select the run) is deliberately *not* in the
-gate yet: it is a random-program oracle whose remaining mismatches are itemised in
-PLAN.md W6.2 rather than papered over.
+`bash oberon/fuzz/run.sh` runs `oberon/fuzz/regressions.txt` — every seed that once
+found a defect, each with the reason it is listed — and then a coverage block;
+`SEEDS`/`BASE` select one contiguous range instead. A seed reproduces a random
+program exactly, together with the values it must compute, so the list is a
+regression suite rather than a memory of one.
 
 ## Using it
 

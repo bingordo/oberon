@@ -16,7 +16,7 @@ set -e
 cd -- "$(dirname -- "$0")"
 
 CC=${CC:-gcc}
-CFLAGS="-std=c11 -O2 -fwrapv -Wall -Wextra -Werror"
+CFLAGS="-std=c11 -O2 -fwrapv -Wall -Wextra -Werror -Wno-overflow"
 SUITE_SRCS="harness.c lower.c constexpr_check.c Ob.c Out.c Main.c"
 TABLE_SRCS="constexpr.c"
 

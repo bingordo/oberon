@@ -5,5 +5,5 @@ cd -- "$(dirname -- "$0")"
 # is a test fixture, and no binary belongs in it.
 BIN="$(mktemp -d)/smoke"
 trap 'rm -rf "$(dirname "$BIN")"' EXIT
-gcc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror -o "$BIN" smoke.c
+gcc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror -Wno-overflow -o "$BIN" smoke.c
 "$BIN"

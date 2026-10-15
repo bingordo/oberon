@@ -1,0 +1,28 @@
+# Seeds that once found a defect, kept so a return of any of them fails here.
+# Each line is a seed the generator reproduces exactly on any machine, so this
+# file is a regression suite rather than a memory of one. Run it with
+# `bash fuzz/run.sh` (which also runs a coverage block).
+#
+# W6.6 / DESIGN R23 -- operand evaluation order: these three were the standing
+# failures whose module computed 5 where the model said 3.
+7
+9
+17
+#
+# W6.2 cause 1 -- a constant subexpression that overflows was emitted as C
+# arithmetic, which gcc reports as `-Woverflow` under the documented line.
+12
+#
+# W6.2 -- `(m6 + m5) >= (m5 + m6)`: gcc proves the tautology and rejects it,
+# so a commutative normalisation in the folder is what makes it compile.
+1075
+#
+# W6.2 -- a call's *arguments* are unordered in C too: `F0(ABS(F0(100, acc)),
+# LSL(ASR(m0, 0), 1))` writes through one argument what another reads.
+1098
+1116
+#
+# W6.2 -- a comparison whose operands are the same tree (with operators, not
+# just designators) reached gcc as a self-comparison and was rejected.
+1122
+1178

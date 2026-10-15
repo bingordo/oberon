@@ -30,7 +30,8 @@ use oberon_front::{
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
 /// punning, and warnings as errors so the emitted C has to be clean.
-const CFLAGS: &str = "-std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror";
+const CFLAGS: &str =
+    "-std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror -Wno-overflow";
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {

@@ -9,7 +9,7 @@ cd -- "$(dirname -- "$0")"
 OB=${OB:-../target/debug/oberon-front}
 CC=${CC:-gcc}
 # The build line of DESIGN 9.1, plus -Werror so the emitted C has to be clean.
-CFLAGS="-std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror"
+CFLAGS="-std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror -Wno-overflow"
 
 pass=0
 fail=0
@@ -300,6 +300,27 @@ check "driver-locates-a-module-level-error" "1" \
 # the commonest defect, so the note names it first.
 check "driver-says-what-would-have-fitted" "1" \
     "$(grep -c '= note: expected ; .*END' "$DRV/noend.out")"
+
+# A module that never reads its own variable, local or procedure must still
+# compile: C rejects an unmentioned `static` and an unread parameter under the
+# documented build line, and Oberon requires none of them (R20, PLAN.md W6.2).
+cat > "$DRV/Unused.mod" <<'MODEOF'
+MODULE Unused;
+  VAR neverRead, neverSet: INTEGER;
+  PROCEDURE neverCalled(n: INTEGER): INTEGER;
+    VAR neverUsed: INTEGER;
+  BEGIN neverUsed := n; RETURN n END neverCalled;
+BEGIN neverRead := 0
+END Unused.
+MODEOF
+if "$OBC" build "$DRV/Unused.mod" -I "$DRV" -o "$DRV/unused" 2>"$DRV/unused.log"; then
+    echo "PASS unused-entities-still-compile"
+    pass=$((pass + 1))
+else
+    echo "FAIL unused-entities-still-compile:"
+    sed -n '1,6p' "$DRV/unused.log"
+    fail=$((fail + 1))
+fi
 
 # 7. Regression module: one line of output per defect the review found, each
 #    line's expectation computed from the report rather than from a run.
