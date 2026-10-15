@@ -1701,11 +1701,17 @@ with the reason, and the correctness oracle is unchanged — `fuzz` with
 `OB_GC_STRESS=1` and the standard suite both still green. "We measured, and this is
 the bound we accept" is a legitimate outcome; "it seems fine" is not.
 
-**First step is the instrument, and it is not optional**: `.15`'s collector has no
+**First step is the instrument, and it is not optional**: §15's collector has no
 counter of any kind, so wall-clock numbers cannot separate a pause from the mutator
-work between pauses. `OB_GC_STATS=1` should report, per collection, the bytes before
-and after, the blocks marked and swept, and the *time spent inside* `ob_collect` —
-the shape `OB_ALLOC_FAIL_AT` and `OB_GC_STRESS` already have.
+work between pauses. `OB_GC_STATS=1` reports, per collection, the bytes before and
+after, the blocks marked and swept, and the *time spent inside* `ob_collect` — the
+shape `OB_ALLOC_FAIL_AT` and `OB_GC_STRESS` already have, and everything it needs is
+already in the runtime: the switch goes beside the other two in `ob_gc_env`, the byte
+counts are `ob_heap_bytes` before and after, the mark stack gives what was marked and
+the sweep loop already distinguishes what it keeps from what it frees, and the clock
+is `timespec_get(&ts, TIME_UTC)` — C11, so no feature-test macro and no new dependency.
+It writes to *stderr*, so a program's own output is untouched, and a final line at exit
+gives the totals. A benchmark then reports a distribution instead of an impression.
 
 **One early observation, recorded with its caveat.** A churn benchmark of my own —
 5000 live nodes kept while 200 000 objects are allocated and dropped — ran
