@@ -13,7 +13,7 @@
 /* The runtime the *compiler actually ships*, included rather than copied: these
  * cases exist to pin its semantics, and a private copy had already drifted from
  * it once (see DESIGN.md §14). */
-#include "../src/oberon_h.inc"
+#include "../crates/cgen/src/oberon_h.inc"
 
 /* Helpers that the emitted runtime does not need but these vectors do: a
  * NUL-terminated comparison, a bounded copy, and an ordinal read. */

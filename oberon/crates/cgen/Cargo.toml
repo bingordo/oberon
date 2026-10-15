@@ -1,0 +1,14 @@
+[package]
+name = "cgen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syntax = { path = "../syntax" }
+sema = { path = "../sema" }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-native = { workspace = true }
+cranelift-object = { workspace = true }
+target-lexicon = { workspace = true }

@@ -11,7 +11,7 @@
 
 /* The types and the two host entry points come from the runtime the compiler
  * actually emits, so this fixture cannot drift from it (DESIGN §14). */
-#include "../src/oberon_h.inc"
+#include "../crates/cgen/src/oberon_h.inc"
 
 /* Find one entry without calling it.
  * Not part of the design's host API (which is exactly the two functions above).

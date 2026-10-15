@@ -23,11 +23,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use oberon_front::{
-    cgen, check_module_recovering_dialect, clif, emit_c_full, emit_interface_dialect,
-    emit_object_full, layout_table_full, limit_errors, parse_with_diagnostics_dialect,
-    render_diagnostics, sym, Diagnostic, Dialect,
+use cgen::{self, clif};
+use obc::{
+    check_module_recovering_dialect, emit_c_full, emit_interface_dialect, emit_object_full,
+    layout_table_full, limit_errors, parse_with_diagnostics_dialect, render_diagnostics,
+    Diagnostic, Dialect,
 };
+use sema::sym;
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
 /// punning, and warnings as errors so the emitted C has to be clean.
@@ -85,7 +87,7 @@ struct Opts {
     ferror_limit: usize,
     /// Which runtime checks to write: all of them unless `-Ochecks=…` narrows the
     /// set (DESIGN §9.4, PLAN.md W3.1 and W8.3).
-    checks: cgen::Checks,
+    checks: cgen::cgen::Checks,
     /// Which dialect to accept: the report's Oberon-07 unless `-Odialect=lower`
     /// (DESIGN §5, PLAN.md W8.10).
     dialect: Dialect,
@@ -182,7 +184,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         backend: Backend::C,
         layout: false,
         ferror_limit: 20,
-        checks: cgen::Checks::ALL,
+        checks: cgen::cgen::Checks::ALL,
         dialect: Dialect::Report,
     };
     let mut i = 2;
@@ -235,15 +237,15 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                     }
                 }
             }
-            "-Ochecks" => o.checks = cgen::Checks::ALL,
+            "-Ochecks" => o.checks = cgen::cgen::Checks::ALL,
             other if other.starts_with("-Ochecks=") => {
                 let list = &other["-Ochecks=".len()..];
-                match cgen::Checks::parse(list) {
+                match cgen::cgen::Checks::parse(list) {
                     Some(c) => o.checks = c,
                     None => {
                         eprintln!(
                             "obc: `-Ochecks={list}` names no check; expected one of {}",
-                            cgen::Checks::NAMES
+                            cgen::cgen::Checks::NAMES
                         );
                         return None;
                     }
@@ -562,8 +564,8 @@ fn emit_tree(
 }
 
 fn write_runtime(o: &Opts) -> Result<(), String> {
-    write(&o.out.join("oberon.h"), cgen::RUNTIME_HEADER)?;
-    write(&o.out.join("oberon_runtime.c"), cgen::RUNTIME_SOURCE)
+    write(&o.out.join("oberon.h"), cgen::cgen::RUNTIME_HEADER)?;
+    write(&o.out.join("oberon_runtime.c"), cgen::cgen::RUNTIME_SOURCE)
 }
 
 fn find_interfaces(o: &Opts) -> (Vec<sym::Interface>, HashMap<String, String>) {

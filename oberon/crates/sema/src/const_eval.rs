@@ -23,7 +23,7 @@
 //! * `ORD` of a `SET` is not folded: the report lists `SET` in the argument
 //!   types but a set has no single ordinal number, so no constant is produced.
 
-use crate::ast::*;
+use syntax::ast::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Const {
@@ -398,7 +398,7 @@ fn call(name: &str, args: &[Const]) -> EvalResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_module;
+    use syntax::parse_module;
 
     /// Parse `CONST c = <expr>;` through the real lexer and parser, so the
     /// folder is tested on trees the front end actually produces.
@@ -521,7 +521,7 @@ mod tests {
     /// `rt_set`, `rt_in`) exactly as the back end would emit them.
     #[test]
     fn agrees_with_the_emitted_c() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/golden/constexpr.tsv");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../golden/constexpr.tsv");
         let table = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => panic!("run `bash oberon/golden/run.sh` first to produce {path}: {e}"),

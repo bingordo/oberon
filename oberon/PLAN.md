@@ -52,7 +52,7 @@ Why: the preamble says "clippy clean"; `cargo clippy --all-targets` reports 244
 warnings, *all* in LALRPOP's generated parser
 (`target/…/out/oberon.rs`, `clippy::ptr_arg` — `&mut Vec` is what LALRPOP's
 `ErrorRecovery` signature requires, so it cannot be changed).
-Files: `src/lib.rs` (the `lalrpop_mod!` site).
+Files: `crates/syntax/src/lib.rs` (the `lalrpop_mod!` site).
 Done when: an `#[allow(clippy::ptr_arg)]` — scoped to the generated module, not
 the crate — makes `cargo clippy --all-targets -- -D warnings` exit 0, and the
 clippy line is part of the gate above. **Done**: `lalrpop_mod!` carries the
@@ -62,7 +62,7 @@ gate block below no longer carries a caveat.
 
 **W0.2 two sections are still marked `[design]` although they are executed daily** — **done**
 Why: §9.2 (type mapping) and §9.3 (records, extension, descriptors) are marked
-`[design]`, but `src/cgen.rs` implements them and `e2e`/`csmoke` run them.
+`[design]`, but `crates/cgen/src/cgen.rs` implements them and `e2e`/`csmoke` run them.
 Done when: those markers say what is actually unverified (if anything), so that
 `grep '\[design' DESIGN.md` returns only the legend. **Done**: §9.2 and §9.3 are
 now `[verified]` with the suites that execute them named — the document's own
@@ -88,7 +88,7 @@ missing, and they are a chain:
    fixture (hand-written, per `e2e/run.sh`'s header) carries a field list the
    emitter would never produce;
 3. `sema` therefore cannot compare the accessing module with the defining one.
-Files: `src/types.rs`, `src/cgen.rs`, `src/sym.rs`, `src/sema.rs`.
+Files: `crates/sema/src/types.rs`, `crates/cgen/src/cgen.rs`, `crates/sema/src/sym.rs`, `crates/sema/src/sema.rs`.
 Done when: the mark travels through the interface, an access to a private field
 of an imported record is an error, and `check_tests` has a case per row (each
 case names its row number). **Done**: `types::Field` carries the mark — the
@@ -105,7 +105,7 @@ wave was for.
 **W1.2 row 50's locality half** (report §6.5, §10.1) — **done**
 Why: a *local* procedure assigned to a procedure variable is rejected, but one
 passed as an *actual* is not — the check exists on one side of a symmetric rule.
-Files: `src/sema.rs`.
+Files: `crates/sema/src/sema.rs`.
 Done when: passing a nested procedure where a procedure variable is expected is
 an error, with a test. **Done**: `check_actuals` rejects a `local procedure`
 actual when the formal's type is a procedure type (the formal is checked first so
@@ -116,7 +116,7 @@ list of unchecked rules is down to two (both halves of field visibility, W1.1).
 
 **W1.3 row 54's unused-*procedure* half** — **done**
 Why: unused imports warn; an unused local procedure does not.
-Files: `src/sema.rs` (the `unused_imports` pass is the natural home).
+Files: `crates/sema/src/sema.rs` (the `unused_imports` pass is the natural home).
 Done when: a module with an uncalled local procedure warns once, the warning is
 located, and it is visible through `obc check` (the path fixed this session).
 **Done**: `Sema::unused_procedures`, with uses recorded at the one place every
@@ -160,7 +160,7 @@ Why: `resolve.rs` splits guard-vs-call and folds module qualification *before*
 the checker builds scopes, so a local variable that shadows an import alias, or
 a nested type name, is classified by the wrong scope. This is a correctness
 bug for programs that shadow, not a style matter.
-Files: `src/resolve.rs`, `src/sema.rs` (it already builds the scopes the pass
+Files: `crates/sema/src/resolve.rs`, `crates/sema/src/sema.rs` (it already builds the scopes the pass
 needs).
 Done when: a module whose local shadows an import alias checks correctly (or is
 rejected for the right reason), with a test; then §13's R17 becomes a note
@@ -321,8 +321,8 @@ old code.
 Why: the design says runtime checks are on by default and compiled out with
 `-Ochecks=n`; in fact `cgen` emits `rt_trap` unconditionally and the driver has
 no such flag.
-Files: `src/cgen.rs` (an option threaded to the three check sites: index, `NIL`
-dereference, type-`CASE` no-match), `src/bin/obc.rs`, `e2e/run.sh`.
+Files: `crates/cgen/src/cgen.rs` (an option threaded to the three check sites: index, `NIL`
+dereference, type-`CASE` no-match), `crates/obc/src/bin/obc.rs`, `e2e/run.sh`.
 Done when: a bounds violation traps by default and runs without the check under
 `-Ochecks=n`, both covered by suite checks; R6's `FOR`-at-`MAX(INTEGER)` note is
 resolved in the same pass (the trap is one of the checks the flag turns off).
@@ -337,7 +337,7 @@ resolved as defined-by-the-report rather than checked — see its row.
 **W3.2 interface-file versioning** (§7, "prototype codec") — **done**
 Why: the format starts at `MODULE <name>` with no version, so a stale interface
 from an older compiler is indistinguishable from a current one.
-Files: `src/sym.rs` (both directions), `src/sema.rs` (the error).
+Files: `crates/sema/src/sym.rs` (both directions), `crates/sema/src/sema.rs` (the error).
 Done when: a version line is written and checked, a wrong-version interface is
 refused with a located message, and the round-trip tests cover it. **Done**:
 `sym::FORMAT_VERSION` is written as the second line (so a reader knows what it is
@@ -386,7 +386,7 @@ to W6.2 for the fuzzer's state.
 ## W4 — designed with an escape hatch, not built
 
 **W4.1 `SYSTEM`** (R5, report §11.1) — **done**
-Why: `src/sema.rs` used to reject `IMPORT SYSTEM` outright ("module SYSTEM is not
+Why: `crates/sema/src/sema.rs` used to reject `IMPORT SYSTEM` outright ("module SYSTEM is not
 available in this implementation (report 11.1)"). Report §11.1 defines five
 portable entries and one proper procedure, all of them deliberately outside the
 type rules:
@@ -464,7 +464,7 @@ and the byte-identical C under `-Ochecks=n`.
   cases), `cargo test` (the catalogue rows and the four new `check_tests`, the
   `SYSTEM.SIZE` reclassification case) and `cargo clippy -D warnings` all pass.
 * **Not in this item**: the generator's SYSTEM fragment. `W6`'s own text asks for
-  one, and the fuzzer's mirror lives in `src/bin/obgen.rs`; W4.1's half is the
+  one, and the fuzzer's mirror lives in `crates/obc/src/bin/obgen.rs`; W4.1's half is the
   compiler's. **The sized accessors** W8.7 proposes (`GET8`…`PUT32`) are
   deliberately not taken (§9.10): the report's table has none, and the address
   keeps the host's width instead, so a byte access needs no separate entry.
@@ -487,7 +487,7 @@ Done when: the design states the root model, and a stress program runs under
 `-Ocollect` without leaking or crashing.
 
 **W4.3 the crate split of §2** (`crates/syntax`, `crates/sema`, `crates/cgen`,
-`crates/obc`)
+`crates/obc`) — **done**
 Why: §2 prescribes a split by phase; the prototype is one crate with `src/*.rs`.
 It is mechanical because the phase interfaces are three plain data types, and it
 pays off when a phase grows — `syntax` is the only crate that may know LALRPOP.
@@ -503,14 +503,42 @@ one crate):
   `oberon_runtime.inc` (depends on both). §2's names for these files (`emit.rs`,
   `layout.rs`, `runtime.h`, `mangle.rs`) are its sketch of the same shape; ours are the
   ones that exist, and the divergence is a naming one.
-* `crates/obc` — `bin/obc.rs` and `bin/obgen.rs` (the generator depends on nothing,
-  which is why it can sit here).
+* `crates/obc` — `bin/obc.rs`, `bin/obgen.rs` and `bin/oberon-front.rs` (the
+  generator depends on nothing, which is why it can sit here; `oberon-front` is
+  the front-end CLI the e2e suite drives as `../target/debug/oberon-front`).
 
 `oberon/Cargo.toml` becomes the workspace manifest with those as members, so the
 binaries stay in `oberon/target/debug/` — which means **no suite path changes**, and
 the CI workflow's `--manifest-path oberon/Cargo.toml` keeps resolving. The tests move
 with their modules (they are unit tests in the same files), and the shell suites do
 not know any of this happened.
+
+**Done.** The four crates exist under `crates/{syntax,sema,cgen,obc}` with a virtual
+workspace manifest at `oberon/Cargo.toml` (`members = ["crates/*"]`, resolver 2), so
+the binaries still land in `oberon/target/debug/` and no suite or CI path changed.
+Two moves the note above did not name were forced by the edges and are recorded here:
+
+* `Diagnostic`, `Severity`, `dedup_diagnostics` and the diagnostic renderer moved out
+  of `sema.rs`/`lib.rs` into `syntax/crates/syntax/src/diag.rs`. A lexical or parse error *is* a
+  diagnostic, so its type has to be visible to the parser; putting it in `syntax` is
+  what lets the checker import it without a cycle and still keeps `sema` and `cgen`
+  from naming LALRPOP.
+* `rendered_type` (the `.sym` type reader) moved from `sema.rs` into `syntax`, beside
+  the grammar it calls; `sema` reaches it as `syntax::rendered_type`.
+
+The façade (`emit_c_full`, `emit_object_full`, `layout_table_full`, `check_module*`)
+and the four test modules are `crates/obc/src/lib.rs`; the two front-end tests that
+read a path had one fix — `const_eval.rs`'s folder-vs-C check read
+`golden/constexpr.tsv` relative to its manifest, so it reads
+`../../golden/constexpr.tsv` now that the crate sits one level down.
+
+**Done** — the numbers are identical to the one-crate tree: `cargo test` **81 passed**;
+`cargo clippy --all-targets -- -D warnings` clean at the workspace; `bash golden/run.sh`
+PASS, ASan/UBSan clean; `bash csmoke/run.sh` **0 failures**; `bash e2e/run.sh`
+**126/0** and `BACKEND=clif bash e2e/run.sh` **126/0**; `bash fuzz/run.sh` and
+`BACKEND=clif bash fuzz/run.sh` exit 0. `cargo build|test|clippy --manifest-path
+oberon/Cargo.toml` now name the workspace manifest and cover every member, so the CI
+workflow resolves unchanged.
 
 **W4.4 a `.sym`-only fast path** — **deferred, measured** (the condition it waits for has not fired)
 Why: `obc build` has no up-to-date check (nothing in the driver looks at
@@ -674,7 +702,7 @@ what it says:
    conflicts**, the same wall as W5.1. So a missing `;` in a body is *reported*,
    not *repaired* — and the honest fix is to say exactly what was discarded,
    which is what the recovery note now does. **[landed: `git diff` of
-   `src/oberon.lalrpop` is empty; the experiment was reverted]**
+   `crates/syntax/src/oberon.lalrpop` is empty; the experiment was reverted]**
 2. *A diagnostic used to hold one note.* `Diagnostic::with_note` **replaced** the
    note, so a recovered error showed the recovery note and silently dropped the
    expected-token note — the reader lost "what would have fitted". `Diagnostic`
@@ -749,7 +777,7 @@ e2e checks pass.
 
 ## W6 — the random program generator, and what it found
 
-**W6.1 the generator** — **implemented: `src/bin/obgen.rs`, `bash fuzz/run.sh`**
+**W6.1 the generator** — **implemented: `crates/obc/src/bin/obgen.rs`, `bash fuzz/run.sh`**
 Why: the three hands-written suites only test what their author thought of. A
 generator writes programs that are *known* to be well formed and *known* to
 compute a particular value, so any disagreement is a bug rather than a judgement
@@ -876,7 +904,7 @@ logical shift left, 0 or -1 for an arithmetic shift right — while only the
 Evidence: a generated program's self-check trapped; the generator's mirror
 follows the report, so the mismatch was the compiler's, and `LSL(1,32)` on its own
 settles it.
-Fixed in `src/oberon_h.inc` (both helpers), `src/const_eval.rs` (both folds and
+Fixed in `crates/cgen/src/oberon_h.inc` (both helpers), `crates/sema/src/const_eval.rs` (both folds and
 its doc), `csmoke/smoke.c` (the copied helpers, the case that encoded the masking,
 and four new cases), `golden/lower.c` and `golden/constexpr_check.c` (the
 second-pass recomputation), `golden/constexpr.tsv` (regenerated), and the four
@@ -984,7 +1012,7 @@ emitter's dereference lowering (`Mem3__p->x = 1`) has no check at all. Evidence:
 violation of the same class reports a located trap. `p^ := p^` does not even
 crash — the C compiler is free to do anything with it, which is the other half
 of the problem.
-Fix, in `src/cgen.rs`: lower a pointer access through a `NIL` test, using the
+Fix, in `crates/cgen/src/cgen.rs`: lower a pointer access through a `NIL` test, using the
 same comma-expression trick §9.5 already uses for guards where the access is a
 *read* (`(rt_nil(p, "… at byte N"), p->f)`) and a hoisted statement where it is
 an *lvalue* (`(rt_nil(p, …), p->f) = x` is not valid C), with a new `rt_nil`
@@ -1182,7 +1210,7 @@ Why: both surveyed compilers that care about embedding Oberon in a lower-case co
 
 The rule that decides the default, and it is worth stating once: **W8.1–W8.5 are additive and may be on by default, because a report program is unaffected; a keyword-case fold is not additive, because the report makes capital and lower-case letters distinct (report §3), so a report program that uses `Begin` or `integer` as an identifier would tokenise differently.** Hence the flag, off by default, and the compiler stays a strict report implementation unless asked otherwise.
 
-Implementation is small and local: keyword recognition is one table and one comparison (`KEYWORDS` and the lookup in `src/lexer.rs`), so the dialect is a field on `Lexer` (`Lexer::new` keeps the report behaviour) compared with `eq_ignore_ascii_case` instead of `==`. Nothing downstream changes: the token stream is identical, so the grammar, AST, checker and emitter never learn about the dialect.
+Implementation is small and local: keyword recognition is one table and one comparison (`KEYWORDS` and the lookup in `crates/syntax/src/lexer.rs`), so the dialect is a field on `Lexer` (`Lexer::new` keeps the report behaviour) compared with `eq_ignore_ascii_case` instead of `==`. Nothing downstream changes: the token stream is identical, so the grammar, AST, checker and emitter never learn about the dialect.
 
 A second, separate decision that falls out of it: `INTEGER`, `CHAR`, `TRUE`, `FALSE`, `NIL` and the §10.2 procedure names are *predeclared identifiers*, not keywords, so their lower-case forms are aliases in `sema::predefine` rather than a lexer concern — and because a user declaration shadows a predeclared name, that half **is** additive and can be on by default. Worth doing separately from the keyword fold, and cheap.
 
@@ -1337,7 +1365,7 @@ with the reason it was taken. (When the item was split, the `e2e` half of this
 line moved to W9.1's successor — W9.2 — and the acceptance test for W9.1 became
 the fuzz corpus, which is what the prototype was finished against.)
 
-**Done.** `src/clif.rs` lowers the fuzz corpus's fragment to Cranelift IR and
+**Done.** `crates/cgen/src/clif.rs` lowers the fuzz corpus's fragment to Cranelift IR and
 emits one object per module through `cranelift-object`; `obc --backend=c|clif`
 (default `c`) writes that object and links it with the same runtime and loader;
 `obgen --backend=clif` generates the fragment and `fuzz/run.sh` runs the standard
@@ -1367,7 +1395,11 @@ module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`
 Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
-**W9.2 the rest of the language on the Cranelift back end** — **open**
+**W9.2 the rest of the language on the Cranelift back end** — **done**: all four slices
+(a–d) are in and `BACKEND=clif bash e2e/run.sh` is **126 passed, 0 failed** — every row
+the C path passes, which was the acceptance — with the corpus green on both back ends.
+`DESIGN.md` §16 carries the record, including the last row's cause (a frame-held record
+local that missed its descriptor walk, whose type-`CASE` then read `NULL + 8`)
 
 *Notes from W9.1, so the next session starts from them rather than re-deriving:*
 
@@ -1408,7 +1440,7 @@ written down):
   header in, `sizeof`/`offsetof` out, compared against the computed table. Then
   scalar fixed arrays. Done when that test passes and the corpus's scalar programs
   still do.
-  **Done.** `src/layout.rs` computes it and `obc emit --layout` prints it (a
+  **Done.** `crates/cgen/src/layout.rs` computes it and `obc emit --layout` prints it (a
   diagnostic that stops before emitting anything, so a module whose records this
   back end does not lower yet can still be asked what layout it would get).
   `e2e`'s layout block is the comparison, one `check` per fact: 20 facts over the
@@ -1606,8 +1638,8 @@ that gains the pointer-field offsets, a conservative stack walk now and a precis
 one when W9's back end can supply stack maps, and collection before `NEW` gives up.
 The implementation is W10.2.
 
-**W10.2 the collector itself** — **implemented: `src/oberon_h.inc`,
-`src/oberon_runtime.inc`, `src/cgen.rs`, `src/bin/obgen.rs`, `fuzz/run.sh`,
+**W10.2 the collector itself** — **implemented: `crates/cgen/src/oberon_h.inc`,
+`crates/cgen/src/oberon_runtime.inc`, `crates/cgen/src/cgen.rs`, `crates/obc/src/bin/obgen.rs`, `fuzz/run.sh`,
 `e2e/run.sh` (five rows) and one line of `e2e/Texts.c`, whose hand-written
 descriptor literal had to list the descriptor's two new fields like any other
 positional initializer under the e2e build's `-Werror`**

@@ -34,10 +34,10 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::ast::Module;
+use syntax::ast::Module;
 use crate::cgen::{mangle, span_of_type};
-use crate::sema::Sema;
-use crate::types::{Basic, Type, TypeId, Types};
+use sema::sema::Sema;
+use sema::types::{Basic, Type, TypeId, Types};
 
 /// A type's size and alignment, in bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

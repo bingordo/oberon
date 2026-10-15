@@ -13,10 +13,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{
+use syntax::ast::{
     self, CaseLabel, Expr, ExprKind, FormalParams, Module, QIdent, Selector, Span, Stmt, StmtKind,
     TypeExpr,
 };
+use syntax::diag::{dedup_diagnostics, Diagnostic, Severity};
+use syntax::rendered_type;
 use crate::const_eval::{self, Const};
 use crate::resolve::{reclassify, Names};
 use crate::sym::{Interface, Item};
@@ -29,64 +31,6 @@ pub struct Signature {
     pub ty: TypeId,
     pub params: Vec<(String, Param)>,
     pub result: Option<TypeId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    pub span: Span,
-    pub message: String,
-    /// A second line of explanation: what the compiler expected, which report
-    /// rule applies, or what the mistaken construct probably meant.
-    pub notes: Vec<String>,
-}
-
-impl Diagnostic {
-    pub fn new(severity: Severity, span: Span, message: impl Into<String>) -> Diagnostic {
-        Diagnostic {
-            severity,
-            span,
-            message: message.into(),
-            notes: Vec::new(),
-        }
-    }
-
-    pub fn error(span: Span, message: impl Into<String>) -> Diagnostic {
-        Diagnostic::new(Severity::Error, span, message)
-    }
-
-    /// Notes accumulate: a syntax error can have both "what would have fitted
-    /// here" and "what the recovery discarded", and the reader needs both
-    /// (DESIGN §10).
-    pub fn with_note(mut self, note: impl Into<String>) -> Diagnostic {
-        self.notes.push(note.into());
-        self
-    }
-
-    pub fn is_error(&self) -> bool {
-        self.severity == Severity::Error
-    }
-}
-
-/// Drop diagnostics that repeat one already reported: two passes over the same
-/// mistake (a call looked up twice, say) must not read as two mistakes.
-pub fn dedup_diagnostics(diags: &mut Vec<Diagnostic>) {
-    let mut seen: Vec<(Severity, u32, u32, String)> = Vec::new();
-    diags.retain(|d| {
-        let key = (d.severity, d.span.lo, d.span.hi, d.message.clone());
-        if seen.contains(&key) {
-            false
-        } else {
-            seen.push(key);
-            true
-        }
-    });
 }
 
 /// What an identifier denotes (report §4: an object is a constant, a type, a
@@ -3001,18 +2945,6 @@ const PREDEFINED_PROPER: &[&str] = &[
 const SYSTEM_FUNCTIONS: &[&str] = &["ADR", "SIZE", "BIT"];
 /// Report §11.1's proper procedures, the ones that write memory.
 const SYSTEM_PROPER: &[&str] = &["GET", "PUT", "COPY"];
-
-/// Parse a type as an interface file renders it, using the module grammar.
-fn rendered_type(text: &str) -> Option<TypeExpr> {
-    let mut lexer = crate::lexer::Lexer::new(text);
-    let mut errors = Vec::new();
-    match crate::oberon::RenderedTypeParser::new().parse(&mut errors, &mut lexer) {
-        // An interface rendering is either readable or it is not; there is no
-        // recovery inside one type.
-        Ok(t) if errors.is_empty() => Some(t),
-        _ => None,
-    }
-}
 
 /// The span a type is filed under. Spans are unique per node in practice; two
 /// nodes can share one (a designator and the expression wrapping it, an

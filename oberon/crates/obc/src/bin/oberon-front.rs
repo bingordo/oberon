@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     let dialect = match args.iter().position(|a| a.starts_with("-Odialect=")) {
         Some(i) => {
             let name = &args[i]["-Odialect=".len()..];
-            match oberon_front::Dialect::from_name(name) {
+            match obc::Dialect::from_name(name) {
                 Some(d) => d,
                 None => {
                     eprintln!(
@@ -31,11 +31,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        None => oberon_front::Dialect::Report,
+        None => obc::Dialect::Report,
     };
-    let report = |src: &str, diags: &mut Vec<oberon_front::Diagnostic>| {
-        let suppressed = oberon_front::limit_errors(diags, ferror_limit);
-        let text = oberon_front::render_diagnostics(path, src, diags);
+    let report = |src: &str, diags: &mut Vec<obc::Diagnostic>| {
+        let suppressed = obc::limit_errors(diags, ferror_limit);
+        let text = obc::render_diagnostics(path, src, diags);
         if suppressed > 0 {
             println!("{text}{suppressed} more error(s) were suppressed (--ferror-limit {ferror_limit})");
         } else {
@@ -87,8 +87,8 @@ fn main() -> ExitCode {
                     let p = ent.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("sym") {
                         if let Ok(text) = std::fs::read_to_string(&p) {
-                            match oberon_front::sym::parse(&text) {
-                                Ok(i) => if !ifaces.iter().any(|x: &oberon_front::sym::Interface| x.module == i.module) {
+                            match sema::sym::parse(&text) {
+                                Ok(i) => if !ifaces.iter().any(|x: &sema::sym::Interface| x.module == i.module) {
                                     ifaces.push(i);
                                 },
                                 Err(e) => eprintln!("warning: {}: {e}", p.display()),
@@ -98,25 +98,25 @@ fn main() -> ExitCode {
                 }
             }
         }
-        return match oberon_front::emit_c_full(
+        return match obc::emit_c_full(
             &src,
             &ifaces,
-            oberon_front::cgen::Checks::ALL,
+            cgen::cgen::Checks::ALL,
             dialect,
         ) {
             Ok(Ok((c, h))) => {
-                let name = oberon_front::parse_module_dialect(&src, dialect)
+                let name = obc::parse_module_dialect(&src, dialect)
                     .map(|m| m.name)
                     .unwrap_or_else(|_| "module".to_string());
                 let write = |file: String, text: &str| -> std::io::Result<()> {
                     std::fs::write(std::path::Path::new(&dir).join(file), text)
                 };
-                let sym_text = oberon_front::emit_interface_dialect(&src, &ifaces, dialect);
+                let sym_text = obc::emit_interface_dialect(&src, &ifaces, dialect);
                 let r = write(format!("{name}.c"), &c)
                     .and_then(|_| write(format!("{name}.h"), &h))
-                    .and_then(|_| write("oberon.h".into(), oberon_front::cgen::RUNTIME_HEADER))
+                    .and_then(|_| write("oberon.h".into(), cgen::cgen::RUNTIME_HEADER))
                     .and_then(|_| {
-                        write("oberon_runtime.c".into(), oberon_front::cgen::RUNTIME_SOURCE)
+                        write("oberon_runtime.c".into(), cgen::cgen::RUNTIME_SOURCE)
                     })
                     .and_then(|_| match &sym_text {
                         Some(t) => write(format!("{name}.sym"), t),
@@ -147,7 +147,7 @@ fn main() -> ExitCode {
     let check = args.iter().any(|a| a == "-c" || a == "--check");
     if check {
         let (_, mut diags) =
-            oberon_front::check_module_recovering_dialect(&src, &[], dialect);
+            obc::check_module_recovering_dialect(&src, &[], dialect);
         let has_error = diags.iter().any(|d| d.is_error());
         report(&src, &mut diags);
         return if has_error {
@@ -156,15 +156,15 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         };
     }
-    match oberon_front::parse_module_dialect(&src, dialect) {
+    match obc::parse_module_dialect(&src, dialect) {
         Ok(m) => {
             println!("{m:#?}");
             ExitCode::SUCCESS
         }
         Err(e) => {
             // The same shape as any other diagnostic (DESIGN §10).
-            let d = oberon_front::diagnostic_for_parse_error(&e);
-            eprint!("{}", oberon_front::render_diagnostics(path, &src, &[d]));
+            let d = obc::diagnostic_for_parse_error(&e);
+            eprint!("{}", obc::render_diagnostics(path, &src, &[d]));
             ExitCode::FAILURE
         }
     }

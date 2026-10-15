@@ -26,7 +26,7 @@
 //! inner declaration shadows an outer one — a local variable named `Texts` is not
 //! the import alias, and a local `T` is not the type `T` (report §4; R17).
 
-use crate::ast::*;
+use syntax::ast::*;
 use std::collections::HashMap;
 
 /// One scope's bindings, by kind: only the two questions the pass asks are

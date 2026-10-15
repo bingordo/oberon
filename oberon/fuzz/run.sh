@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fuzz -- random Oberon-07 programs, each of which knows what it must compute.
 #
-# The generator (src/bin/obgen.rs) writes a module and the value every variable
+# The generator (crates/obc/src/bin/obgen.rs) writes a module and the value every variable
 # must have; the module ends with one check per variable, and a failing check
 # traps. So a seed fails if the compiler rejects a well-formed program, if the
 # emitted C does not compile under the documented build line, or if the program

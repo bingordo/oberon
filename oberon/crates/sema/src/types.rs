@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::BinOp;
+use syntax::ast::BinOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeId(pub u32);
@@ -622,8 +622,8 @@ impl Types {
 
     /// Unary `-` and `~` (report §8.2.1, §8.2.2, §8.2.3: a single SET operand
     /// makes `-` the complement; `+` is the identity on numerics).
-    pub fn unary_ok(&self, op: crate::ast::UnOp, t: TypeId) -> Result<(), &'static str> {
-        use crate::ast::UnOp::*;
+    pub fn unary_ok(&self, op: syntax::ast::UnOp, t: TypeId) -> Result<(), &'static str> {
+        use syntax::ast::UnOp::*;
         if self.is_error(t) {
             return Ok(());
         }
@@ -741,7 +741,7 @@ impl Types {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::UnOp;
+    use syntax::ast::UnOp;
 
     /// A record field for the type-algebra tests: the mark only matters across an
     /// interface, so these are public.

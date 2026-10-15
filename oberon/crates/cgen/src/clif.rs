@@ -38,16 +38,16 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module as ClifM
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::BinaryFormat;
 
-use crate::ast::{
+use syntax::ast::{
     BinOp, CaseArm, CaseLabel, Designator, Expr, ExprKind, Module, Proc, Selector, Span, Stmt,
     StmtKind, UnOp,
 };
 use crate::cgen::{self, mangle, span_of_type};
-use crate::const_eval;
+use sema::const_eval;
 use crate::layout::{Layout, Layouts};
-use crate::sema::{span_key, Sema};
-use crate::types::{Basic, Type, TypeId, Types};
-use crate::Diagnostic;
+use sema::sema::{span_key, Sema};
+use sema::types::{Basic, Type, TypeId, Types};
+use sema::Diagnostic;
 
 /// A procedure's frame: the region a nested procedure reaches its enclosing
 /// storage through (DESIGN §9.7, the C back end's `F_<path>` struct). Its first
@@ -2115,7 +2115,7 @@ impl<'a> Backend<'a> {
     /// The type a declaration's `TypeExpr` denotes: the semantic pass recorded
     /// every type expression by span, and this reads it the same way the C back
     /// end does.
-    fn decl_type(&self, t: &crate::ast::TypeExpr) -> TypeId {
+    fn decl_type(&self, t: &syntax::ast::TypeExpr) -> TypeId {
         self.sema
             .type_at(span_of_type(t), self.types)
             .unwrap_or(TypeId(0))
@@ -3700,10 +3700,10 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         } else {
             None
         };
-        let params: Vec<crate::types::Param> = match local {
+        let params: Vec<sema::types::Param> = match local {
             Some(formals) => formals
                 .iter()
-                .map(|f| crate::types::Param {
+                .map(|f| sema::types::Param {
                     by_var: f.by_var,
                     ty: f.ty,
                 })
@@ -3913,7 +3913,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// The `SYSTEM.<entry>` a designator names, if it names one (DESIGN §9.10):
     /// the import *alias* is what makes it an entry, so `IMPORT S := SYSTEM` works
     /// too, and there is no `SYSTEM.sym` to resolve.
-    fn system_entry<'d>(&self, base: &'d [crate::ast::Ident]) -> Option<&'d str> {
+    fn system_entry<'d>(&self, base: &'d [syntax::ast::Ident]) -> Option<&'d str> {
         if base.len() != 2 {
             return None;
         }
@@ -4614,7 +4614,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// The type a guard's or a type-`CASE` label's name denotes: a declaration of
     /// this module (a label cannot name another module's type — report §9.5's
     /// labels are the module's own).
-    fn qident_type(&self, q: &crate::ast::QIdent) -> Option<TypeId> {
+    fn qident_type(&self, q: &syntax::ast::QIdent) -> Option<TypeId> {
         if q.len() != 1 {
             return None;
         }

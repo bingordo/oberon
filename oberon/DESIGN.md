@@ -13,11 +13,11 @@ meant to be kept:
 
 | Artefact | What it is | Status |
 |---|---|---|
-| `src/bin/obgen.rs`, `fuzz/` | **A random program generator used as a self-checking oracle**: it writes a module *and* the value every variable must have (its own interpreter, so no circularity), and a mismatch traps in the module itself | 25 seeds run, 0 survived: it found three defects in the emitted C that the hand-written suites had missed (§13 R20) |
-| `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 55 tests pass, clippy clean |
-| `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
-| `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
-| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 26 checks pass; it found the emitter and checker bugs listed in §14 |
+| `crates/obc/src/bin/obgen.rs`, `fuzz/` | **A random program generator used as a self-checking oracle**: it writes a module *and* the value every variable must have (its own interpreter, so no circularity), and a mismatch traps in the module itself | 25 seeds run, 0 survived: it found three defects in the emitted C that the hand-written suites had missed (§13 R20) |
+| `.` (the four compiler crates) | The front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 81 tests pass, clippy clean |
+| `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 88 checks, 0 failures, 1 bug in the test spec itself (R11) |
+| `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**: `golden/Ob.h` and `golden/rt.h` `#include "../crates/cgen/src/oberon_h.inc"`, the file `cgen.rs` also `include_str!`s; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
+| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 126 checks pass, on both back ends — every row the C path passes, the Cranelift path passes too (§16); it found the emitter and checker bugs listed in §14 |
 
 Everything marked **[design]** below is not yet implemented; everything marked
 **[verified]** was executed in this repository (commands in §14).
@@ -77,7 +77,7 @@ lalrpop-util = { version = "0.23.1", features = ["lexer", "unicode"] }
 * `build.rs` is `lalrpop::process_src().unwrap()`; the generated parser lands in
   `OUT_DIR` and is included with `lalrpop_mod!(pub oberon);`.
 * We keep the **default** LR(1) construction (the lane-table algorithm). It
-  accepts the grammar in `src/oberon.lalrpop` with **zero conflicts**
+  accepts the grammar in `crates/syntax/src/oberon.lalrpop` with **zero conflicts**
   **[verified]**. The alternatives are worth knowing:
   * `#[LALR]` + `LALRPOP_LANE_TABLE=disabled` → the legacy LALR(1) tables.
     Deprecated upstream; we do not use it.
@@ -89,18 +89,24 @@ lalrpop-util = { version = "0.23.1", features = ["lexer", "unicode"] }
 ### Workspace layout
 
 ```
-Cargo.toml                 # workspace, pins lalrpop/lalrpop-util
-crates/syntax/             # lexer + grammar + syntax AST
-  src/lexer.rs
-  src/oberon.lalrpop
-  src/ast.rs
+Cargo.toml                 # workspace, pins lalrpop/lalrpop-util and the cranelift crates
+crates/syntax/             # lexer + grammar + syntax AST + diagnostics
+  src/{lib.rs,lexer.rs,ast.rs,diag.rs,oberon.lalrpop}  build.rs
 crates/sema/               # resolver, type checker, constant evaluator
-  src/sym.rs src/resolve.rs src/types.rs src/check.rs src/const_eval.rs
-crates/cgen/               # C emitter + runtime header
-  src/mangle.rs src/layout.rs src/emit.rs src/runtime.h
-crates/obc/                # CLI driver: obc build/run/emit/check (DESIGN §9.9)
+  src/{lib.rs,sym.rs,resolve.rs,types.rs,sema.rs,const_eval.rs}
+crates/cgen/               # C emitter, Cranelift back end + the emitted runtime
+  src/{lib.rs,cgen.rs,layout.rs,clif.rs,oberon_h.inc,oberon_runtime.inc}
+crates/obc/                # the driver and the generator: obc build/run/emit/check
+  src/lib.rs  src/bin/{obc.rs,obgen.rs,oberon-front.rs}
 tests/corpus/              # *.Mod with expected diagnostics / expected stdout
 ```
+
+Our file names are the ones that exist, not the earlier sketch of this block:
+the checker is `sema.rs` (the sketch's `check.rs`), the C emitter is `cgen.rs`
+(its `emit.rs`, and its `mangle.rs` folded into `cgen.rs`), the runtime is the
+`oberon_h.inc`/`oberon_runtime.inc` pair the emitter `include_str!`s (its
+`runtime.h`), and the second back end is `clif.rs`. The phase split is what the
+sketch fixes; the names are the divergence PLAN.md W4.3 records.
 
 The split is by *phase*, because each phase is testable on its own and the
 interfaces between them are three plain data types (syntax AST → resolved AST →
@@ -151,7 +157,7 @@ precedence blocks and regex `ignore` patterns. Two things make it unusable here:
   precedence to come out right, and the result would be a regex puzzle nobody
   wants to maintain.
 
-The scanner is 413 lines including documentation (`src/lexer.rs`
+The scanner is 413 lines including documentation (`crates/syntax/src/lexer.rs`
 **[verified]**), emits `Result<(usize, Token<'input>, usize), LexicalError>` — the
 `Spanned` shape LALRPOP expects from a custom lexer — and is plugged in with
 
@@ -224,7 +230,7 @@ Three consequences worth stating, each with what it costs:
 
 ## 5. Grammar
 
-`src/oberon.lalrpop` is a direct transcription of the report's appendix, with
+`crates/syntax/src/oberon.lalrpop` is a direct transcription of the report's appendix, with
 five changes to its productions (D1–D5) plus two decisions that shape the
 grammar without changing what it accepts as a correct program (D6, D7). Each
 change exists because the report's own grammar is not LR(1) at that point; each
@@ -308,7 +314,7 @@ document for users:
   The report does not define it either, so a diagnosed rejection is the honest
   behaviour.
 
-The rule is implemented in `src/resolve.rs` and executed by
+The rule is implemented in `crates/sema/src/resolve.rs` and executed by
 `tests::reclassify_splits_guards_calls_and_module_qualification`, which checks
 all four shapes (`t(T)` guard, `g(1)` call, `t(T).f` guard-then-field, `INC(x)`
 predeclared call) plus `tests::type_guard_and_call_share_one_production` and
@@ -600,12 +606,12 @@ Keeping two types is deliberate: phases that only re-annotate cannot silently
 change the tree, and the emitter can be written against a "nothing can fail"
 interface. The first three rows of that table are the *only* rewrites the
 resolver performs that change a node's shape, and they are all implemented in
-`src/resolve.rs`; the remaining work is attaching `TypeId`/`SymId`, which
+`crates/sema/src/resolve.rs`; the remaining work is attaching `TypeId`/`SymId`, which
 is annotation, not restructuring.
 
 ---
 
-## 7. Resolver: names, scopes, imports **[implemented in `src/sema.rs`]**
+## 7. Resolver: names, scopes, imports **[implemented in `crates/sema/src/sema.rs`]**
 
 Implemented, with the row numbers of §8.5 in each check's comments: the scope
 chain and the declaration order, type resolution with the report's single
@@ -681,7 +687,7 @@ also means an interface cannot drift into a syntax the compiler would not
 accept.
 
 Three details make the format unambiguous, and all three are exercised by the
-prototype codec in `src/sym.rs` **[verified]**:
+prototype codec in `crates/sema/src/sym.rs` **[verified]**:
 
 * a parameterless proper procedure is written `PROC WriteLn` with no
   parentheses at all, matching how the report lets it be called (report §9.2);
@@ -706,11 +712,11 @@ one place in the assignment checker, with a message that names the reason.
 
 ## 8. Semantics
 
-### 8.1 Type representation **[implemented in `src/types.rs`]**
+### 8.1 Type representation **[implemented in `crates/sema/src/types.rs`]**
 
 Types are interned into a `TypeId` so that equality is `u32` comparison for the
 structural kinds, and the report's *nominal* rules are implemented explicitly.
-All of it is executed by `src/types.rs` **[verified]**, which is
+All of it is executed by `crates/sema/src/types.rs` **[verified]**, which is
 deliberately AST-free — it takes `TypeId`s, so the checker, the folder and the
 back end's layout pass share one implementation of the rules:
 
@@ -773,7 +779,7 @@ requires both operands of `+ - * /` to be of the same type). This is the check
 most likely to annoy users coming from C, and the message says exactly what the
 report says.
 
-### 8.3 Constant evaluation **[implemented in `src/const_eval.rs`]**
+### 8.3 Constant evaluation **[implemented in `crates/sema/src/const_eval.rs`]**
 
 `const_eval` folds over the *syntax* AST with a small value domain
 (`Int(i32) | Real(f32) | Bool | Char | Str | Set(u32)`), and is used for exactly
@@ -874,7 +880,7 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 | 34 | `BY` increment not a constant, or equal to zero, or not an integer constant | §9.8 | E |
 
 **Status.** Rows 1-5 are the resolver's and 6-60 the checker's; both are
-implemented in `src/sema.rs` and driven by
+implemented in `crates/sema/src/sema.rs` and driven by
 `check_tests::catalogue_rows_report_what_they_should`, which has a case per row
 (each naming the row number, so a failure points at the rule; rows with two
 shapes have two cases). **Every row is checked**: field visibility across modules
@@ -957,7 +963,7 @@ per `Proc` node in pre-order, one file-scope declaration set per module, one
 `void <Module>__init(void)` for the module body. It performs no optimisation and
 no reordering beyond what the C compiler requires.
 
-### 9.1 Compilation model **[implemented in `src/cgen.rs`]**
+### 9.1 Compilation model **[implemented in `crates/cgen/src/cgen.rs`]**
 
 ```
 cc -std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror \
@@ -1282,7 +1288,7 @@ defining module), and exported procedure prototypes. Every module writes
 `Foo.h` and `Foo.sym`; the `.h` is for the C compiler that links the program,
 the `.sym` is for our own resolver (§7).
 
-### 9.9 The driver **[implemented in `src/bin/obc.rs`]**
+### 9.9 The driver **[implemented in `crates/obc/src/bin/obc.rs`]**
 
 ```
 obc check Foo.mod [-I DIR]...                   diagnostics only
@@ -1307,14 +1313,14 @@ obc run   Foo.mod [-I DIR]... [--command M.P] [--keep]
 * **Build directories.** Temporary by default (so `run` leaves nothing behind);
   `--out DIR` and `--keep` keep the generated C for inspection.
 
-### 9.10 Report §11.1's SYSTEM **[implemented in `src/cgen.rs`/`src/sema.rs`; `e2e`'s `system-*` rows run every entry, `csmoke`'s `system-*` cases execute the snippets]**
+### 9.10 Report §11.1's SYSTEM **[implemented in `crates/cgen/src/cgen.rs`/`crates/sema/src/sema.rs`; `e2e`'s `system-*` rows run every entry, `csmoke`'s `system-*` cases execute the snippets]**
 
 `IMPORT SYSTEM;` resolves to a **builtin** module (R5, `PLAN.md` W4.1): the
 compiler supplies report §11.1's entries, so no `SYSTEM.sym` is read and no
 `SYSTEM.mod` is compiled, and one on the search path is therefore *shadowed* —
 a user supply would be a different language, while a module that names SYSTEM in
 its import list must get the report's entries. The driver skips the import when
-it walks the graph (`src/bin/obc.rs`) and the emitter emits no
+it walks the graph (`crates/obc/src/bin/obc.rs`) and the emitter emits no
 `#include "SYSTEM.h"`; the emitted `.sym` *does* keep the import, so a client can
 see that the module it depends on is not portable. `IMPORT S := SYSTEM` works
 like any alias. **[verified]** by `e2e`'s `system-on-the-search-path-is-shadowed`
@@ -1474,22 +1480,22 @@ rather than a human's.
 | lexer | the near-miss table in §4 | unit tests on token streams **[exists]** |
 | parser | report examples, all statement/expression forms, guard/call unification, unqualified-vs-qualified names | parse tests asserting AST shape **[exists: 7 tests]** |
 | parser (negative) | syntax errors, illegal characters, unterminated strings/comments, and the *report's own* restriction that `RETURN` is not a statement | `unwrap_err` assertions **[exists]** |
-| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `src/lib.rs::diag_tests` **[exists: 18 tests]** |
+| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `crates/obc/src/lib.rs::diag_tests` **[exists: 18 tests]** |
 | error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `e2e` checks 10–13 **[exists]** |
-| resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `src/lib.rs` **[exists: 3 tests]** |
-| resolver + checker | one case per row of §8.5 (rows with two shapes have two cases), plus the report's `Out` module and the kitchen sink checking clean | `src/lib.rs::check_tests` **[exists: 5 tests]** |
+| resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `crates/obc/src/lib.rs` **[exists: 3 tests]** |
+| resolver + checker | one case per row of §8.5 (rows with two shapes have two cases), plus the report's `Out` module and the kitchen sink checking clean | `crates/obc/src/lib.rs::check_tests` **[exists: 5 tests]** |
 | diagnostic rendering | byte span → `line:col`, message text | `check_tests::diagnostics_carry_usable_spans` **[exists]** |
 | constant folder | `DIV`/`MOD`/shifts/sets fold identically to the runtime helpers | `golden/constexpr.tsv` cross-check **[exists: 52 expressions]** |
 | C emission | emitted C compiles with `-Wall -Wextra -Werror` and the program's stdout matches the expected output | `e2e` **[exists]** |
-| type algebra | identity, extension, assignment, parameter modes, operators, predeclared signatures | `src/types.rs` **[exists: 12 tests]** |
-| constant folder | all four folding contexts, plus agreement with the emitted C (`constexpr.tsv`, 52 expressions, produced by the C side from its own helpers) | `src/const_eval.rs` **[exists: 7 tests]** |
-| runtime helpers | §9.5's tricky mappings, the type-`CASE` switch, static links, parameter modes | `csmoke` **[exists: 67 cases]** |\n| the *emitted* runtime | the same vectors, compiled against `src/oberon_h.inc` itself rather than a hand-copy | `golden/rt.h` includes it **[exists]** |
+| type algebra | identity, extension, assignment, parameter modes, operators, predeclared signatures | `crates/sema/src/types.rs` **[exists: 12 tests]** |
+| constant folder | all four folding contexts, plus agreement with the emitted C (`constexpr.tsv`, 52 expressions, produced by the C side from its own helpers) | `crates/sema/src/const_eval.rs` **[exists: 7 tests]** |
+| runtime helpers | §9.5's tricky mappings, the type-`CASE` switch, static links, parameter modes | `csmoke` **[exists: 67 cases]** |\n| the *emitted* runtime | the same vectors, compiled against `crates/cgen/src/oberon_h.inc` itself rather than a hand-copy | `golden/rt.h` includes it **[exists]** |
 | whole-program shape | statement lowering of the report's procedures, module init, command table, exported interface, read-only exports | `golden` **[exists: 66 cases, plain + ASan/UBSan]** |
 | regressions found by review | one output line per defect found in the code review: integer `/`, CHAR ordinal order, folded constants, `CASE` ranges and multi-labels, record-copy descriptors, a local record as a `VAR` record parameter, open-array forwarding, a call through a record field, `PACK`/`UNPK`, `NEW` on a recursive type | `e2e/Regress.mod` + `regress.expected.txt` **[exists: 11 lines]** |
 | compile-only regressions | a recursive record type; Oberon identifiers that are C keywords; a *failing* guard Dtraps with its offset | `e2e/run.sh` checks 8 and 9 **[exists]** |
 | the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash e2e/run.sh` **[exists: 26 checks]** |
-| interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `src/sym.rs` **[exists: 3 tests]** |
-| random programs | the generator's fragment: `INTEGER` arithmetic, the four shift builtins, `IF`/`WHILE`/`REPEAT`/`FOR`/`CASE`, procedures and recursion, each program carrying its own expected values | `bash fuzz/run.sh` **[exists: `src/bin/obgen.rs`; in the gate — `fuzz/regressions.txt` names every seed that once found a defect, then a coverage block runs]** |
+| interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `crates/sema/src/sym.rs` **[exists: 3 tests]** |
+| random programs | the generator's fragment: `INTEGER` arithmetic, the four shift builtins, `IF`/`WHILE`/`REPEAT`/`FOR`/`CASE`, procedures and recursion, each program carrying its own expected values | `bash fuzz/run.sh` **[exists: `crates/obc/src/bin/obgen.rs`; in the gate — `fuzz/regressions.txt` names every seed that once found a defect, then a coverage block runs]** |
 | the seed corpus as a regression suite | each seed that once found a defect, kept in a fixed list with the reason it is there, then a block for coverage; a seed reproduces a program exactly on any machine | `fuzz/regressions.txt` + `bash fuzz/run.sh` **[exists: 9 listed seeds + 100 coverage seeds]** |
 | the *emitted* code under sanitizers | every generated program built with `-fsanitize=address,undefined -fno-sanitize-recover=all`, leak detection on, so a clean run is evidence about the code rather than about the program's arithmetic | `SAN=1 bash fuzz/run.sh` **[exists: 300 seeds clean, plus the regression list in every default run]** |
 | the trap paths, deliberately | each generated program ends with one violation that *must* trap (index past the end, NIL dereference, a guard that cannot hold, a computed zero divisor, a false assertion), and the run must produce the exact trap line — message *and* source byte — which the generator computes from the same render | `bash fuzz/run.sh` (`--adversarial`) **[exists: 200 seeds + the regression list]** |
@@ -1506,13 +1512,13 @@ runtime helpers in executable form.
 | # | deliverable | acceptance |
 |---|---|---|
 | M0 | lexer + grammar + syntax AST | parses the report's example modules and a module exercising every construct; no LALRPOP conflicts; **done, 10 tests green** |
-| M1 | resolver: scopes, imports, interface files, qualification fold, guard/args split, `end_name` | every well-formed module in the test corpus resolves; every §8.5 row in classes 1–5, 48 reported — **done**, `src/sema.rs`, with the report's `Out` module checking clean |
+| M1 | resolver: scopes, imports, interface files, qualification fold, guard/args split, `end_name` | every well-formed module in the test corpus resolves; every §8.5 row in classes 1–5, 48 reported — **done**, `crates/sema/src/sema.rs`, with the report's `Out` module checking clean |
 | M2 | checker + constant folder | all §8.5 rows implemented, each with a matching negative test — **done** except the four explicitly listed gaps in §8.5 (field visibility, one half of row 50, row 54's procedure half) |
-| M3 | C emitter for types, declarations, expressions, and the four control constructs; runtime header | `Out.Mod` compiles to C, compiles with `cc -Wall -Wextra -Werror`, and prints the same as a hand-written reference — **done**, `src/cgen.rs` + `e2e` |
+| M3 | C emitter for types, declarations, expressions, and the four control constructs; runtime header | `Out.Mod` compiles to C, compiles with `cc -Wall -Wextra -Werror`, and prints the same as a hand-written reference — **done**, `crates/cgen/src/cgen.rs` + `e2e` |
 | M4 | procedures, nested procedures, parameter modes, open arrays, `NEW`, `IS`/guards, type `CASE` | a corpus module with dynamic dispatch by `IS` runs correctly — **done**: `e2e/Torture.mod` exercises all of it, including a three-level nested procedure reaching an enclosing local |
 | M5 | modules, imports, commands, exported interface files | two-module program compiles and runs; the report's `Out`/client split works — **done**: the e2e suite compiles `Texts`, `Oberon`, the report's `Out` and `Torture`, and the compiler writes and reads the `.sym` files between them |
 | M6 | diagnostics pass, `-Ochecks`, golden tests | compiler is usable on a few thousand lines of Oberon-07 |
-| M7 | driver: import-graph resolution, loader generation, C invocation, run | `obc run Hello.mod` produces a runnable program; `obc run Torture.mod --command Torture.Run` matches the expected output — **done**, `src/bin/obc.rs` |
+| M7 | driver: import-graph resolution, loader generation, C invocation, run | `obc run Hello.mod` produces a runnable program; `obc run Torture.mod --command Torture.Run` matches the expected output — **done**, `crates/obc/src/bin/obc.rs` |
 
 The open work is itemised in `PLAN.md`, in the order it is worth doing, with the
 section or risk each item comes from.
@@ -1696,7 +1702,7 @@ test result: ok. 47 passed; 0 failed
   (declaration before `MODULE`, duplicate `MODULE`, `CONST` without `=`, `PROC`
   without `)`, and an inline `PROCEDURE (…)` parameter type).
 
-* The type algebra (`src/types.rs`, 12 tests) is where the report's
+* The type algebra (`crates/sema/src/types.rs`, 12 tests) is where the report's
   wording is densest, so each test is named after the rule it pins: pointer
   identity and extension following the base, record extension being reflexive,
   transitive and one-way, the four §9.1 assignment exceptions, the §10.1
@@ -1704,7 +1710,7 @@ test result: ok. 47 passed; 0 failed
   may be a *base* of the actual's), the operand rules of §8.2.1-§8.2.4, and the
   §10.2 signatures.
 
-* The constant folder (`src/const_eval.rs`, 7 tests) is checked twice: once
+* The constant folder (`crates/sema/src/const_eval.rs`, 7 tests) is checked twice: once
   against hand-written expectations, and once against the C back end's own
   helpers via `golden/constexpr.tsv` — 52 expressions whose values the C
   side computes with `rt_div`, `rt_mod`, `rt_lsl`, `rt_asr`, `rt_ror`, `rt_set`,
@@ -1727,7 +1733,7 @@ test result: ok. 47 passed; 0 failed
   Conflicts are hard errors in LALRPOP, so a successful build *is* the evidence.
 * The two conflict transcripts quoted in D3 and D4 were produced by the
   canonical LR(1) builder, which prints the competing parses.
-* `src/lib.rs::tests::parses_kitchen_sink` parses one module containing
+* `crates/obc/src/lib.rs::tests::parses_kitchen_sink` parses one module containing
   every construct of the report: all four declaration sections, all six type
   forms, all seven statement forms, sets with ranges, typed and scalar `CASE`,
   guards, `IS`, strings, hex integers, character constants, `VAR`/value/open-array
@@ -1871,7 +1877,7 @@ test result: ok. 47 passed; 0 failed
 * **The fixture that had drifted.** `golden` used to carry a private copy of
   the runtime helpers, and its `rt_charcmp` had already diverged from the emitted
   one — exactly the failure mode the review predicted. `rt.h` now *includes*
-  `src/oberon_h.inc`, so those vectors test the runtime the compiler ships; the
+  `crates/cgen/src/oberon_h.inc`, so those vectors test the runtime the compiler ships; the
   divergence showed up immediately as two failing cases, which is how it was
   found.
 * `csmoke` (`bash csmoke/run.sh`) covers the C rules of §9.5, §9.3
@@ -2146,7 +2152,7 @@ link mode), and whether any component outside these crates can emit DWARF.
 
 ### The prototype: a lowerer beside `cgen` **[implemented; `PLAN.md` W9.1]**
 
-`src/clif.rs` lowers the *same* checked AST and `sema` types `cgen` consumes, and
+`crates/cgen/src/clif.rs` lowers the *same* checked AST and `sema` types `cgen` consumes, and
 `obc --backend=clif` (default `c`) writes one object file per module instead of a
 translation unit and a header. The scope is the fuzz corpus's fragment: `INTEGER`
 and `BOOLEAN`, one-dimensional fixed arrays of them, `+ - * DIV MOD /`, `ABS`,
@@ -2258,7 +2264,7 @@ they take apart).
 ### The C ABI's layout, and the comparison that makes `cc` the authority **[implemented; `PLAN.md` W9.2a]**
 
 §16's corrected layout paragraph above is what this section implements:
-`src/layout.rs` computes, for the shapes this compiler emits, the size, the
+`crates/cgen/src/layout.rs` computes, for the shapes this compiler emits, the size, the
 alignment and each member's offset the way the C ABI does — because the C back end
 emits C structs and `cc` is what places their members. Four rules are decisions
 rather than arithmetic, and the comparison below is what settles each of them

@@ -28,10 +28,10 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::ast::{self, BinOp, CaseLabel, Expr, ExprKind, Module, QIdent, Selector, Span, Stmt, StmtKind, TypeExpr, UnOp};
-use crate::const_eval;
-use crate::sema::Sema;
-use crate::types::{Basic, Field, Param, Type, TypeId, Types};
+use syntax::ast::{self, BinOp, CaseLabel, Expr, ExprKind, Module, QIdent, Selector, Span, Stmt, StmtKind, TypeExpr, UnOp};
+use sema::const_eval;
+use sema::sema::Sema;
+use sema::types::{Basic, Field, Param, Type, TypeId, Types};
 
 /// `oberon.h`, emitted alongside the generated modules.
 pub const RUNTIME_HEADER: &str = include_str!("oberon_h.inc");
@@ -752,7 +752,7 @@ impl<'a> Emitter<'a> {
         let frame = format!("F_{}", mangle(&path));
 
         // The signature as the checker flattened it, and its procedure type.
-        let (pty, flat, result) = match self.sema.signatures.get(&crate::sema::span_key(p.span)) {
+        let (pty, flat, result) = match self.sema.signatures.get(&sema::sema::span_key(p.span)) {
             Some(sig) => (sig.ty, sig.params.clone(), sig.result),
             None => (TypeId(0), Vec::new(), None),
         };
@@ -2308,7 +2308,7 @@ impl<'a> Emitter<'a> {
             let ty = self
                 .sema
                 .call_types
-                .get(&crate::sema::span_key(d.span))
+                .get(&sema::sema::span_key(d.span))
                 .copied()
                 .unwrap_or(TypeId(0));
             (c, ty, 1usize, false)
@@ -2327,7 +2327,7 @@ impl<'a> Emitter<'a> {
             let ty = self.sema.type_at(d.span, self.types).unwrap_or(TypeId(0));
             (self.designator(&head, level, false), ty, level, false)
         };
-        let callee_ty = match self.sema.call_types.get(&crate::sema::span_key(d.span)) {
+        let callee_ty = match self.sema.call_types.get(&sema::sema::span_key(d.span)) {
             Some(t) => *t,
             None => callee_ty,
         };
@@ -2842,8 +2842,8 @@ impl<'a> Emitter<'a> {
     /// A constant as C, from the checker's folded value (DESIGN §9.2). This is
     /// the only place a constant becomes C, and it cannot disagree with the
     /// folder because it *is* the folder's answer.
-    fn const_cvalue(&self, v: &crate::const_eval::Const) -> String {
-        use crate::const_eval::Const as K;
+    fn const_cvalue(&self, v: &sema::const_eval::Const) -> String {
+        use sema::const_eval::Const as K;
         match v {
             K::Int(n) => format!("((int32_t){}u)", *n as u32),
             K::Real(r) => format!("((float){r:?}f)"),
@@ -2856,8 +2856,8 @@ impl<'a> Emitter<'a> {
 
     /// A constant as an interface file spells it: Oberon's own notation, since
     /// the reader parses these with the grammar (DESIGN §7).
-    fn const_render(v: &crate::const_eval::Const) -> String {
-        use crate::const_eval::Const as K;
+    fn const_render(v: &sema::const_eval::Const) -> String {
+        use sema::const_eval::Const as K;
         match v {
             K::Int(n) => n.to_string(),
             K::Real(r) => format!("{r:?}"),
@@ -2898,8 +2898,8 @@ impl<'a> Emitter<'a> {
             ExprKind::Char(c) => format!("((char){}u)", c),
             ExprKind::Bool(b) => if *b { "1".into() } else { "0".into() },
             ExprKind::Str(text) => format!("((const char *)\"{}\")", escape_c(text)),
-            ExprKind::Set(_) => match crate::const_eval::eval(e) {
-                Ok(crate::const_eval::Const::Set(bits)) => format!("((uint32_t){}u)", bits),
+            ExprKind::Set(_) => match sema::const_eval::eval(e) {
+                Ok(sema::const_eval::Const::Set(bits)) => format!("((uint32_t){}u)", bits),
                 _ => "0u".into(),
             },
             ExprKind::Unary(UnOp::Neg, x) => format!("(-({}))", self.const_value(x)),
@@ -2992,11 +2992,11 @@ impl<'a> Emitter<'a> {
 /// The interface of a checked module: what a client may refer to (DESIGN §7).
 /// Only exported objects are written, and an exported variable is read-only by
 /// the time a client sees it (report §11).
-pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> crate::sym::Interface {
+pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> sema::sym::Interface {
     let mut e = Emitter::new(module.name.clone(), types, sema);
     let mut wanted = Vec::new();
     e.collect_types(&module.decls, &mut wanted);
-    let mut iface = crate::sym::Interface {
+    let mut iface = sema::sym::Interface {
         module: module.name.clone(),
         imports: module.imports.iter().map(|i| i.module.clone()).collect(),
         items: Vec::new(),
@@ -3007,7 +3007,7 @@ pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> crate::s
                 Some((v, _)) => Emitter::const_render(v),
                 None => e.const_value(&c.value),
             };
-            iface.items.push(crate::sym::Item::Const {
+            iface.items.push(sema::sym::Item::Const {
                 name: c.name.clone(),
                 value,
             });
@@ -3016,7 +3016,7 @@ pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> crate::s
     for t in &module.decls.types {
         if t.export {
             let ty = e.decl_type(&t.ty);
-            iface.items.push(crate::sym::Item::Type {
+            iface.items.push(sema::sym::Item::Type {
                 name: t.name.clone(),
                 def: e.render_type_body(ty),
             });
@@ -3026,7 +3026,7 @@ pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> crate::s
         let ty = e.decl_type(&v.ty);
         for (name, export) in &v.names {
             if *export {
-                iface.items.push(crate::sym::Item::Var {
+                iface.items.push(sema::sym::Item::Var {
                     name: name.clone(),
                     ty: e.render_type(ty),
                 });
@@ -3037,11 +3037,11 @@ pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> crate::s
         if !p.export {
             continue;
         }
-        let (flat, result) = match sema.signatures.get(&crate::sema::span_key(p.span)) {
+        let (flat, result) = match sema.signatures.get(&sema::sema::span_key(p.span)) {
             Some(sig) => (sig.params.clone(), sig.result),
             None => (Vec::new(), None),
         };
-        iface.items.push(crate::sym::Item::Proc {
+        iface.items.push(sema::sym::Item::Proc {
             name: p.name.clone(),
             params: flat
                 .iter()
