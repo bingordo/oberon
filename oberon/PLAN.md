@@ -267,7 +267,7 @@ Only worth doing if build times become a complaint.
 
 ---
 
-## W5 — recovery beyond statements
+## W5 — error recovery
 
 **W5.1 declaration-level recovery** (§5 D7)
 Why: today a missing `;` between two `CONST` declarations produces one located
@@ -281,6 +281,63 @@ Two ways out, both outside the current grammar:
    expressions.
 Done when: a missing `;` in a declaration list still reports the errors *after*
 it, with a test that fails today.
+
+**W5.2 cascades, an error limit, and the baseline that pins them** — **the simple half, measured**
+Why: W5.1 is the *hard* half of recovery (LALR(1) will not let us resynchronise in
+declarations at all). The half that is cheap has never been measured, so here is
+the measurement — one small module per defect class, run through `obc check`
+today:
+
+| probe | diagnostics today | verdict |
+|---|---|---|
+| `TYPE T = Unknown; VAR a: T; BEGIN a := 1 END` | **1** | already right: the failed type poisons `a`, so the assignment says nothing |
+| `CONST c = Zz;` then `TYPE T = ARRAY c OF …`, plus two statements using `c` | **1** | already right, same reason |
+| `r.m := 1; r.k := 2; r.n := r.m` on a record without those fields | **3** | already right: one per missing field, and the read of `r.m` does **not** add a second error to its assignment |
+| one file with six defects (two `x := ;`, two uses of an undeclared `Zz`, plus clean statements) | **5** | right: no diagnostic is a *consequence* of the recovery, and the syntax errors do not hide the semantic ones |
+| **three uses of the same undeclared name** (`Zz := 1; Zz := 2; x := Zz`) | **3** | **fix: report the first use and note the rest** — this is the one repetition the checker still produces |
+| **sixty broken statements in one body** | **60** | **fix: an error limit** — nothing stops a flood |
+
+So the improvement is two small, boring changes, not a rearchitecture:
+
+1. *First-use suppression for a name.* A per-check set of names already reported
+   turns three diagnostics into one plus `further errors for "Zz" are
+   suppressed` — the phrasing every C compiler uses, and the reason R2/R3 style
+   floods happen at all. Cheap because the checker already has the name and the
+   span at that point.
+2. *An error limit.* `-ferror-limit N` (default 20, `0` meaning no limit),
+   counted where diagnostics are collected, with a final
+   `N more errors were suppressed` line. It must not change the exit code, must
+   not suppress warnings, and must not change anything below the limit.
+
+Deliberately *not* in this item, with why: declaration-level resynchronisation
+(W5.1 — the grammar cannot express it), a second parse pass to recover from a
+fatal module-level error (the one located message is honest and cheap), and any
+"reparse the tail" machinery (the probes above show the simple behaviour is
+already accurate).
+
+Test cases, which are half the point of the item:
+* a `recovery_tests` table in `oberon/src/lib.rs`, one row per probe above as
+  (source, expected diagnostics as `(line, column, kind)`), so every count in
+  that table becomes pinned: a future cascade or a lost diagnostic fails a test
+  rather than being noticed by hand. The two rows marked *fix* start as their
+  current counts and change when the fix lands.
+* `e2e` checks that assert a *ceiling* rather than an exact count for the messy
+  classes (the sixty-statement flood, the six-defect file), because the ceiling
+  is the property that matters.
+* the generator's second job (W6.1 already exists): inject exactly one defect
+  into a valid program — delete a `;`, replace an identifier with an undeclared
+  one, change a declaration's type — and assert four things: no panic, at least
+  one diagnostic, at most K diagnostics, and the *first* diagnostic within a few
+  lines of the injection. The last two are what a cascade would break.
+* tests that the poison behaviour named above is intentional, not incidental:
+  `ErrorType` must keep suppressing a follow-on error (R1/R4/R7 in the table are
+  those tests), and the limit must leave a below-limit run byte-identical.
+
+Done when: the table is pinned by tests, `-ferror-limit` exists and is tested in
+both CLIs, the defect-injection mode runs clean over a few hundred seeds, and
+DESIGN §10 states the policy — what is suppressed, the poison rule, and the
+limit's default — since that section currently describes only the rendering.
+
 
 ---
 
