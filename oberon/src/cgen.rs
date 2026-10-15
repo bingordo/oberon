@@ -112,6 +112,12 @@ pub struct Emitter<'a> {
     /// Non-zero while rendering the right operand of `&&` or `||`, whose value
     /// must not be computed unless the operand is reached.
     in_conditional: usize,
+    /// The result type of the procedure being emitted, and whether its body
+    /// returns anywhere: `RETURN` is a statement now (PLAN.md W8.4), and every
+    /// return in a procedure funnels through one site so that §5 D6's
+    /// single-exit property survives the change.
+    cur_ret: Option<TypeId>,
+    ret_label: bool,
     /// Runtime checks (DESIGN §9.4, PLAN.md W3.1). On by default; `-Ochecks=n`
     /// removes the index, `NIL` and guard checks and the type-`CASE` fallback, so
     /// a violation becomes the program's problem instead of a located trap. The
@@ -158,6 +164,8 @@ impl<'a> Emitter<'a> {
             prelude: String::new(),
             anon: 0,
             in_conditional: 0,
+            cur_ret: None,
+            ret_label: false,
         }
     }
 
@@ -602,6 +610,7 @@ impl<'a> Emitter<'a> {
     // ----------------------------------------------------------- procedures
 
     fn procedure(&mut self, p: &ast::Proc, out: &mut String) {
+        let (outer_ret, outer_label) = (self.cur_ret, self.ret_label);
         let level = self.frames.len() + 1;
         let path = match self.frames.last() {
             Some(f) if level > 1 => format!("{}__{}", f.path, p.name),
@@ -802,15 +811,28 @@ impl<'a> Emitter<'a> {
         for q in &p.decls.procs {
             self.procedure(q, &mut nested);
         }
+        self.cur_ret = result;
+        self.ret_label = false;
+        if let Some(want) = result {
+            // The one place a function's value leaves from, and zero-initialised
+            // so that a path which does not return yields a defined value rather
+            // than whatever the frame held.
+            let decl = self.binding(want, "ret__acc");
+            let _ = writeln!(out, "    {decl};");
+            let _ = writeln!(out, "    memset(&ret__acc, 0, sizeof(ret__acc));");
+        }
         for s in &p.body {
             self.stmt(s, out, level);
         }
-        if let (Some(want), Some(e)) = (result, &p.ret) {
-            let v = self.expr(e, Some(want));
-            let pre = self.take_prelude();
-            out.push_str(&pre);
-            let _ = writeln!(out, "    return {v};");
+        if self.ret_label {
+            if result.is_some() {
+                let _ = writeln!(out, "    ret: return ret__acc;");
+            } else {
+                let _ = writeln!(out, "    ret: return;");
+            }
         }
+        self.cur_ret = outer_ret;
+        self.ret_label = outer_label;
         let _ = writeln!(out, "}}");
         out.push_str(&nested);
 
@@ -998,6 +1020,25 @@ impl<'a> Emitter<'a> {
                 out.push_str(&pre);
                 let _ = writeln!(out, "        if ({c}) break;");
                 let _ = writeln!(out, "    }}");
+            }
+            // `EXIT` (PLAN.md W8.5): C's `break` leaves the innermost loop, which
+            // is what every emitted loop is — a `for (;;)` with its guards inside,
+            // or a C `for` for the counted one — so no bookkeeping is needed.
+            StmtKind::Exit => {
+                let _ = writeln!(out, "    break;");
+            }
+            // Every return goes through the procedure's single exit: the value is
+            // left in the accumulator and control jumps to the one place that
+            // returns it (§5 D6, PLAN.md W8.4).
+            StmtKind::Return(e) => {
+                self.ret_label = true;
+                if let (Some(e), Some(want)) = (e, self.cur_ret) {
+                    let v = self.expr(e, Some(want));
+                    let pre = self.take_prelude();
+                    out.push_str(&pre);
+                    let _ = writeln!(out, "    ret__acc = {v};");
+                }
+                let _ = writeln!(out, "    goto ret;");
             }
             StmtKind::For { var, from, to, by, body } => {
                 let v = self.designator_name(var, level);

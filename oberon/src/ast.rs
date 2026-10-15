@@ -128,7 +128,6 @@ pub struct Proc {
     pub decls: Decls,
     pub body: Vec<Stmt>,
     /// Oberon-07 allows exactly one `RETURN expr`, at the end of the body.
-    pub ret: Option<Expr>,
     /// The identifier repeated after `END`; must equal `name`.
     pub end_name: Ident,
     /// The span of the *name* (and its export mark), which is what a diagnostic
@@ -187,6 +186,10 @@ pub enum StmtKind {
         body: Vec<Stmt>,
         until: Expr,
     },
+    /// `EXIT` (PLAN.md W8.5): leave the innermost loop.
+    Exit,
+    /// `RETURN [Expr]` (PLAN.md W8.4): leave the body, with a value in a function.
+    Return(Option<Expr>),
     For {
         var: Ident,
         from: Expr,

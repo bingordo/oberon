@@ -513,7 +513,12 @@ mod tests {
         // `OPEN: ARRAY OF CHAR` is one open array of CHAR.
         assert_eq!(walk.params[2].ty.open, 1);
         assert_eq!(walk.params[2].ty.base, vec!["CHAR"]);
-        assert!(walk.ret.is_none());
+        // `RETURN` is a statement now (W8.4), so what this pins is that the body
+        // has none — the report's tail clause was optional too.
+        assert!(walk
+            .body
+            .iter()
+            .all(|s| !matches!(s.kind, StmtKind::Return(_))));
 
         // The `t(CenterNode)` type guard parses as a designator selector whose
         // single "argument" is a bare designator naming a type; the semantic
@@ -803,6 +808,12 @@ END M.
                         walk_expr(value, g, c, a);
                     }
                     StmtKind::Call(d) => walk_desig(d, g, c, a),
+                    StmtKind::Exit => {}
+                    StmtKind::Return(e) => {
+                        if let Some(e) = e {
+                            walk_expr(e, g, c, a);
+                        }
+                    }
                     StmtKind::If { arms, els } => {
                         for (cond, b) in arms {
                             walk_expr(cond, g, c, a);
@@ -1819,7 +1830,7 @@ BEGIN Use END M.\n";
             (43, "MODULE M; TYPE R = RECORD x: INTEGER; x: REAL END; BEGIN END M.", "field `x` is declared twice"),
             (44, "MODULE M; TYPE P = POINTER TO INTEGER; BEGIN END M.", "base type of a pointer must be a record"),
             (45, "MODULE M; TYPE R = RECORD END; P = PROCEDURE (): R; BEGIN END M.", "result type of a procedure may not be a record"),
-            (46, "MODULE M; PROCEDURE F(): INTEGER; BEGIN END F; BEGIN END M.", "must end with a RETURN clause"),
+            (46, "MODULE M; PROCEDURE F(): INTEGER; BEGIN END F; BEGIN END M.", "must contain a RETURN clause"),
             (46, "MODULE M; PROCEDURE P; BEGIN RETURN 1 END P; BEGIN END M.", "may not return a value"),
             (47, "MODULE M; PROCEDURE P; BEGIN END Q; BEGIN END M.", "identifier after END is `Q`"),
             (48, "MODULE M; PROCEDURE P; VAR x*: INTEGER; BEGIN END P; BEGIN END M.", "export mark is only allowed at module scope"),

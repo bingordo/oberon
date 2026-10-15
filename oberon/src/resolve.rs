@@ -193,9 +193,6 @@ fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyErro
     for s in &mut p.body {
         reclassify_stmt(s, names)?;
     }
-    if let Some(r) = &mut p.ret {
-        reclassify_expr(r, names)?;
-    }
     names.pop();
     Ok(())
 }
@@ -227,6 +224,12 @@ fn reclassify_stmt(s: &mut Stmt, names: &mut Names) -> Result<(), ReclassifyErro
             reclassify_expr(value, names)
         }
         StmtKind::Call(d) => reclassify_designator(d, names),
+        // `EXIT` has nothing to reclassify (PLAN.md W8.5).
+        StmtKind::Exit => Ok(()),
+        StmtKind::Return(e) => match e {
+            Some(e) => reclassify_expr(e, names),
+            None => Ok(()),
+        },
         StmtKind::If { arms, els } => {
             for (c, b) in arms {
                 reclassify_expr(c, names)?;

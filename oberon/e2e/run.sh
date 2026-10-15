@@ -647,6 +647,39 @@ printf 'MODULE Two;\n  VAR i: INTEGER;\nBEGIN\n  CASE i OF 1: i := 1 | ELSE i :=
 "$OBC" check "$DRV/Two.mod" >"$DRV/two.out" 2>&1 || true
 check "two-case-defaults-are-refused" "1" "$(grep -c 'two default arms' "$DRV/two.out")"
 
+# `EXIT` (W8.5) leaves the innermost loop of every form, and `RETURN` (W8.4) is a
+# statement: early, from inside a `CASE`, and naked in a proper procedure.
+runs_case exit-and-early-return 'MODULE Ctl;
+  VAR i, k: INTEGER; ok: ARRAY 1 OF INTEGER;
+  PROCEDURE f(x: INTEGER): INTEGER;
+  BEGIN
+    IF x < 0 THEN RETURN 0 END;
+    CASE x OF 1: RETURN 10 | 2: RETURN 20 END;
+    RETURN 7
+  END f;
+  PROCEDURE stop(n: INTEGER);
+  BEGIN
+    IF n > 3 THEN RETURN END;
+    IF n < 0 THEN ok[1] := 0 END
+  END stop;
+BEGIN
+  k := 0;
+  FOR i := 0 TO 9 DO IF i = 3 THEN EXIT END; k := k + 1 END;
+  IF k # 3 THEN ok[1] := 0 END;
+  WHILE TRUE DO EXIT END;
+  REPEAT k := k + 1; EXIT UNTIL TRUE;
+  IF k # 4 THEN ok[1] := 0 END;
+  IF f(-5) # 0 THEN ok[1] := 0 END;
+  IF f(1) # 10 THEN ok[1] := 0 END;
+  IF f(5) # 7 THEN ok[1] := 0 END;
+  stop(4); stop(1)
+END Ctl.
+'
+# `EXIT` outside a loop has no loop to leave.
+printf 'MODULE Lost;\nBEGIN\n  EXIT\nEND Lost.\n' > "$DRV/Lost.mod"
+"$OBC" check "$DRV/Lost.mod" >"$DRV/lost.out" 2>&1 || true
+check "exit-outside-a-loop-is-refused" "1" "$(grep -c 'only allowed inside a loop' "$DRV/lost.out")"
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

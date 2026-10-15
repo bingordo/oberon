@@ -180,6 +180,14 @@ pub struct Sema<'a> {
     interfaces: &'a [Interface],
     /// Control variables of enclosing `FOR` loops (report §9.8).
     locked: Vec<String>,
+    /// How many loops enclose the statement being checked: `EXIT` outside one
+    /// has no loop to leave (PLAN.md W8.5).
+    loop_depth: usize,
+    /// The result type of the procedure being checked, and whether its body has
+    /// returned: a function must contain a `RETURN` with a value, a proper
+    /// procedure must not (PLAN.md W8.4).
+    cur_result: Option<TypeId>,
+    saw_return: bool,
     /// Names that were looked up, so an unused import can be reported.
     used: Vec<String>,
     /// Procedures this unit declares: id, name, the span to point at, and
@@ -243,6 +251,9 @@ impl<'a> Sema<'a> {
             diags: Vec::new(),
             interfaces,
             locked: Vec::new(),
+            loop_depth: 0,
+            cur_result: None,
+            saw_return: false,
             used: Vec::new(),
             declared_procs: Vec::new(),
             used_procs: Vec::new(),
@@ -1360,37 +1371,26 @@ impl<'a> Sema<'a> {
             );
         }
         self.decls(&p.decls, false);
+        // ✔ row 46, as W8.4 relaxes it: a function must *contain* a RETURN clause
+        // rather than end with one, now that `RETURN` is a statement — while every
+        // return still funnels through one site in the emitter (§5 D6).
+        let (outer_result, outer_saw) = (self.cur_result, self.saw_return);
+        self.cur_result = result;
+        self.saw_return = false;
         for s in &p.body {
             self.stmt(s);
         }
-        // ✔ row 46: a function must end with RETURN; a proper procedure must not.
-        match (result, &p.ret) {
-            (Some(want), Some(e)) => {
-                let got = self.expr(e);
-                if !self.types.is_assignable(want, got.ty) {
-                    self.error(
-                        e.span,
-                        "the type of the RETURN expression does not match the result type \
-                         (report 10)",
-                    );
-                }
-            }
-            (Some(_), None) => self.error(
+        if result.is_some() && !self.saw_return {
+            self.error(
                 p.span,
                 format!(
-                    "function procedure `{}` must end with a RETURN clause (report 10)",
+                    "function procedure `{}` must contain a RETURN clause (report 10)",
                     p.name
                 ),
-            ),
-            (None, Some(e)) => self.error(
-                e.span,
-                format!(
-                    "`{}` is a proper procedure: it may not return a value (report 10)",
-                    p.name
-                ),
-            ),
-            (None, None) => {}
+            );
         }
+        self.cur_result = outer_result;
+        self.saw_return = outer_saw;
         self.pop_scope();
     }
 
@@ -2616,18 +2616,51 @@ impl<'a> Sema<'a> {
                     if !self.types.is_bool(v.ty) && !self.types.is_error(v.ty) {
                         self.error(c.span, "the guard of a WHILE must be a BOOLEAN (report 9.6)");
                     }
+                    self.loop_depth += 1;
                     for s in b {
                         self.stmt(s);
                     }
+                    self.loop_depth -= 1;
                 }
             }
             StmtKind::Repeat { body, until } => {
+                self.loop_depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_depth -= 1;
                 let v = self.expr(until);
                 if !self.types.is_bool(v.ty) && !self.types.is_error(v.ty) {
                     self.error(until.span, "the UNTIL condition must be a BOOLEAN (report 9.7)");
+                }
+            }
+            // ✔ W8.5: `EXIT` leaves the innermost loop, so it needs one.
+            StmtKind::Exit => {
+                if self.loop_depth == 0 {
+                    self.error(s.span, "EXIT is only allowed inside a loop (W8.5)");
+                }
+            }
+            StmtKind::Return(e) => {
+                self.saw_return = true;
+                match (e, self.cur_result) {
+                    (Some(e), Some(want)) => {
+                        let got = self.expr(e);
+                        if !self.types.is_assignable(want, got.ty) {
+                            self.error(
+                                e.span,
+                                "the type of the RETURN expression does not match the result \
+                                 type (report 10)",
+                            );
+                        }
+                    }
+                    (Some(e), None) => {
+                        let _ = self.expr(e);
+                        self.error(s.span, "a proper procedure may not return a value (report 10)");
+                    }
+                    (None, Some(_)) => {
+                        self.error(s.span, "a function must RETURN a value (report 10)")
+                    }
+                    (None, None) => {}
                 }
             }
             StmtKind::For {
@@ -2678,9 +2711,11 @@ impl<'a> Sema<'a> {
                     }
                 }
                 self.locked.push(var.clone());
+                self.loop_depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.locked.pop();
             }
             StmtKind::Case { subject, arms } => self.case_stmt(s, subject, arms),

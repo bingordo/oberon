@@ -50,6 +50,7 @@ extern {
         "WHILE"     => Token::While,
         "DO"        => Token::Do,
         "REPEAT"    => Token::Repeat,
+        "EXIT"      => Token::Exit,
         "UNTIL"     => Token::Until,
         "FOR"       => Token::For,
         "BY"        => Token::By,
@@ -198,7 +199,7 @@ ProcDeclSemi: Proc = <p:ProcDecl> ";" => p;
 /// `ProcedureDeclaration = ProcedureHeading ";" ProcedureBody ident`
 ProcDecl: Proc = {
     <lo:@L> "PROCEDURE" <nlo:@L> <id:IdentDef> <nhi:@R> <fp:FormalParameters?> ";" <decls:Declarations>
-        <body:BeginClause> <ret:ReturnClause> "END" <end_name:Ident> <hi:@R> => {
+        <body:BeginClause> "END" <end_name:Ident> <hi:@R> => {
             let (params, result) = match fp {
                 Some(f) => (f.params, f.result),
                 None => (Vec::new(), None),
@@ -211,18 +212,10 @@ ProcDecl: Proc = {
                 result,
                 decls,
                 body,
-                ret,
                 end_name,
                 span: sp(lo, hi),
             }
         },
-};
-
-/// `[RETURN expression]`: Oberon-07 has at most one return, and it terminates
-/// the body.  That makes every procedure a single-exit region in the backend.
-ReturnClause: Option<Expr> = {
-    => None,
-    "RETURN" <e:Expr> => Some(e),
 };
 
 IdentList: Vec<(Ident, bool)> = <first:IdentDef> <rest:IdentDefTail*> => {
@@ -322,6 +315,8 @@ Statement: Option<Stmt> = {
     <s:WhileStmt> => Some(s),
     <s:RepeatStmt> => Some(s),
     <s:ForStmt> => Some(s),
+    <s:ExitStmt> => Some(s),
+    <s:ReturnStmt> => Some(s),
     // Recovery (DESIGN §5 D7): a statement the parser cannot accept becomes an
     // empty one, and the parser skips input until it can continue — at the next
     // `;`, in practice. The recovery is recorded, not swallowed, so one run can
@@ -356,6 +351,15 @@ WhileStmt: Stmt = <lo:@L> "WHILE" <cond:Expr> "DO" <body:StatementSequence> <arm
     Stmt::new(StmtKind::While { arms: v }, sp(lo, hi))
 };
 WhileElsif: (Expr, Vec<Stmt>) = "ELSIF" <cond:Expr> "DO" <body:StatementSequence> => (cond, body);
+
+/// `RETURN [Expr]` (PLAN.md W8.4). It was report §10's tail clause, reachable only
+/// at the end of a body; as a statement it can leave from inside a `CASE`, and the
+/// emitter still funnels every return through one site (DESIGN §5 D6).
+ReturnStmt: Stmt = <lo:@L> "RETURN" <e:Expr?> <hi:@R> => Stmt::new(StmtKind::Return(e), sp(lo, hi));
+
+/// `EXIT` (PLAN.md W8.5): leave the innermost loop. It is a statement of its own
+/// rather than a `LOOP` companion, since `WHILE TRUE` already spells the loop.
+ExitStmt: Stmt = <lo:@L> "EXIT" <hi:@R> => Stmt::new(StmtKind::Exit, sp(lo, hi));
 
 RepeatStmt: Stmt = <lo:@L> "REPEAT" <body:StatementSequence> "UNTIL" <cond:Expr> <hi:@R> => Stmt::new(
     StmtKind::Repeat { body, until: cond },

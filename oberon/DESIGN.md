@@ -353,7 +353,7 @@ keyword), so no duplicate derivation exists.
 `StatementSequence` exist only so the star/tail idioms read uniformly; they have
 no counterpart in the report and none in the AST.
 
-### D6 — `RETURN` is not a statement **[verified]**
+### D6 — `RETURN` is a statement, and every return leaves by one door **[revised in W8.4]**
 
 Report §9's `statement` list does **not** contain `RETURN`; §10 puts it at the
 end of `ProcedureBody`:
@@ -362,11 +362,22 @@ end of `ProcedureBody`:
 ProcedureBody = DeclarationSequence [BEGIN StatementSequence] [RETURN expression] END.
 ```
 
-We transcribe that literally. The prototype consequently *rejects* an Oberon
-program that returns from the middle of a `CASE` **[verified]** — that is the
-report's rule, not a bug, and it buys the back end a guarantee worth having:
-**every procedure body has a single exit point**, so the C emitter never needs to
-synthesise a result variable with multiple assignment sites.
+The first transcription of this design took that literally, and described what it
+bought: **every procedure body has a single exit point**. What it cost was real,
+though — a procedure could not return from inside a `CASE` — and the guarantee was
+the *only* thing the literal reading was for. So `RETURN [Expr]` is a statement now
+(PLAN.md W8.4), and the guarantee is kept by construction instead: a procedure with
+a result has one accumulator (`ret__acc`, zero-initialised so that a path which does
+not return yields a defined value) and one exit (`ret: return ret__acc;`), and every
+`RETURN` is `ret__acc = …; goto ret;`. A proper procedure's `RETURN` is the same
+jump to a bare `return`. The report's tail clause is therefore gone from the
+grammar, and with it the one place the two forms could have been told apart by
+lookahead.
+
+The check relaxes the same way: a function must *contain* a `RETURN` with a value
+rather than end with one, a proper procedure may not return a value, and a naked
+`RETURN` in a function is an error. The single-*exit* property is unchanged; what
+changed is that it is the emitter's doing rather than the grammar's.
 
 ### D7 — error handling and recovery **[implemented; limits found by conflict]**
 
@@ -844,7 +855,8 @@ is added or removed by `-Ochecks`" half of row 60 is `csmoke`'s
 | 43 | field declared twice inside one record | §6.3 | E |
 | 44 | pointer base type is not a record | §6.4 | E |
 | 45 | procedure type/declaration with a record or array result type | §10.1 | E |
-| 46 | `RETURN` in a proper procedure, or missing in a function procedure | §10 | E |
+| 46 | `RETURN` with a value in a proper procedure, a naked `RETURN` in a function, or a function whose body contains no `RETURN` at all (W8.4) | §10 | E |
+| 64 | `EXIT` outside any loop, which has no loop to leave (W8.5) | W8.5 | E |
 | 47 | procedure end identifier ≠ procedure name | §10 | E |
 | 48 | export mark outside module scope, or on a formal parameter | §4 | E |
 | 49 | procedure without parameters declared as `PROCEDURE F()` but called as `F(x)` (and vice versa) | §10.1 | E |
@@ -1536,9 +1548,12 @@ or self-inconsistent and a compiler has to choose once and then be consistent:
    exit code, and the suites' clean modules import nothing unused.
 11. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
    and assignment per §9.1.2), but is not an integer operand.
-13. **Two additive extensions, on by default** (`PLAN.md` W8.1, W8.2). `CASE … ELSE`
-    and `MIN(T)`/`MAX(T)` are not report Oberon-07, and they are adopted rather
-    than gated. The rule that decides which extensions may be: an extension that
+13. **Four additive extensions, on by default** (`PLAN.md` W8.1, W8.2, W8.4, W8.5).
+    `CASE … ELSE`, `MIN(T)`/`MAX(T)`, `EXIT` and `RETURN` as a statement are not
+    report Oberon-07, and they are adopted rather than gated — `ELSE`, `RETURN` and
+    `EXIT` are keywords the report already reserves or that no report program may
+    use as an identifier once reserved, and `MIN`/`MAX` are predeclared names a
+    program can shadow. The rule that decides which extensions may be: an extension that
     *only adds* — a report program cannot be affected by it — may be on by default,
     while one that changes how existing text tokenises or resolves needs a dialect
     switch (W8.10 is the case in point, since the report makes capital and

@@ -92,6 +92,8 @@ pub enum Token<'input> {
     Real(f64),
     StrLit(String),
     CharLit(u8),
+    /// `EXIT` (PLAN.md W8.5).
+    Exit,
 
     Module,
     Import,
@@ -213,6 +215,7 @@ const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("ELSE", Token::Else),
     ("ELSIF", Token::Elsif),
     ("END", Token::End),
+    ("EXIT", Token::Exit),
     ("FALSE", Token::False),
     ("FOR", Token::For),
     ("IF", Token::If),

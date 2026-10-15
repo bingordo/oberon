@@ -27,7 +27,9 @@ jobs:
         run: bash oberon/csmoke/run.sh
       - name: e2e
         run: bash oberon/e2e/run.sh
-      - name: fuzz (regression list, traps, sanitizers, coverage)
+      - name: fuzz (the regression list as a value and a trap oracle, plus coverage)
         run: bash oberon/fuzz/run.sh
+      - name: fuzz under the sanitizers (the slower half, so it is its own step)
+        run: SAN=1 COVER=25 bash oberon/fuzz/run.sh
       - name: clippy
         run: cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings

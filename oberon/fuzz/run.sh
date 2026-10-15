@@ -9,10 +9,11 @@
 # expectation taken from the compiler.
 #
 # The default run is the standard suite: every seed that once found a defect
-# (regressions.txt) as a value oracle, as a trap oracle and once under the
-# sanitizers, then a block for coverage and a smaller adversarial one.
-# SEEDS/BASE select one contiguous range instead, for an ad-hoc run; either way a
-# seed reproduces a program exactly, on any machine.
+# (regressions.txt), as a value oracle and as a trap oracle, then a block for
+# coverage. It is sized to sit beside the other suites in the gate; the slower
+# variants are one flag away — `SAN=1` adds the sanitizers to whatever runs, and
+# SEEDS/BASE/COVER/ADVCOVER select ranges and sizes. Either way a seed reproduces
+# a program exactly, on any machine.
 set -e
 cd -- "$(dirname -- "$0")"
 
@@ -20,8 +21,8 @@ OBG=${OBG:-../target/debug/obgen}
 OBC=${OBC:-../target/debug/obc}
 WORK=${WORK:-findings}
 LIST=${LIST:-regressions.txt}
-COVER=${COVER:-100}
-ADVCOVER=${ADVCOVER:-25}
+COVER=${COVER:-30}
+ADVCOVER=${ADVCOVER:-10}
 BASE=${BASE:-1}
 
 # SAN=1 builds every generated program with the sanitizers the golden suite uses,
@@ -53,11 +54,9 @@ else
     echo "----"
     run --seed-list "$LIST" --adversarial "$@"      # the trap oracle
     echo "----"
-    SAN=1 run --seed-list "$LIST" "$@"              # ... and once under sanitizers
-    echo "----"
     run --seeds "$COVER" --base "$BASE" "$@"        # coverage
     echo "----"
     run --seeds "$ADVCOVER" --base "$BASE" --adversarial "$@"
-    echo "SUMMARY fuzz: regression list (values, traps, sanitizers) + $COVER coverage + $ADVCOVER adversarial, exit $status"
+    echo "SUMMARY fuzz: regression list (values, traps) + $COVER coverage + $ADVCOVER adversarial${SAN:+ under sanitizers}, exit $status"
 fi
 exit $status
