@@ -1,0 +1,33 @@
+# The gate of PLAN.md / README.md, run on a clean checkout: unit tests, the three
+# hand-written suites, the generated corpus, and clippy at -D warnings. The golden
+# suite builds its programs twice, the second time under ASan/UBSan, so the C
+# toolchain here must have the sanitizers (gcc on ubuntu-latest does); the e2e
+# suite additionally builds one program with clang when it is present.
+name: gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: build (the suites drive target/debug/obc and obgen)
+        run: cargo build --manifest-path oberon/Cargo.toml
+      - name: unit tests
+        run: cargo test --manifest-path oberon/Cargo.toml
+      - name: golden (plain and under sanitizers)
+        run: bash oberon/golden/run.sh
+      - name: csmoke
+        run: bash oberon/csmoke/run.sh
+      - name: e2e
+        run: bash oberon/e2e/run.sh
+      - name: fuzz (regression list, traps, sanitizers, coverage)
+        run: bash oberon/fuzz/run.sh
+      - name: clippy
+        run: cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings

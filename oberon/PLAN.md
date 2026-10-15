@@ -248,12 +248,18 @@ exclusive so neither can report it twice. Both are covered: the e2e keeps
 `an-unrelated-refused-interface-is-not-reported` beside
 `a-refused-interface-that-is-needed-is-explained`.
 
-**W3.3 continuous integration**
+**W3.3 continuous integration** — **done**
 Why: there is no `.github/` and no CI; the gate is currently a human habit.
 Done when: a workflow runs the four suites on a clean checkout, with a C
 compiler that has ASan/UBSan (the golden suite runs plain *and* sanitised; `CC`
 overrides the default gcc) and a Rust toolchain no older than the one
-`Cargo.lock` pins.
+`Cargo.lock` pins. **Done**: `.github/workflows/gate.yml` runs the list on
+`ubuntu-latest` — a build step first, because the suites drive
+`target/debug/obc` — then unit tests, golden (plain and sanitised), csmoke, e2e,
+fuzz (regression list, traps, sanitizers, coverage) and clippy at `-D warnings`.
+Every command in it passes on this machine, which is the evidence available here;
+the YAML is parsed, and the one thing a clean runner has that this machine does
+not is a *fresh* gcc, which is also why `CC` is respected throughout.
 
 **W3.4 README at the repository root** — **done**
 Why: the only entry point is DESIGN.md inside the crate; a reader arriving at

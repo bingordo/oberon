@@ -1276,6 +1276,10 @@ Mix.mod:4:8: error: unexpected `;`
 
 ## 11. Testing strategy
 
+The same commands run on a clean checkout in CI (`.github/workflows/gate.yml`),
+in the order PLAN.md and README.md list them, so "the gate" is a machine's habit
+rather than a human's.
+
 | level | what it covers | how |
 |---|---|---|
 | lexer | the near-miss table in §4 | unit tests on token streams **[exists]** |

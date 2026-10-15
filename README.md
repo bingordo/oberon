@@ -40,6 +40,8 @@ bash oberon/fuzz/run.sh        # the seeds that once found a defect, then 100 mo
 cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings
 ```
 
+That list is what CI runs (`.github/workflows/gate.yml`), on a clean checkout.
+
 `bash oberon/fuzz/run.sh` runs `oberon/fuzz/regressions.txt` — every seed that once
 found a defect, each with the reason it is listed — and then a coverage block;
 `SEEDS`/`BASE` select one contiguous range instead. A seed reproduces a random
