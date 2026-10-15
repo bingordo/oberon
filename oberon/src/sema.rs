@@ -11,7 +11,7 @@
 //! `SELF_HOSTING` (bottom of the file) checks this pass on the report's own
 //! modules, and `tests` covers the negative cases row by row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     self, CaseLabel, Expr, ExprKind, FormalParams, Module, QIdent, Selector, Span, Stmt, StmtKind,
@@ -392,6 +392,27 @@ impl<'a> Sema<'a> {
         self.scopes.last().and_then(|s| s.names.get(name)).cloned()
     }
 
+    /// The type a qualified name denotes, resolved *without* reporting: the
+    /// type-`CASE` arm view asks this question and the label check is what
+    /// reports, so asking twice must not say the same thing twice.
+    fn type_of_qual_silent(&mut self, q: &QIdent) -> Option<TypeId> {
+        if q.len() == 1 {
+            return match self.lookup(&q[0]) {
+                Some(Sym::Type(t)) => Some(t),
+                _ => None,
+            };
+        }
+        if q.len() != 2 {
+            return None;
+        }
+        let idx = match self.lookup(&q[0]) {
+            Some(Sym::Module(i)) => i,
+            _ => return None,
+        };
+        let env = self.interface_env(idx, Span::default());
+        env.get(&q[1]).copied()
+    }
+
     /// ✔ row 1: report §4, every identifier must be declared or predefined.
     fn lookup_qual(&mut self, q: &QIdent, span: Span) -> Option<Sym> {
         if q.len() == 1 {
@@ -757,12 +778,14 @@ impl<'a> Sema<'a> {
     /// with the interface it came from, so a field access through one can be
     /// checked against the field's public mark.
     fn mark_imported(&mut self, t: TypeId, module_idx: usize) {
-        let mut guard = 0;
+        // A recursive type (`POINTER TO Node` inside `Node`) would otherwise spin
+        // here until a depth guard cut the walk off, leaving the records it had
+        // not reached yet unmarked — a small legal type, not a deep input.
+        let mut seen: HashSet<TypeId> = HashSet::new();
         let mut stack = vec![t];
         while let Some(t) = stack.pop() {
-            guard += 1;
-            if guard > 256 {
-                return;
+            if !seen.insert(t) {
+                continue;
             }
             match self.types.get(t).clone() {
                 Type::Record { base, fields, .. } => {
@@ -1597,12 +1620,12 @@ impl<'a> Sema<'a> {
                             // an interface is an error — unless the type came
                             // from this module, which is the same check because
                             // only imported types are recorded (§6.3).
-                            if let Some(idx) = self.imported_types.get(&rec).copied() {
-                                let private = self
-                                    .types
-                                    .get(rec)
-                                    .clone();
-                                if let Type::Record { fields, .. } = private {
+                            let decl = self.types.field_decl(rec, f).map(|(d, _)| d);
+                            if let Some(idx) = decl
+                                .and_then(|d| self.imported_types.get(&d).copied())
+                            {
+                                let declaring = self.types.get(decl.expect("checked above")).clone();
+                                if let Type::Record { fields, .. } = declaring {
                                     if fields.iter().any(|field| {
                                         field.name == *f && !field.export
                                     }) {
@@ -2281,13 +2304,7 @@ impl<'a> Sema<'a> {
                 labels.iter().find_map(|l| match &l.lo {
                     // Silent on purpose: `lookup_qual` reports an undeclared
                     // name, and the label check below is the place that does.
-                    CaseLabel::Named(q) if q.len() == 1 => {
-                        match self.lookup(&q[0]) {
-                            Some(Sym::Type(t)) => Some(t),
-                            _ => None,
-                        }
-                    }
-                    CaseLabel::Named(_) => None,
+                    CaseLabel::Named(q) => self.type_of_qual_silent(q),
                     _ => None,
                 })
             });

@@ -331,6 +331,28 @@ impl Types {
     /// Field lookup, searching the record and then its base types. The most
     /// derived declaration wins, which is what "the scope of field identifiers
     /// is the record definition itself" implies for an extension (§6.3).
+    /// A field's type *and* the record that declares it: for an inherited field
+    /// that is the base's declaration, which is the one whose export mark counts
+    /// (report §6.3).
+    pub fn field_decl(&self, mut t: TypeId, name: &str) -> Option<(TypeId, TypeId)> {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > self.types.len() {
+                return None;
+            }
+            match self.get(t) {
+                Type::Record { base, fields, .. } => {
+                    if let Some(f) = fields.iter().find(|f| f.name == name) {
+                        return Some((t, f.ty));
+                    }
+                    t = (*base)?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
     pub fn field(&self, mut t: TypeId, name: &str) -> Option<TypeId> {
         let mut guard = 0;
         loop {

@@ -847,6 +847,48 @@ END M.
 }
 
     #[test]
+    fn an_inherited_private_field_and_a_qualified_label_behave() {
+        // Three defects found by review of the visibility rule, all in one place.
+        let iface = sym::parse(
+            "MODULE M\nTYPE Base = RECORD secret: INTEGER END\nTYPE Node = RECORD child*: RECORD hidden: INTEGER END; next*: POINTER TO Node END\nTYPE DerivedPtr = POINTER TO Derived\nTYPE Derived = RECORD (Base) extra*: INTEGER END\n",
+        )
+        .unwrap();
+
+        // (a) an inherited private field cannot be reached through a *local*
+        //     derived record: the mark that counts is the declaring record's.
+        let src = "MODULE C; IMPORT M; TYPE D = RECORD (M.Base) END; VAR d: D;\nBEGIN d.secret := 1 END C.\n";
+        let (_, diags) = check_module_recovering(src, std::slice::from_ref(&iface));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`secret` is private to module `M`")),
+            "{:#?}",
+            render_diagnostics("C.mod", src, &diags)
+        );
+
+        // (b) a record nested in a recursive imported type is still marked: the
+        //     walk used to spin on the pointer and leave `child` unvisited.
+        let src = "MODULE C; IMPORT M; VAR n: M.Node;\nBEGIN n.child.hidden := 1 END C.\n";
+        let (_, diags) = check_module_recovering(src, std::slice::from_ref(&iface));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`hidden` is private to module `M`")),
+            "{:#?}",
+            render_diagnostics("C.mod", src, &diags)
+        );
+
+        // (c) a *qualified* type-CASE label still narrows the arm.
+        let src = "MODULE C; IMPORT M; VAR p: POINTER TO M.Base;\nBEGIN CASE p OF M.DerivedPtr: p.extra := 1 END END C.\n";
+        let (_, diags) = check_module_recovering(src, std::slice::from_ref(&iface));
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "{}",
+            render_diagnostics("C.mod", src, &diags)
+        );
+    }
+
+    #[test]
     fn a_private_field_of_an_imported_record_cannot_be_named() {
         // ✔ rows 4 and 14, the private-field halves: a field declared without the
         // report's `*` is private to its module (report §6.3), and the mark
