@@ -429,7 +429,7 @@ It is mechanical because the phase interfaces are three plain data types, and it
 pays off when a phase grows — `syntax` is the only crate that may know LALRPOP.
 Done when: the four crates exist with the same tests and suites green.
 
-**W4.4 a `.sym`-only fast path** — *proposed, not from the design* — **measured; the condition has not fired**
+**W4.4 a `.sym`-only fast path** — **deferred, measured** (the condition it waits for has not fired)
 Why: `obc build` has no up-to-date check (nothing in the driver looks at
 timestamps), so every module of the import graph is re-checked on each run. A
 timestamped interface would skip the front end for unchanged modules.
@@ -1079,7 +1079,7 @@ the suites or the target programs needs them, and the reference compilers' own
 something different from what an Oberon programmer expects. Revisit with a program
 that needs one, and then as a dialect (DESIGN §13 decision 13).
 
-**W8.7 the escape hatch's scope** — *feeds W4.1*
+**W8.7 the escape hatch's scope** — **recorded; consumed by W4.1**, which is done
 Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`, `COND`, `REG`, `LDREG`, `LDPSR`, `LED`, `ADC`, `SBC`, `UML`; VOC adds `INT8`…`INT64`, `SET32`/`SET64`, `ADDRESS`; AntKrotov adds `GET8/16/32`, `PUT8/16/32`, `SADR`, `WSADR`, `MOVE`, `TYPEID`, `CODE` and, on STM32, `WCHAR`/`WCHR`. Decision to take in W4.1: the report's portable five, plus the *sized* accessors (`GET8/16/32`, `PUT8/16/32`) because a byte-address model needs them, while register/PSR/`LED`/`CODE`/`WCHAR` are target-specific and stay refused by name.
 
 **W8.8 what the survey says to reject** — **recorded; closed**
