@@ -1215,6 +1215,33 @@ BEGIN Outer END M.\n";
     }
 
     #[test]
+    fn a_constant_index_out_of_range_warns_and_still_traps() {
+        // PLAN.md W7.2: a constant index the compiler can see is out of range is
+        // a mistake worth naming, but the run-time check stays (report §8.1
+        // leaves bounds checking to the implementation), so the warning must not
+        // replace it.
+        let src = "MODULE M;\n  CONST k = 7;\n  VAR a: ARRAY 4 OF INTEGER; i: INTEGER;\nBEGIN\n  a[10] := 1;\n  a[(-1)] := 2;\n  a[k] := 3;\n  a[i] := 4;\n  a[3] := 5\nEND M.\n";
+        let (text, diags) = report(src);
+        let warnings: Vec<String> = diags
+            .iter()
+            .filter(|d| !d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(warnings.len(), 3, "{text}");
+        assert!(warnings[0].contains("the index is 10, but this dimension has 4"), "{warnings:?}");
+        assert!(warnings[1].contains("the index is -1"), "{warnings:?}");
+        assert!(warnings[2].contains("the index is 7"), "{warnings:?}");
+        assert!(diags.iter().all(|d| !d.is_error()), "{text}");
+
+        // The trap is still there for every index, constants included.
+        let c = match emit_c(src, &[]) {
+            Ok(Ok((c, _h))) => c,
+            other => panic!("expected emitted C: {other:?}"),
+        };
+        assert_eq!(c.matches("rt_index(").count(), 5, "{c}");
+    }
+
+    #[test]
     fn an_uncalled_procedure_warns_and_a_used_one_does_not() {
         // ✔ row 54, the other half: the report has no way to mark a procedure as
         // deliberately unused. A call, a use as a value, an exported procedure
@@ -1430,6 +1457,20 @@ PROC Append(p: Writer; b: Buffer)\n"),
             .filter(|d| !d.is_error())
             .map(|d| d.message)
             .collect()
+    }
+
+    #[test]
+    fn a_procedure_name_stays_visible_for_the_rest_of_its_scope() {
+        // The other half of the declaration-order rule (report §4): a procedure's
+        // name is visible to the declarations after it and to the body — here a
+        // procedure named like a *predefined* type shadows it for both, so
+        // `Take(INTEGER)` passes the procedure, not the type.
+        let src = "MODULE M;\n  TYPE F = PROCEDURE;\n\
+  PROCEDURE Take(f: F); BEGIN END Take;\n\
+  PROCEDURE INTEGER;\n  BEGIN\n  END INTEGER;\n\
+BEGIN\n  Take(INTEGER)\nEND M.\n";
+        let e = errors(src, &[]);
+        assert!(e.is_empty(), "`INTEGER` denotes the procedure here: {e:#?}");
     }
 
     #[test]

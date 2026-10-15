@@ -52,6 +52,13 @@ impl Names {
     fn pop(&mut self) {
         self.scopes.pop();
     }
+    /// Bind a name in the scope currently open — a procedure's own name, which
+    /// its later siblings and the enclosing body can see.
+    fn declare_here(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), Kind::Other);
+        }
+    }
     /// The innermost binding of `name`, so an inner declaration shadows an outer.
     fn lookup(&self, name: &str) -> Option<Kind> {
         self.scopes
@@ -112,10 +119,12 @@ fn decl_bindings(d: &Decls, scope: &mut HashMap<String, Kind>) {
 /// Rewrites `Selector::Args` into `Selector::Call` or `Selector::Guard`, and
 /// folds a leading module qualifier into the designator's base.
 pub fn reclassify(m: &mut Module, names: &mut Names) -> Result<(), ReclassifyError> {
-    for s in &mut m.body {
-        reclassify_stmt(s, names)?;
-    }
+    // Declarations first, in order, each procedure's name entering the module's
+    // scope as its declaration is reached (report §4): a procedure is then
+    // visible to the ones declared after it and to the module body, and not to
+    // the ones before it.
     for p in &mut m.decls.procs {
+        names.push(entry(&p.name));
         reclassify_proc(p, names)?;
     }
     for v in &mut m.decls.vars {
@@ -124,7 +133,16 @@ pub fn reclassify(m: &mut Module, names: &mut Names) -> Result<(), ReclassifyErr
     for t in &mut m.decls.types {
         reclassify_type_expr(&mut t.ty, names)?;
     }
+    // The body can now see every procedure.
+    for s in &mut m.body {
+        reclassify_stmt(s, names)?;
+    }
     Ok(())
+}
+
+/// One binding, for a name that is not a type and not a module alias.
+fn entry(name: &str) -> HashMap<String, Kind> {
+    std::iter::once((name.to_string(), Kind::Other)).collect()
 }
 
 fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyError> {
@@ -138,12 +156,9 @@ fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyErro
     }
     decl_bindings(&p.decls, &mut scope);
     names.push(scope);
-    for s in &mut p.body {
-        reclassify_stmt(s, names)?;
-    }
-    if let Some(r) = &mut p.ret {
-        reclassify_expr(r, names)?;
-    }
+    // Nested declarations first, and each nested procedure's name enters *this*
+    // scope as its declaration is reached, so its siblings after it see it while
+    // the ones before it do not (report §4).
     for c in &mut p.decls.consts {
         reclassify_expr(&mut c.value, names)?;
     }
@@ -154,15 +169,17 @@ fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyErro
         reclassify_type_expr(&mut t.ty, names)?;
     }
     for q in &mut p.decls.procs {
-        // Report §4: a declaration is visible from where it stands, so a
-        // procedure sees the siblings declared *before* it and not the ones
-        // after — and a later sibling of the same name as a type must not shadow
-        // that type for an earlier body.
-        let entry: HashMap<String, Kind> =
-            std::iter::once((q.name.clone(), Kind::Other)).collect();
-        names.push(entry);
+        let qname = q.name.clone();
+        names.declare_here(&qname);
         reclassify_proc(q, names)?;
-        names.pop();
+    }
+    // The body last: by now it can see every declaration of this scope, including
+    // the nested procedures.
+    for s in &mut p.body {
+        reclassify_stmt(s, names)?;
+    }
+    if let Some(r) = &mut p.ret {
+        reclassify_expr(r, names)?;
     }
     names.pop();
     Ok(())

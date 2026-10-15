@@ -181,7 +181,12 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
 
     // 1. Interfaces already on the search path (hand-written modules such as
     //    Texts and Oberon ship one with their C).
-    let mut interfaces = find_interfaces(o);
+    let (mut interfaces, refused) = find_interfaces(o);
+    // Say what could not be read before the check runs, so a version mismatch is
+    // not reported as a missing module (PLAN.md W3.2).
+    for r in &refused {
+        eprintln!("obc: {r}");
+    }
 
     // 2. Emit the module and everything it imports, depth first.
     let mut units: Vec<Unit> = Vec::new();
@@ -389,8 +394,13 @@ fn write_runtime(o: &Opts) -> Result<(), String> {
     write(&o.out.join("oberon_runtime.c"), cgen::RUNTIME_SOURCE)
 }
 
-fn find_interfaces(o: &Opts) -> Vec<sym::Interface> {
+fn find_interfaces(o: &Opts) -> (Vec<sym::Interface>, Vec<String>) {
     let mut found: Vec<sym::Interface> = Vec::new();
+    // An interface the loader cannot read is not the same as a missing one: it
+    // exists, and saying *why* it was refused (a version this compiler does not
+    // read, say) is the difference between "recompile that module" and "there is
+    // no such module" (PLAN.md W3.2).
+    let mut refused: Vec<String> = Vec::new();
     for dir in &o.search {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
@@ -401,15 +411,18 @@ fn find_interfaces(o: &Opts) -> Vec<sym::Interface> {
                 continue;
             }
             if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Ok(i) = sym::parse(&text) {
-                    if !found.iter().any(|f| f.module == i.module) {
-                        found.push(i);
+                match sym::parse(&text) {
+                    Ok(i) => {
+                        if !found.iter().any(|f| f.module == i.module) {
+                            found.push(i);
+                        }
                     }
+                    Err(e) => refused.push(format!("{}: {e}", p.display())),
                 }
             }
         }
     }
-    found
+    (found, refused)
 }
 
 fn find_file(o: &Opts, name: &str) -> Option<PathBuf> {
