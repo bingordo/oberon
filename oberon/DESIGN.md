@@ -1,18 +1,22 @@
 # Oberon-07 → C: front end and back end design
 
 Target language: **Oberon-07 as defined by *The Programming Language Oberon*, N. Wirth,
-revision 1.10.2013 / 3.5.2016** (`books/Oberon07.Report.pdf`, cited below as *report §n*).
+revision 1.10.2013 / 3.5.2016** (`../books/Oberon07.Report.pdf`, cited below as *report §n*).
+Paths in this document are relative to its own directory, the repository's
+`oberon/` crate.
+
 Parser generator: **LALRPOP** (0.23.1), used for the full concrete syntax.
 Output: **C11**, one translation unit per Oberon module, compiled by the host `cc`.
 
-Three artefacts in this repository back the claims below and are meant to be kept:
+The crate and the three suites below back the claims in this document and are
+meant to be kept:
 
 | Artefact | What it is | Status |
 |---|---|---|
-| `oberon/` | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 47 tests pass, clippy clean |
-| `oberon/csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
-| `oberon/golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
-| `oberon/e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 24 checks pass; it found the emitter and checker bugs listed in §14 |
+| `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 47 tests pass, clippy clean |
+| `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
+| `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
+| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 24 checks pass; it found the emitter and checker bugs listed in §14 |
 
 Everything marked **[design]** below is not yet implemented; everything marked
 **[verified]** was executed in this repository (commands in §14).
@@ -66,7 +70,7 @@ lalrpop-util = { version = "0.23.1", features = ["lexer", "unicode"] }
 * `build.rs` is `lalrpop::process_src().unwrap()`; the generated parser lands in
   `OUT_DIR` and is included with `lalrpop_mod!(pub oberon);`.
 * We keep the **default** LR(1) construction (the lane-table algorithm). It
-  accepts the grammar in `oberon/src/oberon.lalrpop` with **zero conflicts**
+  accepts the grammar in `src/oberon.lalrpop` with **zero conflicts**
   **[verified]**. The alternatives are worth knowing:
   * `#[LALR]` + `LALRPOP_LANE_TABLE=disabled` → the legacy LALR(1) tables.
     Deprecated upstream; we do not use it.
@@ -78,18 +82,17 @@ lalrpop-util = { version = "0.23.1", features = ["lexer", "unicode"] }
 ### Workspace layout
 
 ```
-oberon/
-  Cargo.toml                 # workspace, pins lalrpop/lalrpop-util
-  crates/syntax/             # lexer + grammar + syntax AST
-    src/lexer.rs
-    src/oberon.lalrpop
-    src/ast.rs
-  crates/sema/               # resolver, type checker, constant evaluator
-    src/sym.rs src/resolve.rs src/types.rs src/check.rs src/const_eval.rs
-  crates/cgen/               # C emitter + runtime header
-    src/mangle.rs src/layout.rs src/emit.rs src/runtime.h
-  crates/obc/                # CLI driver: obc build/run/emit/check (DESIGN §9.9)
-  tests/corpus/              # *.Mod with expected diagnostics / expected stdout
+Cargo.toml                 # workspace, pins lalrpop/lalrpop-util
+crates/syntax/             # lexer + grammar + syntax AST
+  src/lexer.rs
+  src/oberon.lalrpop
+  src/ast.rs
+crates/sema/               # resolver, type checker, constant evaluator
+  src/sym.rs src/resolve.rs src/types.rs src/check.rs src/const_eval.rs
+crates/cgen/               # C emitter + runtime header
+  src/mangle.rs src/layout.rs src/emit.rs src/runtime.h
+crates/obc/                # CLI driver: obc build/run/emit/check (DESIGN §9.9)
+tests/corpus/              # *.Mod with expected diagnostics / expected stdout
 ```
 
 The split is by *phase*, because each phase is testable on its own and the
@@ -141,7 +144,7 @@ precedence blocks and regex `ignore` patterns. Two things make it unusable here:
   precedence to come out right, and the result would be a regex puzzle nobody
   wants to maintain.
 
-The scanner is 413 lines including documentation (`oberon/src/lexer.rs`
+The scanner is 413 lines including documentation (`src/lexer.rs`
 **[verified]**), emits `Result<(usize, Token<'input>, usize), LexicalError>` — the
 `Spanned` shape LALRPOP expects from a custom lexer — and is plugged in with
 
@@ -182,7 +185,7 @@ mechanism, which is why §5 records the (deliberate) choice to fail fast in v1.
 
 ## 5. Grammar
 
-`oberon/src/oberon.lalrpop` is a direct transcription of the report's appendix,
+`src/oberon.lalrpop` is a direct transcription of the report's appendix,
 with five changes. Each change exists because the report's own grammar is not
 LR(1) at that point; each is stated with the evidence that forced it.
 
@@ -253,7 +256,7 @@ document for users:
   The report does not define it either, so a diagnosed rejection is the honest
   behaviour.
 
-The rule is implemented in `oberon/src/resolve.rs` and executed by
+The rule is implemented in `src/resolve.rs` and executed by
 `tests::reclassify_splits_guards_calls_and_module_qualification`, which checks
 all four shapes (`t(T)` guard, `g(1)` call, `t(T).f` guard-then-field, `INC(x)`
 predeclared call) plus `tests::type_guard_and_call_share_one_production` and
@@ -488,12 +491,12 @@ Keeping two types is deliberate: phases that only re-annotate cannot silently
 change the tree, and the emitter can be written against a "nothing can fail"
 interface. The first three rows of that table are the *only* rewrites the
 resolver performs that change a node's shape, and they are all implemented in
-`oberon/src/resolve.rs`; the remaining work is attaching `TypeId`/`SymId`, which
+`src/resolve.rs`; the remaining work is attaching `TypeId`/`SymId`, which
 is annotation, not restructuring.
 
 ---
 
-## 7. Resolver: names, scopes, imports **[implemented in `oberon/src/sema.rs`]**
+## 7. Resolver: names, scopes, imports **[implemented in `src/sema.rs`]**
 
 Implemented, with the row numbers of §8.5 in each check's comments: the scope
 chain and the declaration order, type resolution with the report's single
@@ -568,7 +571,7 @@ also means an interface cannot drift into a syntax the compiler would not
 accept.
 
 Three details make the format unambiguous, and all three are exercised by the
-prototype codec in `oberon/src/sym.rs` **[verified]**:
+prototype codec in `src/sym.rs` **[verified]**:
 
 * a parameterless proper procedure is written `PROC WriteLn` with no
   parentheses at all, matching how the report lets it be called (report §9.2);
@@ -593,11 +596,11 @@ one place in the assignment checker, with a message that names the reason.
 
 ## 8. Semantics
 
-### 8.1 Type representation **[implemented in `oberon/src/types.rs`]**
+### 8.1 Type representation **[implemented in `src/types.rs`]**
 
 Types are interned into a `TypeId` so that equality is `u32` comparison for the
 structural kinds, and the report's *nominal* rules are implemented explicitly.
-All of it is executed by `oberon/src/types.rs` **[verified]**, which is
+All of it is executed by `src/types.rs` **[verified]**, which is
 deliberately AST-free — it takes `TypeId`s, so the checker, the folder and the
 back end's layout pass share one implementation of the rules:
 
@@ -660,7 +663,7 @@ requires both operands of `+ - * /` to be of the same type). This is the check
 most likely to annoy users coming from C, and the message says exactly what the
 report says.
 
-### 8.3 Constant evaluation **[implemented in `oberon/src/const_eval.rs`]**
+### 8.3 Constant evaluation **[implemented in `src/const_eval.rs`]**
 
 `const_eval` folds over the *syntax* AST with a small value domain
 (`Int(i32) | Real(f32) | Bool | Char | Str | Set(u32)`), and is used for exactly
@@ -754,7 +757,7 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 | 34 | `BY` increment not a constant, or equal to zero, or not an integer constant | §9.8 | E |
 
 **Status.** Rows 1-5 are the resolver's and 6-54 the checker's; both are
-implemented in `oberon/src/sema.rs` and driven by
+implemented in `src/sema.rs` and driven by
 `check_tests::catalogue_rows_report_what_they_should`, which has a case per row
 (each naming the row number, so a failure points at the rule). Four things are
 *not* checked yet, listed here rather than implied: field **visibility** across
@@ -817,7 +820,7 @@ per `Proc` node in pre-order, one file-scope declaration set per module, one
 `void <Module>__init(void)` for the module body. It performs no optimisation and
 no reordering beyond what the C compiler requires.
 
-### 9.1 Compilation model **[implemented in `oberon/src/cgen.rs`]**
+### 9.1 Compilation model **[implemented in `src/cgen.rs`]**
 
 ```
 cc -std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror \
@@ -910,7 +913,7 @@ failing program says `foo.Mod:41: index 12 out of range 0..9`.
 
 The complete set of helpers the emitter may reference — this is the whole runtime
 interface. Every one of them has an executor in this repository
-(`oberon/csmoke`, `oberon/golden`, or both), except `rt_new`, whose allocation the
+(`csmoke`, `golden`, or both), except `rt_new`, whose allocation the
 fixtures stub out; `rt_trap` is exercised as a trap *counter* rather than a
 process abort, which is what makes the trap rule testable at all.
 
@@ -921,7 +924,7 @@ process abort, which is what makes the trap rule testable at all.
 | `rt_in` | `int32_t (uint32_t, int32_t)` | `x IN s` |
 | `rt_set` | `uint32_t (int32_t, int32_t)` | `{a .. b}` |
 | `rt_strcopy` | `void (char *dst, int32_t n, const char *src)` | string literal → `CHAR` array (pads) |
-| | | *(`rt_charcopy` and `rt_charcmp` are executed in `oberon/golden`, the rest of the table in `oberon/csmoke`)* |
+| | | *(`rt_charcopy` and `rt_charcmp` are executed in `golden`, the rest of the table in `csmoke`)* |
 | `rt_charcopy` | `void (char *dst, int32_t n, const char *src, int32_t m)` | `CHAR` array → `CHAR` array (no padding) |
 | `rt_charcmp` | `int32_t (const char *, int32_t, const char *, int32_t)` | `CHAR` array relations (bounded) |
 | `rt_is` | `int32_t (const ObDesc *, const ObDesc *)` | `IS` |
@@ -975,7 +978,7 @@ consistently to `y < 0`. Two hazards were found and are handled:
 | `IF … ELSIF … ELSE … END` | `if (…) { … } else if (…) { … } else { … }` |
 | `WHILE g1 DO S1 ELSIF g2 DO S2 END` | `for (;;) { if (g1) {S1} else if (g2) {S2} else break; }` (report §9.6: repeat until no guard is true) |
 | `REPEAT S UNTIL c` | `do { S } while (!(c));` |
-| `FOR v := b TO e BY k DO S END` | `for (v = b; k > 0 ? v <= e : v >= e; v += k) { S }` — equal to the report's while-form for every `k != 0`, and `k == 0` is rejected by check 34 (`oberon/golden` checks all five range shapes against the desugared form) |
+| `FOR v := b TO e BY k DO S END` | `for (v = b; k > 0 ? v <= e : v >= e; v += k) { S }` — equal to the report's while-form for every `k != 0`, and `k == 0` is rejected by check 34 (`golden` checks all five range shapes against the desugared form) |
 | `CASE c OF … END` (scalar) | `switch (c)` with one `case` per label and ranges flattened to consecutive labels |
 | `CASE v OF T1: S1 \| … END` (type case) | `switch (RT_DESC(v)->id)` + arm-local cast |
 
@@ -1036,7 +1039,7 @@ were checked against it for positive, negative, non-dividing and empty ranges
 
   A host that wants to call an exported *parameterized* procedure links against
   `Out.h` and calls `Out__Write(ch)` directly, where the prototype gives it the
-  right type. Verified end to end by the `command-*` cases in `oberon/golden`
+  right type. Verified end to end by the `command-*` cases in `golden`
   (dispatch by name for `WriteLn`, an unknown name and an unknown module both
   failing, and a parameterized procedure reached through `Out.h` rather than
   through the table).
@@ -1050,7 +1053,7 @@ defining module), and exported procedure prototypes. Every module writes
 `Foo.h` and `Foo.sym`; the `.h` is for the C compiler that links the program,
 the `.sym` is for our own resolver (§7).
 
-### 9.9 The driver **[implemented in `oberon/src/bin/obc.rs`]**
+### 9.9 The driver **[implemented in `src/bin/obc.rs`]**
 
 ```
 obc check Foo.mod [-I DIR]...                   diagnostics only
@@ -1134,24 +1137,24 @@ Mix.mod:4:8: error: unexpected `;`
 | lexer | the near-miss table in §4 | unit tests on token streams **[exists]** |
 | parser | report examples, all statement/expression forms, guard/call unification, unqualified-vs-qualified names | parse tests asserting AST shape **[exists: 7 tests]** |
 | parser (negative) | syntax errors, illegal characters, unterminated strings/comments, and the *report's own* restriction that `RETURN` is not a statement | `unwrap_err` assertions **[exists]** |
-| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `oberon/src/lib.rs::diag_tests` **[exists: 10 tests]** |
-| error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `oberon/e2e` checks 10–13 **[exists]** |
-| resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `oberon/src/lib.rs` **[exists: 3 tests]** |
-| resolver + checker | one case per row of §8.5 (55 cases), plus the report's `Out` module and the kitchen sink checking clean | `oberon/src/lib.rs::check_tests` **[exists: 5 tests, 55 catalogue cases]** |
+| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `src/lib.rs::diag_tests` **[exists: 10 tests]** |
+| error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `e2e` checks 10–13 **[exists]** |
+| resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `src/lib.rs` **[exists: 3 tests]** |
+| resolver + checker | one case per row of §8.5 (55 cases), plus the report's `Out` module and the kitchen sink checking clean | `src/lib.rs::check_tests` **[exists: 5 tests, 55 catalogue cases]** |
 | diagnostic rendering | byte span → `line:col`, message text | `check_tests::diagnostics_carry_usable_spans` **[exists]** |
-| constant folder | `DIV`/`MOD`/shifts/sets fold identically to the runtime helpers | `oberon/golden/constexpr.tsv` cross-check **[exists: 52 expressions]** |
-| C emission | emitted C compiles with `-Wall -Wextra -Werror` and the program's stdout matches the expected output | `oberon/e2e` **[exists]** |
-| type algebra | identity, extension, assignment, parameter modes, operators, predeclared signatures | `oberon/src/types.rs` **[exists: 12 tests]** |
-| constant folder | all four folding contexts, plus agreement with the emitted C (`constexpr.tsv`, 52 expressions, produced by the C side from its own helpers) | `oberon/src/const_eval.rs` **[exists: 7 tests]** |
-| runtime helpers | §9.5's tricky mappings, the type-`CASE` switch, static links, parameter modes | `oberon/csmoke` **[exists: 67 cases]** |\n| the *emitted* runtime | the same vectors, compiled against `src/oberon_h.inc` itself rather than a hand-copy | `oberon/golden/rt.h` includes it **[exists]** |
-| whole-program shape | statement lowering of the report's procedures, module init, command table, exported interface, read-only exports | `oberon/golden` **[exists: 66 cases, plain + ASan/UBSan]** |
-| regressions found by review | one output line per defect found in the code review: integer `/`, CHAR ordinal order, folded constants, `CASE` ranges and multi-labels, record-copy descriptors, a local record as a `VAR` record parameter, open-array forwarding, a call through a record field, `PACK`/`UNPK`, `NEW` on a recursive type | `oberon/e2e/Regress.mod` + `regress.expected.txt` **[exists: 11 lines]** |
-| compile-only regressions | a recursive record type; Oberon identifiers that are C keywords; a *failing* guard Dtraps with its offset | `oberon/e2e/run.sh` checks 8 and 9 **[exists]** |
-| the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash oberon/e2e/run.sh` **[exists: 24 checks]** |
-| interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `oberon/src/sym.rs` **[exists: 3 tests]** |
-| whole language | the report's example modules (`Out`'s `Write`/`WriteInt`/`WriteLn`, `log2`, `ReadInt`) compiled and executed against a `Texts`/`Oberon` stub | `oberon/e2e` + `oberon/golden` **[exists]** |
+| constant folder | `DIV`/`MOD`/shifts/sets fold identically to the runtime helpers | `golden/constexpr.tsv` cross-check **[exists: 52 expressions]** |
+| C emission | emitted C compiles with `-Wall -Wextra -Werror` and the program's stdout matches the expected output | `e2e` **[exists]** |
+| type algebra | identity, extension, assignment, parameter modes, operators, predeclared signatures | `src/types.rs` **[exists: 12 tests]** |
+| constant folder | all four folding contexts, plus agreement with the emitted C (`constexpr.tsv`, 52 expressions, produced by the C side from its own helpers) | `src/const_eval.rs` **[exists: 7 tests]** |
+| runtime helpers | §9.5's tricky mappings, the type-`CASE` switch, static links, parameter modes | `csmoke` **[exists: 67 cases]** |\n| the *emitted* runtime | the same vectors, compiled against `src/oberon_h.inc` itself rather than a hand-copy | `golden/rt.h` includes it **[exists]** |
+| whole-program shape | statement lowering of the report's procedures, module init, command table, exported interface, read-only exports | `golden` **[exists: 66 cases, plain + ASan/UBSan]** |
+| regressions found by review | one output line per defect found in the code review: integer `/`, CHAR ordinal order, folded constants, `CASE` ranges and multi-labels, record-copy descriptors, a local record as a `VAR` record parameter, open-array forwarding, a call through a record field, `PACK`/`UNPK`, `NEW` on a recursive type | `e2e/Regress.mod` + `regress.expected.txt` **[exists: 11 lines]** |
+| compile-only regressions | a recursive record type; Oberon identifiers that are C keywords; a *failing* guard Dtraps with its offset | `e2e/run.sh` checks 8 and 9 **[exists]** |
+| the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash e2e/run.sh` **[exists: 24 checks]** |
+| interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `src/sym.rs` **[exists: 3 tests]** |
+| whole language | the report's example modules (`Out`'s `Write`/`WriteInt`/`WriteLn`, `log2`, `ReadInt`) compiled and executed against a `Texts`/`Oberon` stub | `e2e` + `golden` **[exists]** |
 
-The two existing suites are kept as-is rather than rewritten: `oberon/` keeps the
+The two existing suites are kept as-is rather than rewritten: this crate keeps the
 grammar honest during development, and `csmoke` is the specification of the
 runtime helpers in executable form.
 
@@ -1162,13 +1165,13 @@ runtime helpers in executable form.
 | # | deliverable | acceptance |
 |---|---|---|
 | M0 | lexer + grammar + syntax AST | parses the report's example modules and a module exercising every construct; no LALRPOP conflicts; **done, 10 tests green** |
-| M1 | resolver: scopes, imports, interface files, qualification fold, guard/args split, `end_name` | every well-formed module in the test corpus resolves; every §8.5 row in classes 1–5, 48 reported — **done**, `oberon/src/sema.rs`, with the report's `Out` module checking clean |
+| M1 | resolver: scopes, imports, interface files, qualification fold, guard/args split, `end_name` | every well-formed module in the test corpus resolves; every §8.5 row in classes 1–5, 48 reported — **done**, `src/sema.rs`, with the report's `Out` module checking clean |
 | M2 | checker + constant folder | all §8.5 rows implemented, each with a matching negative test — **done** except the four explicitly listed gaps in §8.5 (field visibility, one half of row 50, row 54's procedure half) |
-| M3 | C emitter for types, declarations, expressions, and the four control constructs; runtime header | `Out.Mod` compiles to C, compiles with `cc -Wall -Wextra -Werror`, and prints the same as a hand-written reference — **done**, `oberon/src/cgen.rs` + `oberon/e2e` |
-| M4 | procedures, nested procedures, parameter modes, open arrays, `NEW`, `IS`/guards, type `CASE` | a corpus module with dynamic dispatch by `IS` runs correctly — **done**: `oberon/e2e/Torture.mod` exercises all of it, including a three-level nested procedure reaching an enclosing local |
+| M3 | C emitter for types, declarations, expressions, and the four control constructs; runtime header | `Out.Mod` compiles to C, compiles with `cc -Wall -Wextra -Werror`, and prints the same as a hand-written reference — **done**, `src/cgen.rs` + `e2e` |
+| M4 | procedures, nested procedures, parameter modes, open arrays, `NEW`, `IS`/guards, type `CASE` | a corpus module with dynamic dispatch by `IS` runs correctly — **done**: `e2e/Torture.mod` exercises all of it, including a three-level nested procedure reaching an enclosing local |
 | M5 | modules, imports, commands, exported interface files | two-module program compiles and runs; the report's `Out`/client split works — **done**: the e2e suite compiles `Texts`, `Oberon`, the report's `Out` and `Torture`, and the compiler writes and reads the `.sym` files between them |
 | M6 | diagnostics pass, `-Ochecks`, golden tests | compiler is usable on a few thousand lines of Oberon-07 |
-| M7 | driver: import-graph resolution, loader generation, C invocation, run | `obc run Hello.mod` produces a runnable program; `obc run Torture.mod --command Torture.Run` matches the expected output — **done**, `oberon/src/bin/obc.rs` |
+| M7 | driver: import-graph resolution, loader generation, C invocation, run | `obc run Hello.mod` produces a runnable program; `obc run Torture.mod --command Torture.Run` matches the expected output — **done**, `src/bin/obc.rs` |
 
 M0 is complete; everything else is design.
 
@@ -1189,9 +1192,9 @@ M0 is complete; everything else is design.
 | R9 | `LEN(v)` is defined for one-dimensional open arrays only. | Report §10.2 defines exactly that. Multi-dimensional open arrays are Oberon-2. |
 | R10 | Char classification of `BYTE` ↔ `INTEGER`. | Implemented as a two-way compatibility in `is_assignable`, per report §6.1; it is the only implicit conversion in the language. |
 | R11 | The `csmoke` spec itself contained an error: it asserted `ROR(0x80000000u,1) == 1`, which is `ROL`. | **Found and corrected** by the smoke run; the design uses true right-rotation. This is why the spec was executed rather than trusted. |
-| R12 | Registering a *parameterized* exported procedure in the command table would invoke it through a `void (*)(void)` pointer — undefined behaviour. | **Found** by the `oberon/golden` link model and fixed in §9.8: only parameterless procedures are registered, which is what report §11 defines a command to be. |
-| R13 | With `BY = 0` the emitted `FOR` header and the report's while-desugaring disagree (infinite loop vs. zero iterations). | Unreachable: check 34 rejects `BY = 0`. The equivalence in §9.6 is therefore stated for `k != 0` only, which is every program the checker accepts; `oberon/golden` compares the two forms on all five range shapes. |
-| R14 | `rt_strcopy` leaves no NUL when the source exactly fills the destination, and a later `strcmp`-style comparison would read past the array. Reachable via a same-length `ARRAY n OF CHAR` array assignment, which §8.2 permits. | **Found** by `oberon/golden` and fixed in two places: §9.6 distinguishes the padded string-literal copy from the bounded array-to-array copy, and §9.5 compares `CHAR` arrays with `rt_charcmp`, which is bounded by the shorter operand and stops at a NUL in either — it never assumes termination. |
+| R12 | Registering a *parameterized* exported procedure in the command table would invoke it through a `void (*)(void)` pointer — undefined behaviour. | **Found** by the `golden` link model and fixed in §9.8: only parameterless procedures are registered, which is what report §11 defines a command to be. |
+| R13 | With `BY = 0` the emitted `FOR` header and the report's while-desugaring disagree (infinite loop vs. zero iterations). | Unreachable: check 34 rejects `BY = 0`. The equivalence in §9.6 is therefore stated for `k != 0` only, which is every program the checker accepts; `golden` compares the two forms on all five range shapes. |
+| R14 | `rt_strcopy` leaves no NUL when the source exactly fills the destination, and a later `strcmp`-style comparison would read past the array. Reachable via a same-length `ARRAY n OF CHAR` array assignment, which §8.2 permits. | **Found** by `golden` and fixed in two places: §9.6 distinguishes the padded string-literal copy from the bounded array-to-array copy, and §9.5 compares `CHAR` arrays with `rt_charcmp`, which is bounded by the shorter operand and stops at a NUL in either — it never assumes termination. |
 | R15 | A **failing** guard written with the *record* spelling reads past the object by construction (`p(S).b` where `p` points at an `R`), and the C compiler can see that statically: `-Warray-bounds`/`-Wmaybe-uninitialized` then reject the program under `-Werror`, even though the guard's test traps first. | Accepted and documented rather than silenced: the pointer spelling (`p(Q)`) has no such read and is what the e2e suite uses for the trap case. A program that *tests* for a type it does not hold is expected to use the pointer spelling, which is also the one §9.5's own example uses. |
 | R16 | A structured **value** argument inside a short-circuit operand is copied into its caller-side temporary eagerly, because a temporary is a statement. Guards are no longer affected (§9.5 lowers them as expressions), so this is now limited to a record argument whose *index* expressions contain calls, inside `OR`/`&`. | Documented deviation: the copy happens one step earlier than the operator would evaluate it. Oberon's only side-effecting expressions are calls, and this needs one inside a record actual's index inside a short-circuit operand. |
 | R17 | `resolve.rs` classifies guards and module qualification with *module-wide* name sets, because the prototype's reclassification pass runs before the checker builds scopes. A local variable that shadows an import alias, or a nested type name, is therefore classified by the wrong scope. | Documented limitation of the prototype's pass order, not of the design: the production resolver performs the same classification with the scope chain it is building anyway (§7). A program that shadows an import alias with a local of the same name is affected. |
@@ -1248,8 +1251,10 @@ Open questions, to be settled with a decision record when M1 starts:
 
 ## 14. Evidence appendix
 
+Commands are run in this directory.
+
 ```
-$ cd oberon && cargo test
+$ cargo test
 test diag_tests::a_lexical_error_names_the_character_and_what_to_do ... ok
 test diag_tests::a_missing_end_is_reported_where_the_module_gives_out ... ok
 test diag_tests::a_syntax_error_is_located_explained_and_underlined ... ok
@@ -1289,7 +1294,7 @@ test result: ok. 47 passed; 0 failed
   (declaration before `MODULE`, duplicate `MODULE`, `CONST` without `=`, `PROC`
   without `)`, and an inline `PROCEDURE (…)` parameter type).
 
-* The type algebra (`oberon/src/types.rs`, 12 tests) is where the report's
+* The type algebra (`src/types.rs`, 12 tests) is where the report's
   wording is densest, so each test is named after the rule it pins: pointer
   identity and extension following the base, record extension being reflexive,
   transitive and one-way, the four §9.1 assignment exceptions, the §10.1
@@ -1297,9 +1302,9 @@ test result: ok. 47 passed; 0 failed
   may be a *base* of the actual's), the operand rules of §8.2.1-§8.2.4, and the
   §10.2 signatures.
 
-* The constant folder (`oberon/src/const_eval.rs`, 7 tests) is checked twice: once
+* The constant folder (`src/const_eval.rs`, 7 tests) is checked twice: once
   against hand-written expectations, and once against the C back end's own
-  helpers via `oberon/golden/constexpr.tsv` — 52 expressions whose values the C
+  helpers via `golden/constexpr.tsv` — 52 expressions whose values the C
   side computes with `rt_div`, `rt_mod`, `rt_lsl`, `rt_asr`, `rt_ror`, `rt_set`,
   `rt_in`, `rt_floor`, `rt_flt`, `rt_ord`. **The Rust folder and the emitted C
   agree on every one**, which is the design's claim in §8.3, executed. Building
@@ -1320,14 +1325,14 @@ test result: ok. 47 passed; 0 failed
   Conflicts are hard errors in LALRPOP, so a successful build *is* the evidence.
 * The two conflict transcripts quoted in D3 and D4 were produced by the
   canonical LR(1) builder, which prints the competing parses.
-* `oberon/src/lib.rs::tests::parses_kitchen_sink` parses one module containing
+* `src/lib.rs::tests::parses_kitchen_sink` parses one module containing
   every construct of the report: all four declaration sections, all six type
   forms, all seven statement forms, sets with ranges, typed and scalar `CASE`,
   guards, `IS`, strings, hex integers, character constants, `VAR`/value/open-array
   parameters, nested declarations, and imports with aliasing.
 * `tests::reports_syntax_errors_without_panicking` shows that both a syntax error
   and an unterminated comment produce a parse error rather than a panic.
-* `oberon/golden` (`bash oberon/golden/run.sh`) hand-writes the C that §9.6–9.8
+* `golden` (`bash golden/run.sh`) hand-writes the C that §9.6–9.8
   prescribe for the report's own `log2`, `WriteInt` and `ReadInt`, for a
   `WHILE … ELSIF` loop, five `FOR` shapes checked against the report's
   desugaring, an `IF`/`ELSIF`/`ELSE` chain, a `REPEAT`, a range `CASE` with a
@@ -1341,7 +1346,7 @@ test result: ok. 47 passed; 0 failed
   comparison into a bounded `rt_charcmp` — itself now pinned by 12 cases,
   including `charcmp-adjacent-struct-sentinel`, where an unbounded compare reads
   the neighbouring byte and answers the wrong way).
-* **`oberon/e2e` — the whole compiler, end to end.** Five Oberon modules (the
+* **`e2e` — the whole compiler, end to end.** Five Oberon modules (the
   report's own `Out`, a hello-world, a language torture program and a
   deliberately trapping one, plus `Texts`/`Oberon` as hand-written runtime
   fixtures in the emitted shape) are compiled by this repository's compiler into
@@ -1438,9 +1443,9 @@ test result: ok. 47 passed; 0 failed
 
 
   Each of those is now pinned by a test: the emitter's by the e2e output, the
-  checker's by the catalogue cases, and the runtime's by `oberon/golden`.
+  checker's by the catalogue cases, and the runtime's by `golden`.
 
-* **The review round.** A full read of the code (every file under `oberon/`) found
+* **The review round.** A full read of the code (every file under ``) found
   34 defects, 21 of them high. They are fixed and pinned; the ones worth naming
   are the silent-miscompile class, because each of them compiled and ran:
   constants were re-folded by the emitter with its own partial rules
@@ -1461,13 +1466,13 @@ test result: ok. 47 passed; 0 failed
   descriptor "in front of the payload" (it is the base-most record's first word)
   and claimed every emitted identifier was prefixed (locals and fields are not,
   except for C keywords).
-* **The fixture that had drifted.** `oberon/golden` used to carry a private copy of
+* **The fixture that had drifted.** `golden` used to carry a private copy of
   the runtime helpers, and its `rt_charcmp` had already diverged from the emitted
   one — exactly the failure mode the review predicted. `rt.h` now *includes*
   `src/oberon_h.inc`, so those vectors test the runtime the compiler ships; the
   divergence showed up immediately as two failing cases, which is how it was
   found.
-* `oberon/csmoke` (`bash oberon/csmoke/run.sh`) covers the C rules of §9.5, §9.3
+* `csmoke` (`bash csmoke/run.sh`) covers the C rules of §9.5, §9.3
   and §9.7: `DIV`/`MOD` by brute force, set literal and operator semantics,
   the `FOR` header's iteration counts, `CHAR` array copy/compare, descriptor
   chain walks with a guard trap, shifts, open-array `LEN`, value vs `VAR`

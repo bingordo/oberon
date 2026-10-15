@@ -1,6 +1,6 @@
 //! Oberon-07 front end prototype: lexer + LALRPOP grammar + AST.
 //!
-//! This crate exists to *verify* the design in ../../DESIGN.md: that the
+//! This crate exists to *verify* the design in ../DESIGN.md: that the
 //! report's grammar, with the two factoring decisions described in
 //! `oberon.lalrpop`, is accepted by LALRPOP's LR(1) (lane table) construction
 //! without conflicts, and that realistic Oberon-07 modules parse.
