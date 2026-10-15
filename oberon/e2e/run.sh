@@ -99,6 +99,12 @@ WRAPPER
     chmod +x "$DRV/obc-backend"
     OBC="$DRV/obc-backend"
 fi
+BACKEND_MODE=${BACKEND:-c}
+# The C back end's driver, whatever BACKEND says. A row that reads the emitted *C*
+# -- `Checks.c`, `Named.c`, `SysChk.c`, a `.h` -- is about that back end and must not
+# inherit the switch, or the suite stops at the first such row instead of reaching
+# the rows a different back end exists to be judged by.
+C_OBC=${C_OBC:-../target/debug/obc}
 
 if "$OBC" build Hello.mod -I . --out "$DRV" -o "$DRV/hello" 2>"$DRV/build.log"; then
     echo "PASS driver-builds-a-program"
@@ -299,8 +305,8 @@ BEGIN
   n := a[150]
 END Checks.
 MODEOF
-if "$OBC" build "$DRV/Checks.mod" --out "$DRV" -o "$DRV/checks-on" >/dev/null 2>&1 &&
-   "$OBC" build "$DRV/Checks.mod" -Ochecks=n --out "$DRV" -o "$DRV/checks-off" >/dev/null 2>&1; then
+if "$C_OBC" build "$DRV/Checks.mod" --out "$DRV" -o "$DRV/checks-on" >/dev/null 2>&1 &&
+   "$C_OBC" build "$DRV/Checks.mod" -Ochecks=n --out "$DRV" -o "$DRV/checks-off" >/dev/null 2>&1; then
     status=0
     sh -c '"$0" >/dev/null 2>"$1"' "$DRV/checks-on" "$DRV/checks-on.err" || status=$?
     check "checks-on-traps" "134" "$status"
@@ -313,16 +319,16 @@ if "$OBC" build "$DRV/Checks.mod" --out "$DRV" -o "$DRV/checks-on" >/dev/null 2>
         "$(grep -c 'rt_index\|rt_nil\|rt_guard_is' "$DRV/Checks.c")"
     # Every check has a name, and a named set emits exactly those (W8.3).
     printf 'MODULE Named;\n  TYPE R = RECORD x: INTEGER END; P = POINTER TO R;\n  VAR a: ARRAY 100 OF INTEGER; p: P; n: INTEGER;\nBEGIN\n  n := a[150]; p.x := 1\nEND Named.\n' > "$DRV/Named.mod"
-    "$OBC" emit "$DRV/Named.mod" -Ochecks=nil --out "$DRV" >/dev/null 2>&1
+    "$C_OBC" emit "$DRV/Named.mod" -Ochecks=nil --out "$DRV" >/dev/null 2>&1
     check "named-checks-emit-only-that-check" "1" \
         "$(grep -c 'rt_nil' "$DRV/Named.c")"
     check "named-checks-leave-the-others-out" "0" \
         "$(grep -c 'rt_index' "$DRV/Named.c")"
-    "$OBC" emit "$DRV/Named.mod" -Ochecks=index --out "$DRV" >/dev/null 2>&1
+    "$C_OBC" emit "$DRV/Named.mod" -Ochecks=index --out "$DRV" >/dev/null 2>&1
     check "named-checks-can-turn-one-back-on" "1" \
         "$(grep -c 'rt_index' "$DRV/Named.c")"
     # And an unknown name is a diagnostic rather than a silent default.
-    if "$OBC" emit "$DRV/Named.mod" -Ochecks=banana --out "$DRV" 2>"$DRV/banana.log"; then
+    if "$C_OBC" emit "$DRV/Named.mod" -Ochecks=banana --out "$DRV" 2>"$DRV/banana.log"; then
         echo "FAIL unknown-check-name-is-refused: the flag was accepted"
         fail=$((fail + 1))
     else
@@ -718,7 +724,10 @@ check "system-entries-run[ADR, SIZE, BIT, GET, PUT, COPY]" "0" "$status"
 # The import is in the interface, so a client can see that this module is not
 # portable (PLAN.md W4.1 step 4) -- and SYSTEM has no `.h` to include.
 check "system-import-is-recorded-in-the-interface" "IMPORT SYSTEM" "$(sed -n 3p "$DRV/Sys.sym")"
-check "system-has-no-header-to-include" "0" "$(grep -c 'SYSTEM\.h' "$DRV/Sys.h")"
+mkdir -p "$DRV/sysc"
+"$C_OBC" emit Sys.mod -I . --out "$DRV/sysc" >/dev/null 2>&1 || true
+check "system-has-no-header-to-include" "0" \
+    "$(grep -c 'SYSTEM\.h' "$DRV/sysc/Sys.h" || true)"
 
 # The module is *the compiler's*: a `SYSTEM.mod`/`SYSTEM.sym` on the search path
 # is never read, compiled or linked, so a broken pair there cannot reach a build
@@ -760,8 +769,8 @@ BEGIN
   SYSTEM.PUT(SYSTEM.ADR(r), r)
 END SysChk.
 MODEOF
-if "$OBC" emit "$DRV/SysChk.mod" --out "$DRV/chk-on" >/dev/null 2>&1 &&
-   "$OBC" emit "$DRV/SysChk.mod" --out "$DRV/chk-off" -Ochecks=n >/dev/null 2>&1; then
+if "$C_OBC" emit "$DRV/SysChk.mod" --out "$DRV/chk-on" >/dev/null 2>&1 &&
+   "$C_OBC" emit "$DRV/SysChk.mod" --out "$DRV/chk-off" -Ochecks=n >/dev/null 2>&1; then
     same=0
     cmp -s "$DRV/chk-on/SysChk.c" "$DRV/chk-off/SysChk.c" || same=1
     check "system-emits-the-same-c-under--Ochecks=n" "0" "$same"
@@ -847,8 +856,9 @@ runs_case exit-and-early-return 'MODULE Ctl;
   PROCEDURE f(x: INTEGER): INTEGER;
   BEGIN
     IF x < 0 THEN RETURN 0 END;
-    CASE x OF 1: RETURN 10 | 2: RETURN 20 END;
-    RETURN 7
+    (* the default arm does what falling out of the CASE used to do, now that a
+       value matching no label traps (W2.5) *)
+    CASE x OF 1: RETURN 10 | 2: RETURN 20 ELSE RETURN 7 END
   END f;
   PROCEDURE stop(n: INTEGER);
   BEGIN
@@ -913,6 +923,111 @@ if "$OBC" build "$DRV/UseDef.mod" -I "$DRV" --out "$DRV" -o "$DRV/usedef" >/dev/
         "$(grep -c 'Def__Node' "$DRV/Def.h" | grep -c '^[1-9]')"
 else
     echo "FAIL pointer-to-a-record-in-another-module: did not build"
+    fail=$((fail + 1))
+fi
+
+# 21. The layout the second back end computes is the C ABI's (DESIGN §16): the C
+#     back end emits structs and lets `cc` place the members, so `cc` is the
+#     authority and `layout.rs` is the claim. `obc emit --layout` prints the
+#     computed table and stops, so this runs even though that back end does not
+#     lower records yet (PLAN.md W9.2a) — and every fact is a `check` of its own,
+#     so a mismatch names the type and the field it is about.
+#
+#     The C half names the driver directly: under `BACKEND=clif` `$OBC` is the
+#     wrapper that appends `--backend=clif`, and the later flag would win.
+LAY=$(mktemp -d)
+cat > "$DRV/Lay.mod" <<'MODEOF'
+MODULE Lay;
+  TYPE
+    Node = POINTER TO Cell;
+    Cell = RECORD key: INTEGER; ch: CHAR; r: REAL; next: Node END;
+    Paired = RECORD (Cell) extra: INTEGER END;
+    Tail = RECORD x: INTEGER; last: CHAR END;
+    Empt = RECORD END;
+    Cells = ARRAY 3 OF Cell;
+    Nodes = ARRAY 4 OF Node;
+    Words = ARRAY 5 OF INTEGER;
+    Grid = ARRAY 3, 4 OF INTEGER;
+  VAR a: Cell; b: Paired; c: Nodes; d: Words; e: Grid;
+BEGIN
+END Lay.
+MODEOF
+cat > "$LAY/probe.c" <<'PROBEEOF'
+/* What `cc` says the emitted structs are. One printf per fact, spelling the
+ * Oberon type and member names, so the two tables can be compared line for line
+ * (a pointer type has no C typedef of its own: `Node` is `Cell *`). */
+#include <stdio.h>
+#include <stddef.h>
+#include "Lay.h"
+int main(void) {
+    printf("Node size=%zu align=%zu\n", sizeof(Lay__Cell *), _Alignof(Lay__Cell *));
+    printf("Cell size=%zu align=%zu\n", sizeof(Lay__Cell), _Alignof(Lay__Cell));
+    printf("Cell.desc offset=%zu\n", offsetof(Lay__Cell, desc));
+    printf("Cell.key offset=%zu\n", offsetof(Lay__Cell, key));
+    printf("Cell.ch offset=%zu\n", offsetof(Lay__Cell, ch));
+    printf("Cell.r offset=%zu\n", offsetof(Lay__Cell, r));
+    printf("Cell.next offset=%zu\n", offsetof(Lay__Cell, next));
+    printf("Paired size=%zu align=%zu\n", sizeof(Lay__Paired), _Alignof(Lay__Paired));
+    printf("Paired.base offset=%zu\n", offsetof(Lay__Paired, base));
+    printf("Paired.extra offset=%zu\n", offsetof(Lay__Paired, extra));
+    printf("Tail size=%zu align=%zu\n", sizeof(Lay__Tail), _Alignof(Lay__Tail));
+    printf("Tail.desc offset=%zu\n", offsetof(Lay__Tail, desc));
+    printf("Tail.x offset=%zu\n", offsetof(Lay__Tail, x));
+    printf("Tail.last offset=%zu\n", offsetof(Lay__Tail, last));
+    printf("Empt size=%zu align=%zu\n", sizeof(Lay__Empt), _Alignof(Lay__Empt));
+    printf("Empt.desc offset=%zu\n", offsetof(Lay__Empt, desc));
+    printf("Cells size=%zu align=%zu\n", sizeof(Lay__Cells), _Alignof(Lay__Cells));
+    printf("Nodes size=%zu align=%zu\n", sizeof(Lay__Nodes), _Alignof(Lay__Nodes));
+    printf("Words size=%zu align=%zu\n", sizeof(Lay__Words), _Alignof(Lay__Words));
+    printf("Grid size=%zu align=%zu\n", sizeof(Lay__Grid), _Alignof(Lay__Grid));
+    return 0;
+}
+PROBEEOF
+if "$C_OBC" emit "$DRV/Lay.mod" --backend=c --out "$LAY" >/dev/null 2>&1 &&
+   $CC $CFLAGS -I "$LAY" -o "$LAY/probe" "$LAY/probe.c" 2>"$LAY/cc.log"; then
+    "$LAY/probe" > "$LAY/cc.table"
+    "$OBC" emit "$DRV/Lay.mod" --layout > "$LAY/computed.table" 2>/dev/null
+    while IFS= read -r want; do
+        [ -n "$want" ] || continue
+        key=${want%% *}
+        got=$(grep -F "$key " "$LAY/computed.table" || true)
+        check "layout-$key" "$want" "${got:-<not in the computed table>}"
+    done < "$LAY/cc.table"
+else
+    echo "FAIL layout-the-emitted-header-compiles: $(tail -1 "$LAY/cc.log" 2>/dev/null)"
+    fail=$((fail + 1))
+fi
+
+# 22. Fixed scalar arrays on that layout, multi-dimensional ones included, on
+#     whichever back end `$OBC` is: a module array lives in a data object and a
+#     local one in a zeroed frame slot, every subscript is checked against its
+#     own dimension, and the element is read and written through the stride the
+#     layout gives.
+cat > "$DRV/Grid.mod" <<'MODEOF'
+MODULE Grid;
+  VAR g: ARRAY 3, 4 OF INTEGER; t: ARRAY 2 OF INTEGER; ok: ARRAY 1 OF INTEGER;
+
+  PROCEDURE Fill;
+    VAR l: ARRAY 2, 2 OF INTEGER; i, j: INTEGER;
+  BEGIN
+    FOR i := 0 TO 1 DO FOR j := 0 TO 1 DO l[i, j] := i * 10 + j END END;
+    g[0, 0] := l[1, 1];
+    t[0] := g[0, 0];
+    t[1] := g[1, 3] + g[2, 0]
+  END Fill;
+BEGIN
+  g[1, 3] := 7; g[2, 0] := 5;
+  Fill;
+  IF t[0] # 11 THEN ok[1] := 0 END;
+  IF t[1] # 12 THEN ok[1] := 0 END
+END Grid.
+MODEOF
+if "$OBC" build "$DRV/Grid.mod" --out "$DRV" -o "$DRV/grid" >/dev/null 2>&1; then
+    status=0
+    "$DRV/grid" || status=$?
+    check "array-multi-dimensional-indexing" "0" "$status"
+else
+    echo "FAIL array-multi-dimensional-indexing: did not build"
     fail=$((fail + 1))
 fi
 

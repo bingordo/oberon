@@ -2224,8 +2224,16 @@ matches no label [verified against `books/Oberon07.Report.pdf`, §9.5 in full]. 
 what is left is not a conformance bug but an inconsistency between our own two
 *checks*: a **type**-`CASE` with no match traps with its offset (§9.4) and warns when
 it has no default arm, while a scalar `CASE` falls through silently. Which of those
-the scalar case should do is a decision about the C path, recorded as PLAN.md W2.5 —
-not something this back end should settle by disagreeing with it.
+the scalar case should do was a decision about the C path, recorded as PLAN.md W2.5 —
+not something this back end should settle by disagreeing with it. **W2.5 has since
+decided it** (a located trap for both forms), the C back end, the checker's warning
+and the fixture that relied on the old behaviour landed with that decision, and this
+back end moved with it in the one place it had to: it emits the same trap, the same
+message and the same byte the C side passes — `CASE: no matching label`, the
+*subject's* span — gated by the same `-Ochecks=case`. **[verified]** the module above
+reports `CASE: no matching label (at byte 52 of the source)` on both back ends, and
+with `-Ochecks=none` both fall out of the arms instead, so the program's next trap is
+what fires (`DIV by zero (at byte 91 …)`).
 
 **What W9.2 inherits.** The refusals below are the work list, in the order the
 lowerer meets them, and each has a place to go: `Type::Record`/`Pointer` in
@@ -2241,7 +2249,64 @@ in `oberon.h`, and the `__load`/command-table shape. The acceptance test is `e2e
 (the corpus's collector blocks come back on with it, since a pointer graph is what
 they take apart).
 
-**Evidence.** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
+### The C ABI's layout, and the comparison that makes `cc` the authority **[implemented; `PLAN.md` W9.2a]**
+
+§16's corrected layout paragraph above is what this section implements:
+`src/layout.rs` computes, for the shapes this compiler emits, the size, the
+alignment and each member's offset the way the C ABI does — because the C back end
+emits C structs and `cc` is what places their members. Four rules are decisions
+rather than arithmetic, and the comparison below is what settles each of them
+against `cc` rather than against this prose:
+
+* `CHAR` (and `BYTE`) is one byte with alignment 1, so a `CHAR` between two words
+  is packed into the padding instead of shifting the next field;
+* a pointer — and a procedure value — is the *target's* width and alignment, read
+  from the Cranelift ISA, which is what pads a field after an odd number of words
+  (`Cell.next` at 24, not 20);
+* a record is its members in declaration order, each at the next multiple of its
+  own alignment, and the whole padded to the largest of them, with an extension's
+  base embedded first (`Paired` is 40 bytes: a 32-byte `Cell`, then `extra` at
+  32, rounded up to 8);
+* and every record carries the descriptor word at offset 0 of the base-most
+  record, which is §9.3's rule and also why `RECORD END` is one pointer (8 bytes,
+  alignment 8) rather than nothing at all — a record with no fields still has a
+  type.
+
+**The diagnostic.** `obc emit X --layout` prints the table (a type's size and
+alignment, then one line per member with its offset) and stops *without emitting*,
+which is what lets the comparison cover a fixture whose records and pointers this
+back end does not lower yet. It is one fact per line and no nested format,
+because the other side of the comparison is a C program printing `sizeof` and
+`offsetof`.
+
+**The comparison, and that it is sensitive.** `e2e` emits the fixture with the *C*
+back end, compiles a probe against that header, and compares the two tables line
+for line as 20 separate checks, so a mismatch names the type and the field
+(`layout-Cell.next`). That it can fail is the part worth stating: aligning a
+pointer to 4 instead of the target's width — the mistake a 64-bit host invites —
+turns seven rows red (`layout-Node`, `layout-Cell`, `layout-Cell.next`,
+`layout-Paired`, `layout-Paired.extra`, `layout-Cells`, `layout-Nodes`) and
+restoring the rule turns them green.
+
+**Arrays on top of it.** A fixed array's layout is its element's size times its
+count, aligned to the element, and that is what a declaration is sized from and
+what a subscript's stride is: module arrays stay data objects (an array of
+pointers or records is sized from this table too) and a *local* array becomes a
+frame slot, zeroed exactly as the C back end's `memset` zeroes a local. Row-major,
+one `rt_index` per dimension against that dimension's length and the designator's
+byte, which is the C emitter's chain of `.e[rt_index(...)]`: `g[1, 4]` into an
+`ARRAY 3, 4 OF INTEGER` reports `index out of range (at byte 54 of the source)` on
+both back ends, and `g[1, 3] + g[2, 0]` computes the same value on both.
+
+**Evidence.** `bash e2e/run.sh`: **122 passed, 0 failed** (101 before this item:
+20 layout facts and the array row), and the same array program builds and runs
+under `--backend=clif` when the driver is asked for it by hand — the `e2e` row
+itself does not get there in a `BACKEND=clif` run, for the harness reason below. `bash fuzz/run.sh` and `BACKEND=clif bash fuzz/run.sh` both
+exit 0 with the corpus's scalar programs (86 and 67 programs), and the gate —
+`cargo test`, `cargo clippy --all-targets -- -D warnings`, `golden`, `csmoke`,
+`e2e`, both `fuzz` modes — is green.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the
 `-Odialect=lower` dialect, then 30 coverage seeds and 10 adversarial coverage
 seeds — **67 programs, 0 failures** (against the same corpus's numbers on the C

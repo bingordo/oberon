@@ -9,6 +9,7 @@ pub mod ast;
 pub mod cgen;
 pub mod clif;
 pub mod const_eval;
+pub mod layout;
 pub mod lexer;
 pub mod resolve;
 pub mod sema;
@@ -208,6 +209,26 @@ pub fn emit_object_full<'input>(
         return Ok(Err(sema.diags.clone()));
     }
     Ok(clif::emit_object(&m, &sema.types, &sema, checks))
+}
+
+/// The layout table `obc emit --layout` prints: the C ABI's size, alignment and
+/// member offsets for the module's `TYPE` section (DESIGN §16, `layout.rs`).
+///
+/// The two `Result`s are the emitters': a parse failure outside, the module's
+/// diagnostics inside, so the driver reports a module that does not check
+/// exactly as it does for either back end.
+pub fn layout_table_full<'input>(
+    input: &'input str,
+    interfaces: &[sym::Interface],
+    dialect: Dialect,
+    pointer_bytes: u64,
+) -> Result<Result<String, Vec<Diagnostic>>, ParseErr<'input>> {
+    let mut m = parse_module_dialect(input, dialect)?;
+    let sema = sema::Sema::check_owned(&mut m, interfaces);
+    if sema.diagnostics().iter().any(Diagnostic::is_error) {
+        return Ok(Err(sema.diags.clone()));
+    }
+    Ok(Ok(layout::table(&m, &sema.types, &sema, pointer_bytes)))
 }
 
 /// Byte offset → `line:column` (1-based), the only place line information is
@@ -660,6 +681,7 @@ IF (t # NIL) & (t.key # n) THEN
     0: t := t.left
   | 1..3: t := t.right
   | 4, 5: t := NIL
+  | : t := NIL
   END
 ELSIF t IS CenterNode THEN
   c := t(CenterNode);

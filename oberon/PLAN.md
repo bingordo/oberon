@@ -1367,6 +1367,31 @@ written down):
   header in, `sizeof`/`offsetof` out, compared against the computed table. Then
   scalar fixed arrays. Done when that test passes and the corpus's scalar programs
   still do.
+  **Done.** `src/layout.rs` computes it and `obc emit --layout` prints it (a
+  diagnostic that stops before emitting anything, so a module whose records this
+  back end does not lower yet can still be asked what layout it would get).
+  `e2e`'s layout block is the comparison, one `check` per fact: 20 facts over the
+  shapes that pin the rules — a record with `INTEGER`/`CHAR`/`REAL`/pointer
+  fields, an extension, an array of records, an array of pointers, a trailing
+  `CHAR`, `RECORD END` — and every one of them agrees with `sizeof`/`offsetof`
+  computed by `cc` from the header the C back end wrote. The comparison is
+  *sensitive*: giving a pointer a 4-byte alignment instead of the target's turns
+  7 rows red, each naming the type and the field (`layout-Cell.next`,
+  `layout-Paired.extra`, `layout-Nodes`, …), and restoring it turns them green.
+  Scalar fixed arrays are lowered on that layout — multi-dimensional ones and
+  *local* ones included (a local array is a zeroed frame slot, as the C back
+  end's `memset` makes it), with one `rt_index` per dimension against that
+  dimension's length and the designator's byte: a second subscript out of range
+  reports `index out of range (at byte 54 …)` on both back ends. `e2e` 122
+  passed/0 failed (101 before), the corpus's scalar programs pass on both paths,
+  and the gate is green.
+
+  One thing W9.2c will meet earlier than its own rows: with `BACKEND=clif` the
+  suite stops around row 69, at `checks-off-emits-no-check`, which greps the
+  emitted `Checks.c` — a file a back end that emits an object never writes — and
+  under `set -e` that is where the run ends. The rows that read the emitted *C*
+  are about the C back end and have to name it (`--backend=c`) rather than
+  inherit `BACKEND`; that is the harness's, not the back end's.
 * **W9.2b — records, pointers and the heap.** Descriptor emission matching the C
   emitter's `ObDesc` including the collector's field map, record locals, fields,
   assignment and copies, `POINTER TO`, `NEW` through `rt_new`, and the type-`CASE`

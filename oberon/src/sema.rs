@@ -2926,12 +2926,16 @@ impl<'a> Sema<'a> {
             // that follows.
             self.pop_scope();
         }
-        // ✔ row 39: without a default, a value matching no label falls through.
-        if is_type_case && !has_default {
+        // ✔ row 39: without a default arm, a value matching no label traps, and the
+        // reader is told before it happens — for a *scalar* CASE as much as for a
+        // type one, which is the asymmetry W2.5 removed. The report leaves the case
+        // undefined (§9.5 defines which arm runs and says nothing about a value that
+        // matches no label), and this design's answer to undefined is a located trap.
+        if !has_default {
             self.warn(
                 s.span,
-                "this type CASE has no default arm: a value matching no label would be undefined \
-                 (report 9.5)",
+                "this CASE has no default arm: a value matching no label would trap \
+                 (report 9.5 leaves it undefined)",
             );
         }
     }

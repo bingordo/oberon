@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use oberon_front::{
-    cgen, check_module_recovering_dialect, emit_c_full, emit_interface_dialect,
-    emit_object_full, limit_errors, parse_with_diagnostics_dialect, render_diagnostics, sym,
-    Diagnostic, Dialect,
+    cgen, check_module_recovering_dialect, clif, emit_c_full, emit_interface_dialect,
+    emit_object_full, layout_table_full, limit_errors, parse_with_diagnostics_dialect,
+    render_diagnostics, sym, Diagnostic, Dialect,
 };
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
@@ -77,6 +77,9 @@ struct Opts {
     keep: bool,
     /// Which back end emits this build's modules.
     backend: Backend,
+    /// Print the module's type layout and stop, without emitting anything: a
+    /// diagnostic (DESIGN §16's comparison), not a mode of the build.
+    layout: bool,
     /// How many errors to print before saying the rest were suppressed; `0` is
     /// no limit (PLAN.md W5.2).
     ferror_limit: usize,
@@ -116,7 +119,10 @@ fn usage() -> ExitCode {
          \x20                   index, nil, guard and case
          \x20 -Odialect=NAME    report (default) or lower, which folds reserved-word case\n\
          \x20 --backend=NAME    c (default) writes C, clif writes an object file per\n\
-         \x20                   module with the Cranelift back end (PLAN.md W9.1))"
+         \x20                   module with the Cranelift back end (PLAN.md W9.1)\n\
+         \x20 --layout          print the C ABI's layout of the module's types and stop\n\
+         \x20                   (DESIGN §16; the second back end computes it, `cc` is the\n\
+         \x20                   authority, and `e2e` compares the two)"
     );
     ExitCode::FAILURE
 }
@@ -174,6 +180,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         command: None,
         keep: false,
         backend: Backend::C,
+        layout: false,
         ferror_limit: 20,
         checks: cgen::Checks::ALL,
         dialect: Dialect::Report,
@@ -201,6 +208,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
+            "--layout" => o.layout = true,
             other if other.starts_with("--backend=") => {
                 let name = &other["--backend=".len()..];
                 match Backend::from_name(name) {
@@ -275,6 +283,22 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     let mut stack: Vec<String> = Vec::new();
     let root_src = read(&o.root)?;
     let root = module_name(&root_src, o.dialect);
+    if o.layout {
+        // The table is about the *types*, so a module whose records or pointers
+        // this back end does not lower yet can still be asked what layout it
+        // would get — which is exactly what the comparison against `cc` needs,
+        // and why this prints and stops rather than building anything.
+        let pointer_bytes = clif::pointer_bytes().map_err(|e| format!("--layout: {e}"))?;
+        match layout_table_full(&root_src, &interfaces, o.dialect, pointer_bytes) {
+            Ok(Ok(table)) => print!("{table}"),
+            Ok(Err(diags)) => {
+                print!("{}", render_diagnostics(&o.root.display().to_string(), &root_src, &diags));
+                return Err(format!("`{root}` does not check"));
+            }
+            Err(e) => return Err(format!("{}: {e}", o.root.display())),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     emit_tree(
         o,
         &refused,

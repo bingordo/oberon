@@ -1318,6 +1318,17 @@ impl<'a> Emitter<'a> {
             }
             let _ = writeln!(out, "    break; }}");
         }
+        // A value that matches no label traps, as it does in the type-`CASE` above
+        // and as W2.5 decided: a silent fall-through is the one thing this design
+        // does not do with an undefined result. `self.checks.case_` still governs it,
+        // so `-Ochecks=…` can turn it off with the rest.
+        if !default_taken && self.checks.case_ {
+            let _ = writeln!(
+                out,
+                "    default: rt_trap_pos(\"CASE: no matching label\", {}); break;",
+                subject.span.lo
+            );
+        }
         let _ = writeln!(out, "    }}");
     }
 

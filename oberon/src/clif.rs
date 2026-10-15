@@ -29,7 +29,8 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    self, types, AbiParam, InstBuilder, Signature, TrapCode, UserFuncName,
+    self, types, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, TrapCode,
+    UserFuncName,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -43,6 +44,7 @@ use crate::ast::{
 };
 use crate::cgen::{self, mangle, span_of_type};
 use crate::const_eval;
+use crate::layout::{Layout, Layouts};
 use crate::sema::{span_key, Sema};
 use crate::types::{Basic, Type, TypeId, Types};
 use crate::Diagnostic;
@@ -57,10 +59,37 @@ const I32: ir::Type = types::I32;
 /// The width of an `INTEGER`, and so the stride of an array of them.
 const WORD: u64 = 4;
 
-/// The message the one trap this back end reports itself carries, byte for byte
-/// the C back end's (DESIGN §9.4's table, and the corpus's adversarial mode
-/// compares it).
-const ASSERTION: &str = "assertion failed";
+/// A message a trap this back end reports itself carries, byte for byte the C
+/// back end's: the arithmetic checks' messages belong to the runtime helper that
+/// reports them, and these two are the emitter's own decisions (DESIGN §9.4's
+/// table, and the corpus's adversarial mode compares the text and the byte).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Msg {
+    /// `ASSERT` (report §10.2, DESIGN §9.6).
+    Assertion,
+    /// A `CASE` whose arms cannot match the subject: the report leaves it
+    /// undefined, and W2.5's decision — which the C back end implements — is a
+    /// located trap rather than a silent fall-through.
+    CaseDefault,
+}
+
+impl Msg {
+    fn text(self) -> &'static str {
+        match self {
+            Msg::Assertion => "assertion failed",
+            Msg::CaseDefault => "CASE: no matching label",
+        }
+    }
+
+    /// The data object's name. Local, like every generated name: a C string
+    /// literal has no symbol at all, so no client can depend on this spelling.
+    fn symbol(self) -> &'static str {
+        match self {
+            Msg::Assertion => "assertion_failed",
+            Msg::CaseDefault => "case_no_matching_label",
+        }
+    }
+}
 
 /// One runtime entry point the generated code calls, out of DESIGN §9.4's table:
 /// the four the fragment's checks and traps need. Each is the object boundary's
@@ -102,28 +131,7 @@ fn build(
     sema: &Sema<'_>,
     checks: cgen::Checks,
 ) -> Result<Vec<u8>, Diagnostic> {
-    // `OptLevel` defaults to `none` (DESIGN §16), so an unoptimised back end
-    // would have been measured against the C path's `-O2`: `speed` is the level
-    // the comparison asks for.
-    let mut flags = settings::builder();
-    flags
-        .set("opt_level", "speed")
-        .map_err(|e| host(format!("opt_level: {e}")))?;
-    let isa_builder = cranelift_native::builder().map_err(|e| host(format!("the host's ISA: {e}")))?;
-    // The object path is ELF by construction here: `ObjectBuilder` picks the
-    // binary format from the ISA's triple, and the design's second back end is
-    // the ELF one (DESIGN §16). A host whose format is something else is told
-    // so, rather than handed an object nothing here was written for.
-    if isa_builder.triple().binary_format != BinaryFormat::Elf {
-        return Err(host(format!(
-            "the clif back end emits ELF objects; this host's format is {} ({})",
-            isa_builder.triple().binary_format,
-            isa_builder.triple()
-        )));
-    }
-    let isa = isa_builder
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| host(format!("the target ISA did not configure: {e}")))?;
+    let isa = host_isa()?;
     let obj = ObjectModule::new(
         ObjectBuilder::new(
             isa,
@@ -138,6 +146,39 @@ fn build(
         .finish()
         .emit()
         .map_err(|e| host(format!("writing the object: {e}")))
+}
+
+/// The host's target ISA, with the optimisation level the design's comparison
+/// asks for: `OptLevel` defaults to `none` (DESIGN §16), so an unoptimised back
+/// end would have been measured against the C path's `-O2`.
+///
+/// The object path is ELF by construction: `ObjectBuilder` picks the binary
+/// format from the ISA's triple, and the design's second back end is the ELF one.
+/// A host whose format is something else is told so, rather than handed an object
+/// nothing here was written for.
+fn host_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, Diagnostic> {
+    let mut flags = settings::builder();
+    flags
+        .set("opt_level", "speed")
+        .map_err(|e| host(format!("opt_level: {e}")))?;
+    let isa_builder = cranelift_native::builder().map_err(|e| host(format!("the host's ISA: {e}")))?;
+    if isa_builder.triple().binary_format != BinaryFormat::Elf {
+        return Err(host(format!(
+            "the clif back end emits ELF objects; this host's format is {} ({})",
+            isa_builder.triple().binary_format,
+            isa_builder.triple()
+        )));
+    }
+    isa_builder
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| host(format!("the target ISA did not configure: {e}")))
+}
+
+/// The target's pointer width in bytes, which is what a layout needs and what a
+/// caller without an object module (`--layout`) has to ask for separately.
+pub fn pointer_bytes() -> Result<u64, String> {
+    let isa = host_isa().map_err(|d| d.message)?;
+    Ok(u64::from(isa.frontend_config().pointer_bytes()))
 }
 
 /// A failure that is about this host rather than about the program. The span is
@@ -163,8 +204,14 @@ struct Backend<'a> {
     checks: cgen::Checks,
     obj: ObjectModule,
     /// What an address is in the IR, for the symbol loads and the runtime's
-    /// pointer arguments.
+    /// pointer arguments, and how wide it is in bytes.
     ptr: ir::Type,
+    ptr_bytes: u64,
+    /// The C ABI's layout of every type the module stores: an array's element
+    /// stride and (for records, PLAN.md W9.2b) a field's offset come from here.
+    /// Computed once for the module rather than per body, because it is a
+    /// property of the types and not of a function.
+    layouts: HashMap<TypeId, Layout>,
     /// Every procedure the module declares, under the symbol it is emitted with.
     procs: HashMap<String, FuncId>,
     /// The module's variables, as data objects.
@@ -175,9 +222,8 @@ struct Backend<'a> {
     /// The runtime entry points and the registry call, declared for the module.
     rt: HashMap<Rt, FuncId>,
     register: FuncId,
-    /// The `assertion failed` message, for the one trap this back end reports
-    /// itself.
-    assertion: DataId,
+    /// The messages this back end's own traps carry (`Msg`).
+    msgs: HashMap<Msg, DataId>,
     /// The five fields below are filled by `run`, in the order it documents, and
     /// are read only after that: they start as ids that nothing can be, so a
     /// path that read one early would be a wrong symbol rather than a
@@ -202,6 +248,7 @@ impl<'a> Backend<'a> {
         obj: ObjectModule,
     ) -> Backend<'a> {
         let ptr = obj.target_config().pointer_type();
+        let ptr_bytes = u64::from(obj.target_config().pointer_bytes());
         Backend {
             module_name: module.name.clone(),
             types,
@@ -209,12 +256,14 @@ impl<'a> Backend<'a> {
             checks,
             obj,
             ptr,
+            ptr_bytes,
+            layouts: HashMap::new(),
             procs: HashMap::new(),
             vars: HashMap::new(),
             var_ty: HashMap::new(),
             rt: HashMap::new(),
             register: FuncId::from_u32(0),
-            assertion: DataId::from_u32(0),
+            msgs: HashMap::new(),
             name_data: DataId::from_u32(0),
             commands: DataId::from_u32(0),
             init: FuncId::from_u32(0),
@@ -224,14 +273,21 @@ impl<'a> Backend<'a> {
 
     fn run(&mut self, module: &Module) -> Result<(), Diagnostic> {
         let span = module.span;
-        // 1. The one message the back end carries: `ASSERT`'s. Every other trap
-        //    reports from the runtime helper that makes it. It is declared
-        //    whether or not the module asserts, which is what the C back end
-        //    does with its (usually empty) command table: a string that no call
-        //    names is a few bytes of `.rodata`, and asking first would mean
-        //    walking the whole body to answer a question with one byte of
-        //    consequence.
-        self.assertion = self.declare_string("assertion_failed", ASSERTION)?;
+        // 0. The C ABI's layout for every type this module stores (DESIGN §16,
+        //    `layout.rs`): the array strides below are read from it, as are the
+        //    record member offsets W9.2's pointers and records will need.
+        self.compute_layouts(module)?;
+        // 1. The messages the back end carries itself: `ASSERT`'s, and the one
+        //    an unmatched `CASE` reports (W2.5). Every other trap reports from
+        //    the runtime helper that makes it. Both are declared whether or not
+        //    the module can reach them, which is what the C back end does with
+        //    its (usually empty) command table: a string that no call names is a
+        //    few bytes of `.rodata`, and asking first would mean walking the
+        //    whole body to answer a question with one byte of consequence.
+        for msg in [Msg::Assertion, Msg::CaseDefault] {
+            let id = self.declare_string(msg.symbol(), msg.text())?;
+            self.msgs.insert(msg, id);
+        }
         // 2. The runtime entry points, and the registry. A declaration is a
         //    symbol-table entry and not code — the linker tolerates one that is
         //    never called, which the C path's mixture of modules already relies
@@ -277,6 +333,54 @@ impl<'a> Backend<'a> {
     }
 
     // -------------------------------------------------------------- symbols
+
+    /// Ask `layout.rs` for the layout of every type the module can store, so
+    /// that the lowering reads a table rather than walking the type graph. The
+    /// walk recurses through elements and bases, so the roots are the declared
+    /// types and every variable, parameter and local.
+    fn compute_layouts(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        let mut layouts = Layouts::new(self.types, self.ptr_bytes);
+        for decl in &module.decls.types {
+            if let Some(t) = self.sema.type_at(span_of_type(&decl.ty), self.types) {
+                layouts.of(t);
+            }
+        }
+        for v in &module.decls.vars {
+            layouts.of(self.decl_type(&v.ty));
+        }
+        for p in &module.decls.procs {
+            let (params, result) = self.signature_of(p)?;
+            for (_, ty) in &params {
+                layouts.of(*ty);
+            }
+            if let Some(r) = result {
+                layouts.of(r);
+            }
+            for v in &p.decls.vars {
+                layouts.of(self.decl_type(&v.ty));
+            }
+        }
+        self.layouts = layouts.resolved();
+        Ok(())
+    }
+
+    fn layout(&self, t: TypeId) -> Option<Layout> {
+        self.layouts.get(&t).copied()
+    }
+
+    /// The dimensions of a fixed array, outermost first, and its element type.
+    fn array_dims(&self, mut t: TypeId) -> Option<(Vec<u32>, TypeId)> {
+        let mut dims = Vec::new();
+        while let Type::Array { len, elem } = self.types.get(t) {
+            dims.push(*len);
+            t = *elem;
+        }
+        if dims.is_empty() {
+            None
+        } else {
+            Some((dims, t))
+        }
+    }
 
     /// The name a module-level Oberon object is emitted under. The same rule as
     /// the C back end's, C-keyword escape included, because a client compiled
@@ -396,20 +500,28 @@ impl<'a> Backend<'a> {
         Ok(())
     }
 
-    /// What a variable of this type holds, or a refusal.
+    /// What a variable of this type holds, from the layout table, or a refusal.
+    /// A fixed array of the scalar types is what this back end stores today —
+    /// the corpus's self-checks need `fail: ARRAY 1 OF INTEGER`, and a
+    /// multi-dimensional one is the same arithmetic on the same layout — while
+    /// an array of records or pointers needs the elements themselves lowered
+    /// (PLAN.md W9.2b).
     fn data_size(&self, t: TypeId, span: Span) -> Result<usize, Diagnostic> {
-        match self.types.get(t) {
-            Type::Basic(Basic::Integer) | Type::Basic(Basic::Boolean) => Ok(WORD as usize),
-            // The corpus's self-checks need one array: `fail: ARRAY 1 OF
-            // INTEGER`, whose out-of-range index is what traps when a value
-            // differs. A one-dimensional array of the scalar types is exactly
-            // that, and its element is a word.
-            Type::Array { len, elem } => {
-                self.scalar(*elem, span)?;
-                Ok(*len as usize * WORD as usize)
+        match self.array_dims(t) {
+            // Any number of dimensions: what has to be lowerable is the
+            // *innermost* element, not the immediate one (the immediate one of a
+            // `ARRAY 3, 4 OF INTEGER` is an `ARRAY 4 OF INTEGER`).
+            Some((_, elem)) => {
+                self.scalar(elem, span)?;
             }
-            other => Err(not_yet(
-                &format!("a variable of type {}", type_name(other)),
+            None => {
+                self.scalar(t, span)?;
+            }
+        }
+        match self.layout(t) {
+            Some(l) => Ok(l.size as usize),
+            None => Err(not_yet(
+                &format!("a variable of type {}", type_name(self.types.get(t))),
                 span,
             )),
         }
@@ -594,7 +706,10 @@ impl<'a> Backend<'a> {
         for (rt, rid) in self.rt.clone() {
             rts.insert(rt, self.obj.declare_func_in_func(rid, &mut ctx.func));
         }
-        let assertion = self.obj.declare_data_in_func(self.assertion, &mut ctx.func);
+        let mut msgs = HashMap::new();
+        for (msg, mid) in self.msgs.clone() {
+            msgs.insert(msg, self.obj.declare_data_in_func(mid, &mut ctx.func));
+        }
 
         let mut fn_ctx = FunctionBuilderContext::new();
         {
@@ -609,11 +724,56 @@ impl<'a> Backend<'a> {
                 bcx.def_var(var, values[i]);
                 vars.insert(pname.clone(), var);
             }
+            let mut slots: HashMap<String, ir::Value> = HashMap::new();
+            let mut slot_ty: HashMap<String, TypeId> = HashMap::new();
             for (lname, ty) in locals {
-                let var = bcx.declare_var(self.scalar(*ty, span)?);
-                vars.insert(lname.clone(), var);
+                if matches!(self.types.get(*ty), Type::Array { .. }) {
+                    let size = self.layout(*ty).map(|l| l.size).ok_or_else(|| {
+                        not_yet(&format!("the local array `{lname}`"), span)
+                    })?;
+                    if size > u64::from(u32::MAX) {
+                        // A frame slot's size is a 32-bit field in Cranelift's IR;
+                        // the C path's local is a `sizeof`-sized object.
+                        return Err(Diagnostic::error(
+                            span,
+                            format!(
+                                "the local array `{lname}` is {size} bytes; the clif back end's                                  stack slots are 32-bit"
+                            ),
+                        ));
+                    }
+                    let align = self
+                        .types
+                        .elem(*ty)
+                        .and_then(|e| self.layout(e))
+                        .map(|l| l.align)
+                        .unwrap_or(1)
+                        .trailing_zeros() as u8;
+                    let slot = bcx.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        size as u32,
+                        align,
+                    ));
+                    let addr = bcx.ins().stack_addr(self.ptr, slot, 0);
+                    // Zeroed exactly as the C back end zeroes a local
+                    // (`memset`), so a program that reads an element before
+                    // assigning it reads the same value on both paths — which is
+                    // the one value the report leaves free.
+                    bcx.emit_small_memset(
+                        self.obj.target_config(),
+                        addr,
+                        0,
+                        size,
+                        align,
+                        ir::MemFlagsData::new(),
+                    );
+                    slots.insert(lname.clone(), addr);
+                    slot_ty.insert(lname.clone(), *ty);
+                } else {
+                    let var = bcx.declare_var(self.scalar(*ty, span)?);
+                    vars.insert(lname.clone(), var);
+                }
             }
-            let mut l = Lower::new(self, bcx, vars, gvs, frefs, rts, assertion, result);
+            let mut l = Lower::new(self, bcx, vars, slots, slot_ty, gvs, frefs, rts, msgs, result);
             l.stmts(body)?;
             // A path that reaches the end of a body returns zero: the C back
             // end zero-initialises its result accumulator for the same reason,
@@ -680,10 +840,17 @@ struct Lower<'b, 'f, 'a> {
     b: &'b Backend<'a>,
     bcx: FunctionBuilder<'f>,
     vars: HashMap<String, Variable>,
+    /// A local whose type is an array: its storage is a zeroed stack slot, and
+    /// what the body names is the address (cgen zeroes a local the same way).
+    slots: HashMap<String, ir::Value>,
+    /// The type of each of those slots, which is where the stride comes from.
+    /// A module variable's array type is looked up in the back end's table
+    /// instead, since its storage is a data object rather than a frame.
+    slot_ty: HashMap<String, TypeId>,
     gv: HashMap<String, ir::GlobalValue>,
     frefs: HashMap<String, ir::FuncRef>,
     rt: HashMap<Rt, ir::FuncRef>,
-    assertion: ir::GlobalValue,
+    msgs: HashMap<Msg, ir::GlobalValue>,
     /// The result type, which is what `RETURN` answers with.
     result: Option<TypeId>,
     /// The loops an `EXIT` leaves, innermost last.
@@ -692,24 +859,29 @@ struct Lower<'b, 'f, 'a> {
 
 impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         b: &'b Backend<'a>,
         bcx: FunctionBuilder<'f>,
         vars: HashMap<String, Variable>,
+        slots: HashMap<String, ir::Value>,
+        slot_ty: HashMap<String, TypeId>,
         gv: HashMap<String, ir::GlobalValue>,
         frefs: HashMap<String, ir::FuncRef>,
         rt: HashMap<Rt, ir::FuncRef>,
-        assertion: ir::GlobalValue,
+        msgs: HashMap<Msg, ir::GlobalValue>,
         result: Option<TypeId>,
     ) -> Lower<'b, 'f, 'a> {
         Lower {
             b,
             bcx,
             vars,
+            slots,
+            slot_ty,
             gv,
             frefs,
             rt,
-            assertion,
+            msgs,
             result,
             loops: Vec::new(),
         }
@@ -783,8 +955,9 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         let name = self.base_name(target)?;
         match target.sels.as_slice() {
             [] => self.store_var(name, v, target.span),
-            [Selector::Index(ix)] if ix.len() == 1 => {
-                let addr = self.elem_addr(name, &ix[0], target.span)?;
+            // One or more subscripts, each checked against its own dimension.
+            [Selector::Index(ix)] => {
+                let (addr, _) = self.elem_addr(name, ix, target.span)?;
                 self.bcx.ins().store(ir::MemFlagsData::new(), v, addr, 0);
                 Ok(())
             }
@@ -808,41 +981,79 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         }
     }
 
-    /// The address of one element of a module-level array, with the bounds check
-    /// the C back end makes: `rt_index(i, n, at)` answers with the index and
-    /// traps with the *designator's* source byte when it is out of range, which
-    /// is what makes a failing self-check name its line (DESIGN §9.4).
-    fn elem_addr(&mut self, name: &str, index: &Expr, span: Span) -> Result<ir::Value, Diagnostic> {
-        let gv = *self
-            .gv
+    /// The address of one element of an array, and the element's IR type, with
+    /// the bounds checks the C back end makes: `rt_index(i, n, at)` answers with
+    /// the index and traps with the *designator's* source byte when it is out of
+    /// range, which is what makes a failing self-check name its line (DESIGN
+    /// §9.4). Row-major, one check per dimension and the *same* byte for each of
+    /// them, exactly as the C emitter's chain of `rt_index` calls is.
+    ///
+    /// The stride comes from `layout.rs` rather than from a literal: the element
+    /// may be a word, a `CHAR`, or (once their elements are lowered, PLAN.md
+    /// W9.2b) a record, and the layout is the one the C side allocates by.
+    fn elem_addr(
+        &mut self,
+        name: &str,
+        indexes: &[Expr],
+        span: Span,
+    ) -> Result<(ir::Value, ir::Type), Diagnostic> {
+        let ty = match self
+            .slot_ty
             .get(name)
-            .ok_or_else(|| not_yet(&format!("the array `{name}`"), span))?;
-        let ty = *self
+            .or_else(|| self.b.var_ty.get(name))
+            .copied()
+        {
+            Some(t) => t,
+            None => return Err(not_yet(&format!("the array `{name}`"), span)),
+        };
+        let (dims, elem) = self
             .b
-            .var_ty
-            .get(name)
-            .ok_or_else(|| not_yet(&format!("the array `{name}`"), span))?;
-        let (len, elem) = match self.b.types.get(ty) {
-            Type::Array { len, elem } => (*len, *elem),
-            _ => return Err(not_yet(&format!("an index into `{name}`"), span)),
-        };
-        self.b.scalar(elem, span)?;
-        let i = self.expr(index)?;
-        let i = if self.b.checks.index {
-            let n = self.bcx.ins().iconst(I32, i64::from(len));
-            let at = self.bcx.ins().iconst(I32, i64::from(span.lo));
-            self.call_rt(Rt::Index, &[i, n, at])
-                .expect("a bounds check answers with the index")
+            .array_dims(ty)
+            .ok_or_else(|| not_yet(&format!("an index into `{name}`"), span))?;
+        if indexes.len() != dims.len() {
+            return Err(not_yet(
+                &format!("an index into `{name}` with {} subscripts", indexes.len()),
+                span,
+            ));
+        }
+        // The base: a module variable is a data object, a local an address in
+        // its own frame.
+        let base = if let Some(addr) = self.slots.get(name).copied() {
+            addr
+        } else if let Some(gv) = self.gv.get(name).copied() {
+            self.bcx.ins().symbol_value(self.b.ptr, gv)
         } else {
-            i
+            return Err(not_yet(&format!("the array `{name}`"), span));
         };
-        let base = self.bcx.ins().symbol_value(self.b.ptr, gv);
-        let off = self.bcx.ins().imul_imm_s(i, WORD as i64);
-        // The index is an `INTEGER` and the address is as wide as the host's
-        // pointers, so the offset is widened before it is added — sign-extended,
-        // which is what C's `p[i]` does for an index the checks are off for.
-        let off = self.bcx.ins().sextend(self.b.ptr, off);
-        Ok(self.bcx.ins().iadd(base, off))
+        let elem_ty = self.b.scalar(elem, span)?;
+        let mut flat: Option<ir::Value> = None;
+        for (k, index) in indexes.iter().enumerate() {
+            let i = self.expr(index)?;
+            let i = if self.b.checks.index {
+                let n = self.bcx.ins().iconst(I32, i64::from(dims[k]));
+                let at = self.bcx.ins().iconst(I32, i64::from(span.lo));
+                self.call_rt(Rt::Index, &[i, n, at])
+                    .expect("a bounds check answers with the index")
+            } else {
+                i
+            };
+            // `flat = flat * dims[k] + i`, which is the row-major address the C
+            // emitter's nested `.e[...]` chain computes.
+            flat = Some(match flat {
+                None => i,
+                Some(f) => {
+                    let scaled = self.bcx.ins().imul_imm_s(f, i64::from(dims[k]));
+                    self.bcx.ins().iadd(scaled, i)
+                }
+            });
+        }
+        let flat = flat.expect("an index list has at least one subscript");
+        let stride = self.b.layout(elem).map(|l| l.size).unwrap_or(0);
+        // Widened before the multiply: an index is an `INTEGER` and the offset is
+        // the target's pointer width, as C's own `p[i]` arithmetic is.
+        let wide = self.bcx.ins().sextend(self.b.ptr, flat);
+        let off = self.bcx.ins().imul_imm_s(wide, stride as i64);
+        Ok((self.bcx.ins().iadd(base, off), elem_ty))
     }
 
     /// `IF … ELSIF … ELSE … END`, as a chain of blocks rather than nested
@@ -1015,12 +1226,15 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 self.stmts(body)?;
                 self.jump_to(after);
             }
-            // No default arm: a value that matches no label *falls through*,
-            // which is what the C back end's `switch` does and what DESIGN §9.6
-            // records for the scalar `CASE`. A *type*-`CASE` traps instead
-            // (§9.3); the report is silent on the scalar case, so which of our
-            // two checks is right is PLAN.md W2.5's decision rather than this
-            // back end's — the reference's behaviour is what is lowered.
+            // No default arm: a value that matches no label traps, as it does
+            // in the type-`CASE` (§9.3) — W2.5's decision, and what the C back
+            // end now emits (`default: rt_trap_pos("CASE: no matching label")`).
+            // The report leaves the case undefined (§9.5 defines which arm runs
+            // and says nothing about a value that matches no label), and this
+            // design's answer to undefined is a located trap. `-Ochecks=case`
+            // still governs it; with the check off, the run falls out of the
+            // arms as it always did.
+            None if self.b.checks.case_ => self.trap(Msg::CaseDefault, subject.span.lo),
             None => self.jump_to(after),
         }
         self.bcx.switch_to_block(after);
@@ -1082,7 +1296,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             let bad = self.bcx.create_block();
             self.branch(cond, ok, bad)?;
             self.bcx.switch_to_block(bad);
-            self.trap_assert(d.span.lo);
+            self.trap(Msg::Assertion, d.span.lo);
             self.bcx.switch_to_block(ok);
             return Ok(());
         }
@@ -1362,9 +1576,9 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         let name = self.base_name(d)?;
         match d.sels.as_slice() {
             [] => self.load_var(name, span),
-            [Selector::Index(ix)] if ix.len() == 1 => {
-                let addr = self.elem_addr(name, &ix[0], span)?;
-                Ok(self.bcx.ins().load(I32, ir::MemFlagsData::new(), addr, 0))
+            [Selector::Index(ix)] => {
+                let (addr, elem) = self.elem_addr(name, ix, span)?;
+                Ok(self.bcx.ins().load(elem, ir::MemFlagsData::new(), addr, 0))
             }
             _ => Err(not_yet(
                 &format!("the designator `{name}` with its selectors"),
@@ -1377,11 +1591,17 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         if let Some(var) = self.vars.get(name) {
             return Ok(self.bcx.use_var(*var));
         }
+        if self.slots.contains_key(name) {
+            // A whole array where a *value* is expected is a copy, which is
+            // PLAN.md W9.2's ("string and record copies"); naming one place
+            // refuses both.
+            return Err(not_yet(&format!("`{name}` as a value"), span));
+        }
         if let Some(gv) = self.gv.get(name) {
             let addr = self.bcx.ins().symbol_value(self.b.ptr, *gv);
             return Ok(self.bcx.ins().load(I32, ir::MemFlagsData::new(), addr, 0));
         }
-        Err(not_yet(&format!("the designator `{name}`"), span))
+        Err(not_yet(&format!("the designator `{name}` used as a value"), span))
     }
 
     fn store_var(&mut self, name: &str, v: ir::Value, span: Span) -> Result<(), Diagnostic> {
@@ -1412,16 +1632,20 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         self.bcx.inst_results(call).first().copied()
     }
 
-    /// `ASSERT`'s trap: the runtime reports, and the path ends. A signature has
-    /// no `noreturn` bit (DESIGN §16), so the successor is unreachable *because
-    /// the emitter says so* — the trap is the IR's own, and nothing falls
-    /// through into what the surrounding construct put after the call.
-    fn trap_assert(&mut self, at: u32) {
+    /// A trap the back end reports itself: the runtime reports, and the path
+    /// ends. A signature has no `noreturn` bit (DESIGN §16), so the successor is
+    /// unreachable *because the emitter says so* — the trap is the IR's own, and
+    /// nothing falls through into what the surrounding construct put after it.
+    fn trap(&mut self, msg: Msg, at: u32) {
         let fref = *self
             .rt
             .get(&Rt::Trap)
             .expect("the runtime entry points are declared for the module");
-        let m = self.bcx.ins().symbol_value(self.b.ptr, self.assertion);
+        let text = *self
+            .msgs
+            .get(&msg)
+            .expect("the module declares every message it can report");
+        let m = self.bcx.ins().symbol_value(self.b.ptr, text);
         let a = self.offset(at);
         self.bcx.ins().call(fref, &[m, a]);
         self.bcx.ins().trap(TrapCode::unwrap_user(1));

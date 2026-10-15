@@ -74,9 +74,11 @@ MODULE Regress;
     (* constants come from the checker's folding *)
     Out.WriteInt(Bc, W); Out.WriteInt(C1, W); Out.WriteLn;
     (* a CASE with a range and a multi-label arm *)
-    i := 2; CASE i OF 1..3: k := 1 | 4, 5: k := 2 | 9: k := 3 END; Out.WriteInt(k, W);
-    i := 5; CASE i OF 1..3: k := 1 | 4, 5: k := 2 | 9: k := 3 END; Out.WriteInt(k, W);
-    i := 9; CASE i OF 1..3: k := 1 | 4, 5: k := 2 | 9: k := 3 END; Out.WriteInt(k, W);
+    (* each has a default arm: without one a value that matches no label traps
+       (W2.5), and a module that is meant to be clean has to say what it does *)
+    i := 2; CASE i OF 1..3: k := 1 | 4, 5: k := 2 | 9: k := 3 | : k := 0 END; Out.WriteInt(k, W);
+    i := 5; CASE i OF 1..3: k := 1 | 4, 5: k := 2 | 9: k := 3 | : k := 0 END; Out.WriteInt(k, W);
+    i := 9; CASE i OF 1..3: k := 1 | 4, 5: k := 2 | 9: k := 3 | : k := 0 END; Out.WriteInt(k, W);
     Out.WriteLn;
     (* record slicing keeps the destination's descriptor *)
     d.a := 1; d.b := 2;
