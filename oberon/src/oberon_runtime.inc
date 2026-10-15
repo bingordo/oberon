@@ -383,3 +383,27 @@ int ob_run_command(const char *module, const char *name) {
     }
     return 0;
 }
+
+/* -------------------------------------------------- the object boundary */
+
+/* The Cranelift back end's entry points (DESIGN 16.2). Every check the emitted
+ * C makes is a `static inline` helper in the header, which is free for the C
+ * compiler and invisible to a linker; a generated object needs the symbol, and
+ * these are it. Each one calls its helper, so there is one implementation of
+ * each rule for both back ends -- the arithmetic in the header, and the message
+ * and the source byte with it. */
+int32_t ob_rt_index_at(int32_t i, int32_t n, int32_t at) {
+    return rt_index_at(i, n, at);
+}
+
+int32_t ob_rt_div_at(int32_t x, int32_t y, int32_t at) {
+    return rt_div_checked(x, y, at);
+}
+
+int32_t ob_rt_mod_at(int32_t x, int32_t y, int32_t at) {
+    return rt_mod_checked(x, y, at);
+}
+
+void ob_rt_trap_pos(const char *msg, int32_t at) {
+    rt_trap_pos(msg, at);
+}

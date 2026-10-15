@@ -522,6 +522,14 @@ struct Program {
     /// only way those checks (bounds, NIL, guard, divisor, assertion) are
     /// exercised rather than reasoned about.
     adversarial: bool,
+    /// Generate only the fragment the Cranelift back end lowers (PLAN.md W9.1):
+    /// the scalar program below plus the `fail` array its self-checks trap
+    /// through, and none of the record, pointer or array machinery the *other*
+    /// parts of this file use -- the heap probe (W10.2) and the two adversarial
+    /// violations that need a record or a pointer. The values the mirror
+    /// predicts are the same; what changes is the shape of the module around
+    /// them.
+    fragment: bool,
     seed: u64,
 }
 
@@ -549,8 +557,17 @@ impl Program {
     /// the runtime reports comes from. The runtime reports the byte of the
     /// *designator* the check guards, so each variant says where that token
     /// starts inside the block it returns.
-    fn violation(seed: u64, m: &str) -> (String, usize, &'static str) {
-        match seed % 6 {
+    fn violation(seed: u64, m: &str, fragment: bool) -> (String, usize, &'static str) {
+        // A record, a pointer and a guard are PLAN.md W9.2's on that back end,
+        // so the fragment's violations are the three a scalar program can make
+        // plus the assertion: the same list, without the two that are about a
+        // pointer's type or its NIL-ness.
+        let kind = if fragment {
+            [0, 3, 4, 5][(seed % 4) as usize] as u64
+        } else {
+            seed % 6
+        };
+        match kind {
             0 => {
                 let block = "  arr[4] := 1\n".to_string();
                 let rel = block.find("arr").unwrap();
@@ -675,18 +692,27 @@ impl Program {
             }
         }
 
-        // The heap probe's types (PLAN.md W10.2): the fuzz fragment allocates
-        // now, so that a collector run per allocation has something to be right
-        // about. `GCPtr` first, because a field may only name a pointer whose
-        // base type is already declared (report 6.4).
-        let _ = writeln!(out, "  TYPE");
-        let _ = writeln!(out, "    GCPtr = POINTER TO GCNode;");
-        let _ = writeln!(out, "    GCNode = RECORD val: INTEGER; next: GCPtr END;");
-        let _ = writeln!(
-            out,
-            "    GCHold = RECORD first: GCPtr; node: GCNode; many: ARRAY 2 OF GCNode END;"
-        );
-        if self.adversarial {
+        // One `TYPE` section, which is all the grammar has room for, holding
+        // whichever of the two groups of machinery this run generates.
+        let heap_types = !self.fragment;
+        let pointer_types = self.adversarial && !self.fragment;
+        if heap_types || pointer_types {
+            let _ = writeln!(out, "  TYPE");
+        }
+        if heap_types {
+            // The heap probe's types (PLAN.md W10.2): the fuzz fragment
+            // allocates now, so that a collector run per allocation has
+            // something to be right about. `GCPtr` first, because a field may
+            // only name a pointer whose base type is already declared (report
+            // 6.4).
+            let _ = writeln!(out, "    GCPtr = POINTER TO GCNode;");
+            let _ = writeln!(out, "    GCNode = RECORD val: INTEGER; next: GCPtr END;");
+            let _ = writeln!(
+                out,
+                "    GCHold = RECORD first: GCPtr; node: GCNode; many: ARRAY 2 OF GCNode END;"
+            );
+        }
+        if pointer_types {
             // The machinery the violations need. It is declared but never used
             // by the generated part of the program, so it cannot affect a value
             // the mirror predicts.
@@ -704,20 +730,27 @@ impl Program {
         }
         // The trap trigger: out of range for its own length, on purpose.
         let _ = writeln!(out, "    fail: ARRAY 1 OF INTEGER;");
-        // The heap probe's roots: a pointer variable, a record variable holding
-        // pointers, and the temporaries the record copies need.
-        let _ = writeln!(
-            out,
-            "    gcHead, gcTmp: GCPtr; gcHold: GCHold; gcN: INTEGER;"
-        );
+        if !self.fragment {
+            // The heap probe's roots: a pointer variable, a record variable
+            // holding pointers, and the temporaries the record copies need.
+            let _ = writeln!(
+                out,
+                "    gcHead, gcTmp: GCPtr; gcHold: GCHold; gcN: INTEGER;"
+            );
+        }
         if self.adversarial {
-            let _ = writeln!(out, "    arr: ARRAY 4 OF INTEGER; pa: APtr;");
+            let _ = writeln!(out, "    arr: ARRAY 4 OF INTEGER;");
+            if !self.fragment {
+                let _ = writeln!(out, "    pa: APtr;");
+            }
         }
 
         for f in &g.funcs {
             render_func(g, f, &mut out);
         }
-        out.push_str(&self.gc_procs());
+        if !self.fragment {
+            out.push_str(&self.gc_procs());
+        }
 
         let _ = writeln!(out, "BEGIN");
         let trace = self.per_statement.map(|v| self.explain(v));
@@ -747,7 +780,9 @@ impl Program {
                 }
             }
         }
-        out.push_str(&self.gc_probe());
+        if !self.fragment {
+            out.push_str(&self.gc_probe());
+        }
         let expected = self.expectations();
         for (k, name) in g.mvars.iter().enumerate() {
             let _ = writeln!(
@@ -762,7 +797,7 @@ impl Program {
         // trap it expects rather than merely requiring one.
         let mut expectation = None;
         if self.adversarial {
-            let (block, rel, msg) = Self::violation(self.seed, &g.mvars[0]);
+            let (block, rel, msg) = Self::violation(self.seed, &g.mvars[0], self.fragment);
             let at = out.len() + rel;
             expectation = Some(if msg == "type guard failed" {
                 // This message carries its own byte rather than a suffix.
@@ -1032,6 +1067,7 @@ fn generate(seed: u64) -> Program {
         lower_keywords: false,
         body,
         per_statement: None,
+        fragment: false,
     }
 }
 
@@ -1260,6 +1296,11 @@ fn main() {
     let mut cflags: Vec<String> = Vec::new();
     let mut adversarial = false;
     let mut lower_keywords = false;
+    // Which back end the programs are built with, and so which of the two
+    // module shapes they get (`--backend=c`, the default, is the C back end and
+    // the full module; `clif` is the Cranelift back end and the scalar
+    // fragment, PLAN.md W9.1).
+    let mut backend = "c".to_string();
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
@@ -1293,6 +1334,14 @@ fn main() {
             }
             "--keep" => keep = true,
             "--adversarial" => adversarial = true,
+            other if other.starts_with("--backend=") => {
+                let name = &other["--backend=".len()..];
+                if name != "c" && name != "clif" {
+                    eprintln!("obgen: `--backend={name}` is not a back end; expected c or clif");
+                    std::process::exit(2);
+                }
+                backend = name.to_string();
+            }
             "--lower" => lower_keywords = true,
             "--cflag" => {
                 i += 1;
@@ -1327,6 +1376,7 @@ fn main() {
         let mut program = generate(base);
         program.adversarial = adversarial;
         program.lower_keywords = lower_keywords;
+        program.fragment = backend != "c";
         program.per_statement = Some(
             program
                 .g
@@ -1342,14 +1392,18 @@ fn main() {
         let mut program = generate(base);
         program.adversarial = adversarial;
         program.lower_keywords = lower_keywords;
+        program.fragment = backend != "c";
         print!("{}", program.render());
         return;
     }
+    let fragment = backend != "c";
     let modes = Modes {
         keep,
         cflags: std::mem::take(&mut cflags),
         adversarial,
         lower_keywords,
+        backend,
+        fragment,
     };
     if let Some(path) = &seed_list {
         // A named list is how the seeds that once found a bug stay in the gate:
@@ -1378,6 +1432,10 @@ struct Modes {
     cflags: Vec<String>,
     adversarial: bool,
     lower_keywords: bool,
+    /// The back end name `obc` is given, and whether that means the module is
+    /// generated in the fragment shape (PLAN.md W9.1).
+    backend: String,
+    fragment: bool,
 }
 
 fn run_list(picks: &[u64], obc: &Path, work: &Path, modes: &Modes) -> i32 {
@@ -1431,6 +1489,7 @@ fn one(seed: u64, obc: &Path, work: &Path, modes: &Modes) -> Result<(), String> 
     let mut program = generate(seed);
     program.adversarial = modes.adversarial;
     program.lower_keywords = modes.lower_keywords;
+    program.fragment = modes.fragment;
     let (src, expectation) = program.render_with_expectation();
     let dir = work.join(format!("seed-{seed}"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1446,6 +1505,7 @@ fn one(seed: u64, obc: &Path, work: &Path, modes: &Modes) -> Result<(), String> 
 
     let mut cmd = Command::new(obc);
     cmd.arg("build").arg(&path).arg("--out").arg(&dir).arg("-o").arg(dir.join("Fuzz"));
+    cmd.arg(format!("--backend={}", modes.backend));
     // Extra C flags, so the corpus can be run under the sanitizers the way the
     // golden suite runs its own programs twice (PLAN.md W7.5).
     for f in &modes.cflags {

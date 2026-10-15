@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod cgen;
+pub mod clif;
 pub mod const_eval;
 pub mod lexer;
 pub mod resolve;
@@ -185,6 +186,28 @@ pub fn emit_c_full<'input>(
     }
     let (c, h) = cgen::emit_module_checked(&m, &sema.types, &sema, checks);
     Ok(Ok((c, h)))
+}
+
+/// The same module through the Cranelift back end: an object file's bytes, or
+/// the diagnostics that say why not (DESIGN §16.2, PLAN.md W9.1).
+///
+/// The two `Result`s are the C back end's too, and mean the same thing: the
+/// outer one is a parse failure, the inner one the module's diagnostics. A
+/// construct the back end does not lower arrives as one of those diagnostics,
+/// carrying its span, so the driver prints the reason and where exactly as it
+/// prints a type error.
+pub fn emit_object_full<'input>(
+    input: &'input str,
+    interfaces: &[sym::Interface],
+    checks: cgen::Checks,
+    dialect: Dialect,
+) -> Result<Result<Vec<u8>, Vec<Diagnostic>>, ParseErr<'input>> {
+    let mut m = parse_module_dialect(input, dialect)?;
+    let sema = sema::Sema::check_owned(&mut m, interfaces);
+    if sema.diagnostics().iter().any(Diagnostic::is_error) {
+        return Ok(Err(sema.diags.clone()));
+    }
+    Ok(clif::emit_object(&m, &sema.types, &sema, checks))
 }
 
 /// Byte offset → `line:column` (1-based), the only place line information is

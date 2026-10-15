@@ -2123,3 +2123,107 @@ file descriptors with `write`. Sources: `cranelift-codegen/src/ir/libcall.rs:22-
 **Not established from these sources**, and therefore not claimed: the exact ELF
 relocation kinds and linker flags for a given target and PIC model (they depend on the
 link mode), and whether any component outside these crates can emit DWARF.
+
+### The prototype: a lowerer beside `cgen` **[implemented; `PLAN.md` W9.1]**
+
+`src/clif.rs` lowers the *same* checked AST and `sema` types `cgen` consumes, and
+`obc --backend=clif` (default `c`) writes one object file per module instead of a
+translation unit and a header. The scope is the fuzz corpus's fragment: `INTEGER`
+and `BOOLEAN`, one-dimensional fixed arrays of them, `+ - * DIV MOD /`, `ABS`,
+`ODD`, `MIN`/`MAX`, the three shifts, relations, assignment,
+`IF`/`WHILE`/`REPEAT`/`FOR`/`CASE`/`EXIT`/`RETURN`, `ASSERT`, value parameters,
+recursion, and the `fail[1]` index the corpus's self-checks trap through.
+Everything else is **refused by name** with the milestone that owes it
+(`PLAN.md` W9.2) and the byte it was refused at, so a second back end that
+disagrees says so instead of emitting something plausible.
+
+**The ABI decision: the runtime stays C.** The checks are the design's
+diagnostics — a message and a source byte — and the C runtime already is their
+one implementation, so the generated code calls it exactly as the emitted C does
+(§9.4's table). That is also what makes a mixed build link: both back ends put
+`<Module>__init`, `<Module>__load` and the command table in the object, and both
+call `rt_*`/`ob_*` by the same C names.
+
+*What the research did not prepare for*: the header's helpers are `static
+inline`, so `rt_div_at`, `rt_index` and `rt_trap_pos` are **macros** over
+functions with **no link-time identity at all** — the C path never needed one and
+the preprocessor hid that. Four entry points were added to the runtime
+(`ob_rt_index_at`, `ob_rt_div_at`, `ob_rt_mod_at`, `ob_rt_trap_pos`), each one
+calling its helper, so the floor-division rule, the bounds rule and the trap
+message keep one implementation; the C path does not call them and its behaviour
+is unchanged.
+
+**Optimisation.** `OptLevel` defaults to `none`, so the back end sets `speed`: an
+unoptimised back end measured against the C path's `-O2` would have been a
+comparison of two different questions. The ISA is the host's
+(`cranelift_native`), and the binary format is *checked* to be ELF rather than
+assumed: on a host whose format is something else the back end refuses by name.
+
+**The module.** Module variables are data objects (`Export` when the Oberon
+declaration is exported, else `Local`), zero-initialised, so both back ends read
+zero from a variable that was never assigned. `__init` is the module body and
+`__load` is `__init` plus `ob_register_commands(name, table)`, which is what the
+driver's loader has always called. The command table is a data object of
+`{name, fn}` pairs with a null terminator, built with `write_data_addr`/
+`write_function_addr` so the entries become relocations, and it holds only
+parameterless exported procedures — the same rule, and the same table, as §9.7's
+C. *Found here*: a table defined with `Init::Zeros` lands in `.bss`, whose
+relocations a static link cannot write (the section has no bytes in the file), so
+the loader read a table of nulls and found no command; the table therefore has
+*contents*, and a module variable (which carries no relocation) still does not.
+
+**The link step** is the C one: `cc <§9.1's flags> <units>.o oberon_runtime.c
+obc_main.c -o program`. The loader differs between the back ends in its prologue
+only — a lowered module has no header, so the loader declares `M__load` itself
+and includes `oberon.h` for the registry instead of including each module's `.h`.
+`obc emit --backend=clif` writes `<Name>.o` (and the `.sym`, which is front-end
+work and what an importer is checked against).
+
+**Shifts: the one rule the IR does not share.** Cranelift's shifts keep only the
+low five bits of the count, while report §8.2.2 defines `LSL(x,n) = x * 2^n` and
+`ASR(x,n) = x DIV 2^n`, so a count of 32 or more is *defined* — 0, and 0 or -1
+for `ASR` — exactly as R22 fixed in the C runtime. The back end lowers the count
+as `n & 31`, the shift, and a `select` on `n >= 32` (and `ROR` as two
+complementary shifts, which is the report's rotation mod 32). Wrapping needs
+nothing: `iadd`/`isub`/`imul` wrap by definition, which is what `-fwrapv` buys
+the C path. **[verified]** 29 of the 30 coverage programs contain a shift by 32,
+33 or 63; with that `select` removed from the lowering, 6 of those 30 fail
+(seeds 11, 12, 16, 17, 21, 28, each with its own self-check naming the variable
+and the value it expected, e.g. `seed-17` expected 3), and with it they all pass.
+
+**Two things the C path needed that this one does not.** There is no constant
+folder: its reason was C's warnings about the overflow *it* folds and C's
+tautology detection (R20, W6.2), neither of which exists in an IR whose
+arithmetic wraps and whose comparisons are values. And there is no evaluation
+order problem: operands are lowered in source order, so R23's class of defect —
+where one operand's call writes what another reads — cannot arise from the
+backend at all. `const_at`/`extreme_at` are still what names a constant and
+`MIN`/`MAX`.
+
+**One divergence, recorded rather than resolved — and it is narrower than it first
+looked.** For a *scalar* `CASE` with no matching label and no default arm, this
+lowerer was first written to trap and was changed to fall through, so that it agrees
+with the C back end, which is the reference for W9.1. The claim that the *report*
+requires the trap does not survive reading it: §9.5 defines which arm runs, requires
+the labels' types to fit the expression's, and says nothing at all about a value that
+matches no label [verified against `books/Oberon07.Report.pdf`, §9.5 in full]. So
+what is left is not a conformance bug but an inconsistency between our own two
+*checks*: a **type**-`CASE` with no match traps with its offset (§9.4) and warns when
+it has no default arm, while a scalar `CASE` falls through silently. Which of those
+the scalar case should do is a decision about the C path, recorded as PLAN.md W2.5 —
+not something this back end should settle by disagreeing with it.
+
+**Evidence.** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
+value oracle), the same 9 under the adversarial trap oracle, the same 9 in the
+`-Odialect=lower` dialect, then 30 coverage seeds and 10 adversarial coverage
+seeds — **67 programs, 0 failures** (against the same corpus's numbers on the C
+path, which `bash fuzz/run.sh` prints). The two blocks the clif mode does not run
+are the collector's, whose oracle needs records and pointers (W9.2); `golden` and
+`csmoke` stay on the C path, as `PLAN.md` W9.1 says they must. Trap parity is
+byte-for-byte with the C path on the cases the driver builds by hand: the same
+`assertion failed (at byte 105 …)` for `ASSERT`, `DIV by zero (at byte 91 …)` and
+`MOD by zero (at byte 92 …)` for a zero divisor, and the same
+`index out of range (at byte 303 …)` for the corpus's own check — plus a
+hand-written module whose command is dispatched by `--command M.P` through the
+runtime's registry, which is the part of the object/ABI plumbing the corpus
+cannot reach.

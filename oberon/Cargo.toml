@@ -7,4 +7,10 @@ edition = "2021"
 lalrpop = "0.23"
 
 [dependencies]
+cranelift-codegen = "0.136"
+cranelift-frontend = "0.136"
+cranelift-module = "0.136"
+cranelift-native = "0.136"
+cranelift-object = "0.136"
 lalrpop-util = { version = "0.23", features = ["lexer", "unicode"] }
+target-lexicon = "0.13"

@@ -189,6 +189,35 @@ and the failing record-spelling write compiles and traps with the guard's offset
 under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
 program built with `--cc clang`). The pointer spelling was already tested.
 
+**W2.5 a scalar `CASE` with no matching label falls through, silently** — **open, a decision**
+
+**Found while writing the second back end** (W9.1), which had to choose between
+agreeing with the C path and trapping: it agrees with the C path, which is the
+reference, and the choice is left here.
+
+What is true, having read the report rather than trusting a summary of it: §9.5
+defines which arm runs and that the labels' types must fit the expression, and says
+**nothing** about a value that matches no label. So both behaviours are conforming,
+and ours are *inconsistent*: a **type**-`CASE` with no match traps with its source
+offset and warns when it has no default arm (catalogue row 39 and §9.4), while a
+scalar `CASE` with no match and no default falls through without a word. The second
+is a silent undefined result where the first is a located diagnostic, which is the
+opposite of this design's stance everywhere else — and a program that relies on the
+fall-through would stop compiling into the same behaviour, so it is a decision rather
+than a fix.
+
+Options, with what each costs: **trap** (consistent with the type-`CASE`, with
+"trap rather than silence", and with the design's own treatment of a missing guard;
+it changes the emitted C for any scalar `CASE` without a default, which is why it
+needs saying out loud); **warn and keep falling through** (the cheapest consistency:
+the reader is told, the behaviour is unchanged, and catalogue row 39's note covers
+it); or **leave both** and record that the asymmetry is deliberate, which needs a
+reason better than "it was always that way".
+
+Done when: one of the three is chosen, DESIGN §9.6's row for the scalar `CASE` says
+what the choice is rather than what the code happens to do, and the suites pin it
+(a warning row, or a trap row, or an explicit "no contract here" row).
+
 **W2.4 a pointer array cannot see a record declared later in the module** — **done**
 
 **Found while building the collector** (W10.2), and *not* caused by it: the same
@@ -1175,7 +1204,8 @@ Done when: each item above has either landed with tests or been declined in DESI
 
 ## W9 — a second back end that emits ELF directly, on Cranelift
 
-**W9.1 research the back end, then build it beside the C one** — **open**
+**W9.1 research the back end, then build it beside the C one** — **done**
+(the research is DESIGN §16, the prototype is §16's second subsection)
 
 Why: every memory-safety and code-generation finding of W7 has been about the *C*
 the emitter writes, not about Oberon-07 — R15 (a guarded read gcc can prove is
@@ -1238,7 +1268,27 @@ end, and only then is "generates ELF directly" literally true of the whole progr
 Done when: the research questions are answered with their sources in DESIGN; a
 prototype builds and runs the `e2e` modules with every row passing; `fuzz`'s seeds
 pass against it; and DESIGN records the ABI decision (runtime in C versus lowered)
-with the reason it was taken.
+with the reason it was taken. (When the item was split, the `e2e` half of this
+line moved to W9.1's successor — W9.2 — and the acceptance test for W9.1 became
+the fuzz corpus, which is what the prototype was finished against.)
+
+**Done.** `src/clif.rs` lowers the fuzz corpus's fragment to Cranelift IR and
+emits one object per module through `cranelift-object`; `obc --backend=c|clif`
+(default `c`) writes that object and links it with the same runtime and loader;
+`obgen --backend=clif` generates the fragment and `fuzz/run.sh` runs the standard
+oracle against it (`BACKEND=clif bash fuzz/run.sh`: **67 programs, 0 failures** —
+the 9-seed regression list as a value oracle, as a trap oracle and in the
+lower-case dialect, 30 coverage seeds, 10 adversarial coverage seeds). The
+research's open questions are answered in DESIGN §16, the prototype in the
+subsection after it, and the one thing the research could not have known — the
+runtime's checks are `static inline` helpers with no link-time identity, so four
+`ob_rt_*` entry points had to be added — is there with the runs that settle the
+shift rule (29 of 30 coverage programs carry a count of 32 or more; 6 fail if the
+rule is dropped), the `OptLevel`, the module/command-table shape and the one
+divergence it found in the C path (a scalar `CASE` with no matching label falls
+through there, where report §9.5 says the program is aborted; the second back end
+was made to agree with the C path, and the C path's behaviour is left alone
+because W9.1 does not change it).
 
 **Split, so that the first half is completable rather than open-ended.** The research
 half is done. The prototype is now W9.1 proper, scoped to the **fuzz corpus**:

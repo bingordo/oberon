@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use oberon_front::{
-    cgen, check_module_recovering_dialect, emit_c_full, emit_interface_dialect, limit_errors,
-    parse_with_diagnostics_dialect, render_diagnostics, sym, Diagnostic,
-    Dialect,
+    cgen, check_module_recovering_dialect, emit_c_full, emit_interface_dialect,
+    emit_object_full, limit_errors, parse_with_diagnostics_dialect, render_diagnostics, sym,
+    Diagnostic, Dialect,
 };
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
@@ -42,6 +42,26 @@ enum Mode {
     Run,
 }
 
+/// Which back end writes the code for the modules this build has source for
+/// (PLAN.md W9.1). `c` is the reference and the default; `clif` emits an object
+/// file per module instead of a translation unit and a header, and the driver
+/// links it the same way (DESIGN §16.2).
+#[derive(PartialEq, Clone, Copy)]
+enum Backend {
+    C,
+    Clif,
+}
+
+impl Backend {
+    fn from_name(name: &str) -> Option<Backend> {
+        match name {
+            "c" => Some(Backend::C),
+            "clif" => Some(Backend::Clif),
+            _ => None,
+        }
+    }
+}
+
 struct Opts {
     mode: Mode,
     root: PathBuf,
@@ -55,6 +75,8 @@ struct Opts {
     cflag: Vec<String>,
     command: Option<(String, String)>,
     keep: bool,
+    /// Which back end emits this build's modules.
+    backend: Backend,
     /// How many errors to print before saying the rest were suppressed; `0` is
     /// no limit (PLAN.md W5.2).
     ferror_limit: usize,
@@ -66,10 +88,13 @@ struct Opts {
     dialect: Dialect,
 }
 
-/// One module in the link: source this build emitted, or C found on disk.
+/// One module in the link: code this build emitted, or C found on disk. What
+/// the code *is* depends on the back end that wrote it — a translation unit for
+/// the C back end, an object file for the Cranelift one — and both go to the C
+/// compiler's command line, which is why the two live in one field.
 struct Unit {
     name: String,
-    c: PathBuf,
+    code: PathBuf,
 }
 
 fn usage() -> ExitCode {
@@ -89,7 +114,9 @@ fn usage() -> ExitCode {
          \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)
          \x20 -Ochecks[=LIST]   runtime checks: all (default), none, or a list of
          \x20                   index, nil, guard and case
-         \x20 -Odialect=NAME    report (default) or lower, which folds reserved-word case)"
+         \x20 -Odialect=NAME    report (default) or lower, which folds reserved-word case\n\
+         \x20 --backend=NAME    c (default) writes C, clif writes an object file per\n\
+         \x20                   module with the Cranelift back end (PLAN.md W9.1))"
     );
     ExitCode::FAILURE
 }
@@ -146,6 +173,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         cflag: Vec::new(),
         command: None,
         keep: false,
+        backend: Backend::C,
         ferror_limit: 20,
         checks: cgen::Checks::ALL,
         dialect: Dialect::Report,
@@ -173,6 +201,19 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
+            other if other.starts_with("--backend=") => {
+                let name = &other["--backend=".len()..];
+                match Backend::from_name(name) {
+                    Some(b) => o.backend = b,
+                    None => {
+                        eprintln!(
+                            "obc: `--backend={name}` is not a back end this compiler has; \
+                             expected c or clif"
+                        );
+                        return None;
+                    }
+                }
+            }
             other if other.starts_with("-Odialect=") => {
                 let name = &other["-Odialect=".len()..];
                 match Dialect::from_name(name) {
@@ -261,7 +302,10 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
 
     // 3. Runtime, loader, and the C compiler.
     write_runtime(o)?;
-    write(&o.out.join("obc_main.c"), &loader_source(&units, o.command.as_ref()))?;
+    write(
+        &o.out.join("obc_main.c"),
+        &loader_source(&units, o.command.as_ref(), o.backend),
+    )?;
     let exe = o.exe.clone().unwrap_or_else(|| {
         if o.mode == Mode::Build {
             PathBuf::from(format!("./{root}"))
@@ -279,8 +323,10 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     for dir in &o.search {
         cmd.arg("-I").arg(dir);
     }
+    // A unit is a `.c` or a `.o`; the compiler driver takes either, which is
+    // what makes the back ends interchangeable here (DESIGN §16.2).
     for u in &units {
-        cmd.arg(&u.c);
+        cmd.arg(&u.code);
     }
     cmd.arg(o.out.join("oberon_runtime.c"));
     cmd.arg(o.out.join("obc_main.c"));
@@ -379,7 +425,7 @@ fn emit_tree(
                     }
                     units.push(Unit {
                         name: m.clone(),
-                        c,
+                        code: c,
                     });
                     done.insert(m);
                 }
@@ -447,14 +493,33 @@ fn emit_tree(
         return Err(format!("`{name}` does not check"));
     }
     let _ = parsed;
-    let (c, h) = emit_c_full(src, interfaces, o.checks, o.dialect)
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .map_err(|diags| {
-            print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
-            format!("`{name}` does not check")
-        })?;
-    write(&o.out.join(format!("{name}.c")), &c)?;
-    write(&o.out.join(format!("{name}.h")), &h)?;
+    // The two back ends diverge in what they write: a translation unit and a
+    // header the C compiler is handed, or an object file that is handed to the
+    // same command line. Both are linked with the same runtime and loader
+    // (DESIGN §16.2), so the rest of the driver does not care which it was.
+    let code = match o.backend {
+        Backend::C => {
+            let (c, h) = emit_c_full(src, interfaces, o.checks, o.dialect)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .map_err(|diags| {
+                    print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
+                    format!("`{name}` does not check")
+                })?;
+            write(&o.out.join(format!("{name}.c")), &c)?;
+            write(&o.out.join(format!("{name}.h")), &h)?;
+            o.out.join(format!("{name}.c"))
+        }
+        Backend::Clif => {
+            let object = emit_object_full(src, interfaces, o.checks, o.dialect)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .map_err(|diags| {
+                    print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
+                    format!("`{name}` was not lowered by the clif back end")
+                })?;
+            write_bytes(&o.out.join(format!("{name}.o")), &object)?;
+            o.out.join(format!("{name}.o"))
+        }
+    };
     if let Some(text) = emit_interface_dialect(src, interfaces, o.dialect) {
         write(&o.out.join(format!("{name}.sym")), &text)?;
         if let Ok(iface) = sym::parse(&text) {
@@ -465,7 +530,7 @@ fn emit_tree(
     }
     units.push(Unit {
         name: name.to_string(),
-        c: o.out.join(format!("{name}.c")),
+        code,
     });
     done.insert(name.to_string());
     stack.pop();
@@ -533,11 +598,34 @@ fn find_file(o: &Opts, name: &str) -> Option<PathBuf> {
 /// The loader `main`: load the modules in dependency order. Each `<M>__load`
 /// runs that module's body and registers its commands, which is exactly what
 /// report §11 says happens when a module is loaded.
-fn loader_source(units: &[Unit], command: Option<&(String, String)>) -> String {
+///
+/// The two back ends need the same `main` with different prologues. The C back
+/// end's modules declare themselves in a header, so the loader includes it; a
+/// module the Cranelift back end lowered has no header at all — its interface is
+/// the object and the `.sym` — so the loader declares the one entry point it
+/// calls. Either way the command dispatch is the same, because it goes through
+/// the runtime's registry and not through a module's names (DESIGN §16.2).
+fn loader_source(
+    units: &[Unit],
+    command: Option<&(String, String)>,
+    backend: Backend,
+) -> String {
     let mut out = String::from("/* Generated by obc: load the modules, in dependency order. */\n");
     out.push_str("#include <stdio.h>\n");
-    for u in units {
-        out.push_str(&format!("#include \"{}.h\"\n", u.name));
+    match backend {
+        Backend::C => {
+            for u in units {
+                out.push_str(&format!("#include \"{}.h\"\n", u.name));
+            }
+        }
+        Backend::Clif => {
+            // `ob_run_command` is the runtime's, so the registry's declaration
+            // is what this file includes.
+            out.push_str("#include \"oberon.h\"\n");
+            for u in units {
+                out.push_str(&format!("void {}__load(void);\n", u.name));
+            }
+        }
     }
     out.push_str("\nint main(void) {\n");
     for u in units {
@@ -578,4 +666,9 @@ fn read(path: &Path) -> Result<String, String> {
 
 fn write(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The object a back end produced is bytes, not text.
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }

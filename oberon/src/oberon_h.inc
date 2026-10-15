@@ -320,4 +320,19 @@ static inline void rt_rec_copy(void *dst, const void *src, int32_t n, const ObDe
     *(const ObDesc **)dst = self;
 }
 
+/* ------------------------------------------------------ the object boundary */
+
+/* The Cranelift back end (DESIGN 16.2) reaches the checks above through the
+ * linker rather than the preprocessor, and a `static inline` helper has no
+ * identity to link against: there is no symbol for a generated object to call,
+ * which is the one thing the C path's shape hid. These four are that identity,
+ * one per check a generated object makes, and each calls the helper it is named
+ * after rather than repeating it, so the rule keeps one implementation. Nothing
+ * in the emitted C calls them, and the C back end's behaviour is unchanged by
+ * their presence. */
+int32_t ob_rt_index_at(int32_t i, int32_t n, int32_t at);
+int32_t ob_rt_div_at(int32_t x, int32_t y, int32_t at);
+int32_t ob_rt_mod_at(int32_t x, int32_t y, int32_t at);
+void ob_rt_trap_pos(const char *msg, int32_t at);
+
 #endif /* OBERON_H */
