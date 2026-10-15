@@ -902,7 +902,7 @@ is added or removed by `-Ochecks`" half of row 60 is `csmoke`'s
 | 36 | duplicate `CASE` label, or overlapping ranges | §9.5 | E |
 | 37 | type-`CASE` label that does not extend the case variable's type | §9.5 | E |
 | 38 | type-`CASE` on something other than a pointer or VAR record parameter | §9.5 | E |
-| 39 | type-`CASE` where the arms are not exhaustive and there is no default arm | §9.5 | W |
+| 39 | a `CASE` — scalar or type — with no default arm, since a value matching no label then traps (W2.5; report §9.5 is silent on that case, and the design's answer to undefined is a located trap) | §9.5 | W |
 | 40 | constant expression expected (const decl, array length, case label, `BY`) but the expression is not constant | §5, §6.2, §9.5, §9.8 | E |
 | 41 | array length not a positive constant | §6.2 | E |
 | 42 | record base type (`RECORD (T)`) is not a record, or is a self/cyclic extension | §6.3 | E |
@@ -1201,9 +1201,9 @@ is wider than the `INTEGER` a temporary of its type would be (§9.10, R31).
 | procedure call | `f(&a, b, c);` — VAR actuals get `&`, structured value actuals get a caller-made copy |
 | `IF … ELSIF … ELSE … END` | `if (…) { … } else if (…) { … } else { … }` |
 | `WHILE g1 DO S1 ELSIF g2 DO S2 END` | `for (;;) { if (g1) {S1} else if (g2) {S2} else break; }` (report §9.6: repeat until no guard is true) |
-| `REPEAT S UNTIL c` | `do { S } while (!(c));` |
+| `REPEAT S UNTIL c` | `for (;;) { S if (c) break; }` — not `do … while`, because a guard temporary has to be remade inside the loop rather than hoisted out of it |
 | `FOR v := b TO e BY k DO S END` | `for (v = b; k > 0 ? v <= e : v >= e; v += k) { S }` — equal to the report's while-form for every `k != 0`, and `k == 0` is rejected by check 34 (`golden` checks all five range shapes against the desugared form) |
-| `CASE c OF … END` (scalar) | `switch (c)` with one `case` per label and ranges flattened to consecutive labels |
+| `CASE c OF … END` (scalar) | `switch (c)` with one `case` per label and ranges flattened to consecutive labels, and a `default: rt_trap_pos("CASE: no matching label", <subject>)` when the program wrote no default arm (W2.5) — the same answer the type-`CASE` gives, and switchable with `-Ochecks=case` |
 | `CASE v OF T1: S1 \| … END` (type case) | `switch (RT_DESC(v)->id)` + arm-local cast |
 
 The `FOR` header is exactly the report §9.8 equivalence, and its iteration counts

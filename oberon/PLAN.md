@@ -189,7 +189,7 @@ and the failing record-spelling write compiles and traps with the guard's offset
 under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
 program built with `--cc clang`). The pointer spelling was already tested.
 
-**W2.5 a scalar `CASE` with no matching label falls through, silently** — **open, a decision**
+**W2.5 a scalar `CASE` with no matching label falls through, silently** — **done**
 
 **Found while writing the second back end** (W9.1), which had to choose between
 agreeing with the C path and trapping: it agrees with the C path, which is the
@@ -229,7 +229,16 @@ what the code happens to do, the warning and the trap are emitted (the trap with
 byte, the warning only when there is no default arm, as for the type-`CASE`), the C
 back end and the Cranelift one agree on it — W9.2b lowers this shape, so the two must
 land together or the second inherits the old silence — and the suites pin both: a
-`trap-` row in `e2e` asserting the exact line, and a row for the warning.
+`trap-` row in `e2e` asserting the exact line, and a row for the warning. **Done**:
+the emitter writes the trapping `default` under `-Ochecks=case`, the checker warns for
+any `CASE` without a default arm (catalogue row 39), §9.6's row says so, and the
+Cranelift lowerer moved with it in the same change — same message, same byte (the
+subject's span), same switch — verified on both back ends. Rows:
+`trap-case-no-matching-label` (asserting the exact line and the abort),
+`a-default-less-case-warns`, and the fixtures that relied on the old silence updated
+rather than accommodated: `Regress.mod`'s ranged `CASE`s, the kitchen-sink module, and
+the early-`RETURN` row, whose fall-through arm is now a default arm because a
+fall-through no longer exists.
 
 **W2.4 a pointer array cannot see a record declared later in the module** — **done**
 

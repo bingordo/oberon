@@ -339,6 +339,20 @@ else
     fail=$((fail + 1))
 fi
 
+# A scalar CASE with no default arm warns and, if a value matches no label, traps
+# with the subject's offset (W2.5) — the type CASE has behaved that way all along.
+trap_case case-no-matching-label 'MODULE Cnl;
+  VAR i: INTEGER; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  i := 5;
+  CASE i OF 1: i := 1 | 2: i := 2 END;
+  ok[1] := 0
+END Cnl.
+' 'oberon: trap: CASE: no matching label (at byte'
+printf 'MODULE CnlW;\n  VAR i: INTEGER;\nBEGIN\n  i := 1;\n  CASE i OF 1: i := 2 END\nEND CnlW.\n' > "$DRV/CnlW.mod"
+"$OBC" check "$DRV/CnlW.mod" >"$DRV/cnlw.out" 2>&1 || true
+check "a-default-less-case-warns" "1" "$(grep -c 'this CASE has no default arm' "$DRV/cnlw.out")"
+
 trap_case case-no-match 'MODULE T6;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P;
