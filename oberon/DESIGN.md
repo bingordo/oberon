@@ -2028,3 +2028,98 @@ Two things only a run could settle, and both are in the runtime as written:
   and `setjmp` puts it in the frame the walk is already reading. Completing this
   precisely is what W9's stack maps are for, and it would change nothing else
   here.
+
+## 16. A second back end on Cranelift: what the crates give **[researched; the prototype is PLAN.md W9.1]**
+
+Read from the crate sources, not from the manual, at the version pinned below. Every
+claim here names what backs it; where a question could not be settled from those
+sources, it says so rather than guessing.
+
+**The crates** (crates.io, 2026-10-15): `cranelift`, `cranelift-codegen`,
+`cranelift-frontend`, `cranelift-module`, `cranelift-object` — *"Emit Cranelift
+output to native object files with `object`"*, which is the ELF path — plus
+`cranelift-native` and `cranelift-control`, all at **0.136.3** and all
+`Apache-2.0 WITH LLVM-exception`. There is **no crate called `cranelift-backend`**;
+the family above is what to read.
+
+**Objects and ELF.** `ObjectBuilder::new(isa, name, libcall_names)` chooses its binary
+format from `isa.triple().binary_format`, so an ELF host gets ELF but native
+autodetection does not *force* it: a build that must be ELF everywhere needs an
+explicit ELF triple rather than `Triple::host()`. Functions and data are declared and
+defined through `cranelift_module::Module` (`declare_function`, `define_function`,
+`declare_data`, `define_data`) and the bytes come from `ObjectModule::finish()` →
+`ObjectProduct::emit()`, which is what `object::write` serialises. A static table of
+addresses — the descriptor objects and a command table of function pointers — is a
+`DataDescription` with `write_data_addr`/`write_function_addr` at the slots, which
+becomes *relocations* against those symbols rather than baked addresses; the exact
+ELF relocation kind depends on target, PIC model and symbol preemptibility, and the
+generic API does not name it. Inside a function, a symbol's address comes from
+`declare_func_in_func` + `func_addr`, or `declare_data_in_func` + `symbol_value`.
+Sources: `cranelift-object/src/backend.rs:42-65,254-270,678-747,1128-1165`;
+`cranelift-module/src/module.rs:839-952,955-997`;
+`cranelift-module/src/data_context.rs:17-56,122-162`;
+`cranelift-object/tests/basic.rs:273-315`.
+
+**The C ABI boundary, which is the interesting one here.** The runtime stays C, so the
+generated code must call `rt_index`, `rt_div_at`, `rt_new`, `rt_trap_pos` as the C
+compiler would call them. `module.make_signature()` takes the target ISA's default
+convention, and `CallConv::triple_default` is SysV, AppleAarch64 or WindowsFastcall
+according to the triple — so the host's C ABI is what a signature gets unless asked
+otherwise, and hard-coding `SystemV` would be wrong on other hosts.
+`Type::I32` is `int32_t`, `module.target_config().pointer_type()` is the pointer and
+`size_t` width, and a declaration is `Linkage::Import` for a runtime function,
+`Linkage::Export` for a generated entry point. `Signature` carries parameters,
+results and convention — **no `noreturn` bit and no varargs**, so a trapping helper is
+an ordinary call and the emitter must model the unreachable successor itself.
+Sources: `cranelift-codegen/src/ir/extfunc.rs:20-57,138-183`;
+`cranelift-codegen/src/isa/call_conv.rs:14-41,62-73`; `cranelift-module/src/module.rs:839-952`.
+
+**Layout.** The IR has scalar, vector and floating types, not records: a record is a
+byte region reached through a pointer, with the field offsets computed by *us* —
+which is the same arrangement the C back end already has, so the layout code can be
+shared rather than re-derived. `StackSlotData` takes a byte size and an alignment
+exponent, and `stack_addr` materialises the address. Sources:
+`cranelift-codegen/src/ir/types.rs:9-27`; `cranelift-codegen/src/ir/stackslot.rs:22-32,57-71`;
+`cranelift-frontend/src/frontend.rs:573-577`.
+
+**Checks and traps.** Keeping every check as a call into the runtime is sufficient and
+is what this design wants: Cranelift's own `trap`/`trapz`/`trapnz` exist
+(`TrapCode` includes division by zero and overflow), but the crates do not promise a
+process signal or an exit status for them, while our runtime's report *is* the
+diagnostic — a message and a source byte — so the call is the mechanism that
+preserves it. Sources: `cranelift-codegen/src/ir/trapcode.rs:16-48`;
+`cranelift-module/src/module.rs:910-926`; versioned `InstBuilder` docs for
+`trap`/`trapz`/`trapnz`.
+
+**Debug information: there is none to be had here, and the design does not need it.**
+`cranelift-object` exposes an *unwind* builder (`.eh_frame`, CFI for unwinding), not
+a source-line or type-info writer; codegen carries `SourceLoc` but the object backend
+does not serialise it as DWARF. The traps carry their own offsets, which is the
+design's stance anyway (§10). Sources: `cranelift-object/src/backend.rs:144-155,738-747`;
+`cranelift-object/src/unwind.rs:1-7,80-108`; `cranelift-codegen/src/ir/sourceloc.rs:18-35`.
+
+**Optimisation and integer semantics.** `OptLevel` is `none`, `speed` or
+`speed_and_size`, and the **default is `none`** — so a prototype must set it, or it
+measures an unoptimised back end against `-O2`. Wrapping is not a flag here: `iadd`
+and `imul` wrap modulo 2^B by definition, which is exactly what §9.1's `-fwrapv`
+buys the C back end, and `sdiv` traps on a zero divisor and on `MIN / -1`. The one
+rule that does **not** carry over is shifts: only the low B bits of an `ishl`/`ushr`/
+`sshr` count are significant, so `LSL(x, 33)` is not 0 the way report §8.2.2 says —
+the language's own rule has to be implemented, exactly as R22 fixed it in the C
+runtime, and the corpus generates those counts on purpose. Sources:
+`cranelift-codegen/src/settings.rs:16-20,490-503,555-567`;
+`cranelift-codegen/src/context.rs:174-195`; the official IR specification's shift
+rule; `cranelift-codegen/src/isa/x64/lower.isle:4488-4499` for the two trapping
+conditions of signed division.
+
+**The runtime, if it is ever lowered rather than compiled.** `memcpy`, `memset`,
+`memmove` and `memcmp` have `LibCall` variants with libc names by default
+(`FunctionBuilder::call_memcpy`/`call_memset`), while `malloc`, `getenv`, `write`,
+`abort` and `exit` are ordinary `Linkage::Import` declarations with C signatures. A
+variadic `printf` is not expressible, which costs nothing here: the runtime writes to
+file descriptors with `write`. Sources: `cranelift-codegen/src/ir/libcall.rs:22-62`;
+`cranelift-frontend/src/frontend.rs:841-868,943-966`.
+
+**Not established from these sources**, and therefore not claimed: the exact ELF
+relocation kinds and linker flags for a given target and PIC model (they depend on the
+link mode), and whether any component outside these crates can emit DWARF.
