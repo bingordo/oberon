@@ -407,3 +407,23 @@ int32_t ob_rt_mod_at(int32_t x, int32_t y, int32_t at) {
 void ob_rt_trap_pos(const char *msg, int32_t at) {
     rt_trap_pos(msg, at);
 }
+
+int32_t ob_rt_is(const ObDesc *d, const ObDesc *target) {
+    return rt_is(d, target);
+}
+
+void ob_rt_rec_copy(void *dst, const void *src, int32_t n, const ObDesc *self) {
+    rt_rec_copy(dst, src, n, self);
+}
+
+/* A guard's report. The C back end bakes the byte into a literal per guard site
+ * ("type guard failed at byte N"), which a lowered call cannot do, so the byte is
+ * a parameter and the text is formatted here — byte for byte what that literal
+ * prints, with `at` negative so the reporter adds no suffix of its own. */
+void ob_rt_guard_at(int32_t cond, int32_t at) {
+    if (!cond) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "type guard failed at byte %d", (int)at);
+        rt_trap_pos(msg, -1);
+    }
+}

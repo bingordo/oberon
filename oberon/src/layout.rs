@@ -62,6 +62,25 @@ pub struct Member {
     pub offset: u64,
 }
 
+/// What a field access needs of a record: the base it embeds (whose fields are
+/// its own, at the base's offsets), and its *own* fields with the offsets and
+/// types the C struct has. Both the descriptor and the base are at offset 0
+/// (§9.3, and the facts `e2e`'s comparison pins: `Cell.desc offset=0`,
+/// `Paired.base offset=0`), so nothing here has to carry them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RecordLayout {
+    pub base: Option<TypeId>,
+    pub fields: Vec<(String, u64, TypeId)>,
+}
+
+/// Everything a back end keeps after the walk: a size/alignment per type, and a
+/// record's own fields for whoever has to address one.
+#[derive(Default)]
+pub struct Tables {
+    pub layouts: HashMap<TypeId, Layout>,
+    pub records: HashMap<TypeId, RecordLayout>,
+}
+
 /// The layouts of one module's types, memoized: a record's layout is its
 /// members' layouts, and the type graph is a DAG through arrays and bases (a
 /// record reached through a pointer is not a member, so the walk terminates).
@@ -70,6 +89,7 @@ pub struct Layouts<'a> {
     pointer: u64,
     cache: HashMap<TypeId, Option<Layout>>,
     members: HashMap<TypeId, Vec<Member>>,
+    records: HashMap<TypeId, RecordLayout>,
 }
 
 impl<'a> Layouts<'a> {
@@ -81,6 +101,7 @@ impl<'a> Layouts<'a> {
             pointer: pointer_bytes,
             cache: HashMap::new(),
             members: HashMap::new(),
+            records: HashMap::new(),
         }
     }
 
@@ -135,6 +156,7 @@ impl<'a> Layouts<'a> {
                         offset: 0,
                     });
                 }
+                let mut own = Vec::new();
                 for f in fields {
                     let fl = self.of(f.ty)?;
                     offset = round_up(offset, fl.align);
@@ -142,10 +164,18 @@ impl<'a> Layouts<'a> {
                         name: mangle(&f.name),
                         offset,
                     });
+                    own.push((mangle(&f.name), offset, f.ty));
                     offset += fl.size;
                     align = align.max(fl.align);
                 }
                 self.members.insert(t, members);
+                self.records.insert(
+                    t,
+                    RecordLayout {
+                        base,
+                        fields: own,
+                    },
+                );
                 Some(Layout::new(round_up(offset, align), align))
             }
             Type::OpenArray { .. } | Type::Nil | Type::StringLit(_) | Type::Error => None,
@@ -157,11 +187,38 @@ impl<'a> Layouts<'a> {
     /// The layouts every type asked for since `new`, without the ones that have
     /// no storage: the module-wide table a back end keeps instead of borrowing
     /// this walk at every use.
-    pub fn resolved(self) -> HashMap<TypeId, Layout> {
-        self.cache
-            .into_iter()
-            .filter_map(|(t, l)| l.map(|l| (t, l)))
-            .collect()
+    pub fn resolved(self) -> Tables {
+        Tables {
+            layouts: self
+                .cache
+                .into_iter()
+                .filter_map(|(t, l)| l.map(|l| (t, l)))
+                .collect(),
+            records: self.records,
+        }
+    }
+
+    /// A record's own fields, with the offsets a `Field` selector adds to. It
+    /// walks the base chain, so an inherited field is found where the derived
+    /// record's layout puts it.
+    pub fn field_offset(&mut self, rec: TypeId, name: &str) -> Option<(u64, TypeId)> {
+        let mut cur = rec;
+        for _ in 0..64 {
+            let r = self.record_of(cur)?;
+            if let Some((_, off, ty)) = r.fields.iter().find(|(n, _, _)| n == name) {
+                return Some((*off, *ty));
+            }
+            cur = r.base?;
+        }
+        None
+    }
+
+    /// A record's own fields, in declaration order.
+    pub fn record_of(&mut self, rec: TypeId) -> Option<RecordLayout> {
+        if !self.records.contains_key(&rec) {
+            let _ = self.of(rec);
+        }
+        self.records.get(&rec).cloned()
     }
 
     /// The members a record *declares*: its descriptor or base, then its own
@@ -171,6 +228,69 @@ impl<'a> Layouts<'a> {
             let _ = self.of(rec);
         }
         self.members.get(&rec).cloned().unwrap_or_default()
+    }
+}
+
+/// The offsets inside the runtime's `ObDesc`, which the C side has as a struct
+/// (`oberon.h`): `{ const ObDesc *base; int32_t id; const char *name; const
+/// ObFld *fields; int32_t nfields; }`. It is a fixed shape rather than a
+/// program's type, so it is computed here once — with the same padding rule as
+/// everything else — instead of being written out as literals that a change to
+/// the C struct would silently falsify. The collector reads `fields`/`nfields`
+/// on every mark, so a mistake here is a crash rather than a wrong number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ObDesc {
+    pub size: u64,
+    pub base: u64,
+    pub id: u64,
+    pub name: u64,
+    pub fields: u64,
+    pub nfields: u64,
+}
+
+/// The same for `ObFld { size_t off; size_t stride; size_t n; const ObDesc
+/// *desc; }` — all `size_t`, so every member is pointer-aligned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ObFld {
+    pub size: u64,
+    pub off: u64,
+    pub stride: u64,
+    pub n: u64,
+    pub desc: u64,
+}
+
+pub fn ob_desc(pointer_bytes: u64) -> ObDesc {
+    let p = pointer_bytes;
+    let mut off = 0;
+    let base = off;
+    off += p;
+    let id = off;
+    off += 4;
+    off = round_up(off, p);
+    let name = off;
+    off += p;
+    let fields = off;
+    off += p;
+    let nfields = off;
+    off += 4;
+    ObDesc {
+        size: round_up(off, p),
+        base,
+        id,
+        name,
+        fields,
+        nfields,
+    }
+}
+
+pub fn ob_fld(pointer_bytes: u64) -> ObFld {
+    let p = pointer_bytes;
+    ObFld {
+        size: 4 * p,
+        off: 0,
+        stride: p,
+        n: 2 * p,
+        desc: 3 * p,
     }
 }
 

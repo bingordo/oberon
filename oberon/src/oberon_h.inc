@@ -334,5 +334,8 @@ int32_t ob_rt_index_at(int32_t i, int32_t n, int32_t at);
 int32_t ob_rt_div_at(int32_t x, int32_t y, int32_t at);
 int32_t ob_rt_mod_at(int32_t x, int32_t y, int32_t at);
 void ob_rt_trap_pos(const char *msg, int32_t at);
+int32_t ob_rt_is(const ObDesc *d, const ObDesc *target);
+void ob_rt_rec_copy(void *dst, const void *src, int32_t n, const ObDesc *self);
+void ob_rt_guard_at(int32_t cond, int32_t at);
 
 #endif /* OBERON_H */

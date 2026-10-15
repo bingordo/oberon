@@ -189,6 +189,19 @@ and the failing record-spelling write compiles and traps with the guard's offset
 under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
 program built with `--cc clang`). The pointer spelling was already tested.
 
+**W2.6 a `NIL` pointer where a type is asked for faults on the C path** — **done**
+
+**Found by W9.2b** (the second back end), by running the same module through both:
+`p IS T` and a type-`CASE` on a `NIL` pointer subject read the descriptor at address
+zero, so a program asking a *question* died of a fault with no message. The guard
+spelling had always checked first, and the lowerer answered the report — `NIL IS T` is
+false, and a `NIL` subject matches no label — which is how the C path's gap showed up.
+
+**Fixed** in the same change as the finding: `IS` orders its test as the guard does,
+and a pointer type-`CASE` switches on the "no type" sentinel `0`, which no label
+carries, leaving the default arm or W2.5's located trap to answer. Row:
+`nil-has-no-type`, which fails on the old code by dying.
+
 **W2.5 a scalar `CASE` with no matching label falls through, silently** — **done**
 
 **Found while writing the second back end** (W9.1), which had to choose between
@@ -1407,6 +1420,21 @@ written down):
   and guards that read a descriptor. Done when the corpus's *collector* blocks run
   in the clif mode (`fuzz/run.sh`, `obgen --backend=clif` widening accordingly): a
   pointer graph is the only thing that takes those paths apart.
+  **Done.** Descriptors, field maps and root registrations are data objects under
+  the C back end's names, with every offset from `layout.rs`; `NEW` allocates
+  through `rt_new` and initialises the nested descriptors; fields, implicit
+  dereferences, `NIL` checks, record copies (`rt_rec_copy`), `IS`, guards and the
+  type-`CASE` all read a descriptor through `ob_rt_is`. `obgen`'s fragment mode and
+  `run.sh`'s clif-only branch are deleted, so the corpus is one corpus again:
+  `BACKEND=clif bash fuzz/run.sh` runs the same seven blocks as the C path —
+  **86 programs, 0 failures, exit 0**, the collector's two stress blocks included
+  (the collector forced on every allocation) — and the C path is unchanged at exit
+  0. Two findings came out of it: a module variable that can hold a pointer must be
+  aligned to its *type* rather than to a word (UBSan caught a misaligned load in
+  the collector's walk on four regression seeds), and the C back end's `IS` and
+  type-`CASE` read through a `NIL` pointer where the report's answer is "no match"
+  and the lowered code gives it. `e2e` through clif reaches 56 checks with 9
+  failing — the distance W9.2c closes, reported rather than made to pass.
 * **W9.2c — the rest, and `e2e`.** Open arrays and `VAR` parameters, nested
   procedures with static links, `REAL`/`CHAR`/`SET`, string and record copies,
   imports and cross-module calls, `SYSTEM`. Done when `BACKEND=clif bash

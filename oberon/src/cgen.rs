@@ -1212,7 +1212,21 @@ impl<'a> Emitter<'a> {
             // variable has the label's type (report §9.5), which is modelled by
             // rebinding the name in an arm-local scope.
             let desc = self.dyn_of(&subj, sub_ty);
-            let _ = writeln!(out, "    switch (({desc})->id) {{");
+            // A NIL subject is of no type, so it matches no label: id 0 is the
+            // "no type" sentinel and no label carries it, which leaves the default
+            // arm or the located trap to answer (W2.5, catalogue row 39). Reading
+            // the descriptor through NIL, as this used to, faults with no message.
+            if self.types.is_pointer(sub_ty) {
+                // Cast to the switch's own type: the labels are unsigned, and a
+                // bare `0u` in the `?:` would change the operand's signedness,
+                // which the documented build line rejects.
+                let _ = writeln!(
+                    out,
+                    "    switch ((uint32_t)(({subj}) != NULL ? ({desc})->id : 0)) {{"
+                );
+            } else {
+                let _ = writeln!(out, "    switch (({desc})->id) {{");
+            }
             let mut default_taken = false;
             for arm in arms {
                 let labels: Vec<TypeId> = arm
@@ -1443,7 +1457,16 @@ impl<'a> Emitter<'a> {
                     }
                 };
                 let target = self.descriptor_name(t);
-                format!("rt_is({}, {target})", self.dyn_of(&v, ty))
+                let test = format!("rt_is({}, {target})", self.dyn_of(&v, ty));
+                // `NIL IS T` is false, and the descriptor of a NIL pointer is at
+                // address zero — so the test has to come second (a C-path gap
+                // W9.2b found by comparing the two back ends; the guard spelling
+                // has always ordered it this way).
+                if self.types.is_pointer(ty) {
+                    format!("(({v}) != NULL && {test})")
+                } else {
+                    test
+                }
             }
             ExprKind::Set(elems) => {
                 if elems.is_empty() {

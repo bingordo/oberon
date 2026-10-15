@@ -1045,6 +1045,22 @@ else
     fail=$((fail + 1))
 fi
 
+# A NIL pointer where a type is asked for: `NIL IS T` is false and a NIL type-CASE
+# subject matches no label, so the default arm (or the located trap) answers. The C
+# path used to read the descriptor through NIL and fault with no message — a gap
+# W9.2b found by comparing the two back ends (W2.6).
+runs_case nil-has-no-type 'MODULE NilT;
+  TYPE R = RECORD END; S = RECORD (R) x: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
+  VAR p: P; i: INTEGER; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  p := NIL;
+  IF p IS PS THEN ok[1] := 0 END;
+  IF ~(p IS PS) THEN i := 1 END;
+  CASE p OF PS: ok[1] := 0 | : i := i + 1 END;
+  IF i # 2 THEN ok[1] := 0 END
+END NilT.
+'
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

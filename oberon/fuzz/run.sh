@@ -8,9 +8,12 @@
 # computes something else -- with no output expected from the program and no
 # expectation taken from the compiler.
 #
-# `BACKEND=clif` runs the same suite against the Cranelift back end, on the
-# fragment it lowers (PLAN.md W9.1); the collector's block is C-only, because its
-# oracle needs records and pointers.
+# `BACKEND=clif` runs the same suite, the collector's blocks included (PLAN.md
+# W9.2b): every block below is back-end-agnostic, so the switch is the whole
+# difference. What the sanitizer flags prove about a lowered *object* is less
+# than what they prove about compiled C -- the object is not instrumented -- but
+# the stress half of those blocks is what forces the collector to run on every
+# allocation, and a live object it freed is a failing check either way.
 #
 # The default run is the standard suite: every seed that once found a defect
 # (regressions.txt), as a value oracle and as a trap oracle, then a block for
@@ -23,13 +26,10 @@ set -e
 cd -- "$(dirname -- "$0")"
 
 # BACKEND=clif builds every program with the Cranelift back end instead of the C
-# one (PLAN.md W9.1). That back end lowers the corpus's scalar fragment --
-# INTEGER arithmetic and the shifts, the control flow, procedures, recursion and
-# the `fail[1]` self-checks the oracle traps through -- so `obgen` generates that
-# fragment for it and the two blocks whose oracle needs a record or a pointer
-# (the collector's heap probe, W10.2) are not run. Everything else is the same
-# oracle: the regression list, its trap and dialect variants, and a coverage
-# block, with the numbers below stated in the summary.
+# one (PLAN.md W9.1, widened by W9.2b to the records, pointers and heap the
+# collector's probe needs). It is the same oracle throughout: the regression
+# list, its trap and dialect variants, a coverage block, and the collector's
+# blocks under `OB_GC_STRESS`.
 BACKEND=${BACKEND:-c}
 
 OBG=${OBG:-../target/debug/obgen}
@@ -100,16 +100,6 @@ run() {
 if [ -n "${SEEDS:-}" ]; then
     run --seeds "$SEEDS" --base "$BASE" "$@"
     echo "SUMMARY fuzz: seeds $BASE..$((BASE + SEEDS - 1))${SAN:+ under sanitizers}, exit $status"
-elif [ "$BACKEND" = clif ]; then
-    run --seed-list "$LIST" "$@"                    # the value oracle
-    echo "----"
-    run --seed-list "$LIST" --adversarial "$@"      # the trap oracle
-    run --seed-list "$LIST" --lower "$@"            # the same programs, lower-case dialect
-    echo "----"
-    run --seeds "$COVER" --base "$BASE" "$@"        # coverage
-    echo "----"
-    run --seeds "$ADVCOVER" --base "$BASE" --adversarial "$@"
-    echo "SUMMARY fuzz: clif (values, traps, lower-case dialect) + $COVER coverage + $ADVCOVER adversarial, exit $status"
 else
     run --seed-list "$LIST" "$@"                    # the value oracle
     echo "----"

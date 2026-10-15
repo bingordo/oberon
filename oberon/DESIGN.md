@@ -1547,6 +1547,7 @@ section or risk each item comes from.
 | R30 | `rt_new` took its size as `int32_t`, so routing `NEW` through it (the fix for the matrix's `NEW` row) truncated a record larger than 2 GiB to its low word: the allocation was `sizeof(T)` no longer, and the default `-Werror` build rejected the conversion. | **Found by review** of the W7.4 commit pair, by source analysis rather than a run, with the input that shows it (`ARRAY 1073741824 OF INTEGER`, 4 GiB). Fixed: the parameter is `size_t`, as `malloc`'s is, so the size `NEW` computes survives the call; the compile of that record is the evidence. |
 | R28 | An assignment **through a guard** (`p(S).f := 1`) emitted the guard's comma expression in an lvalue position, so the program did not compile at all. | **Found by the trap matrix** while adding the guard row (W7.4). A comma expression is not an lvalue; the guard's check is now hoisted into the prelude — which the assignment emitter already flushes after rendering its target — and the view alone is the expression. The *static* problem the design already records as R15 (gcc sees a read out of the allocation's bounds when the guard *fails*) is untouched and still documented. |
 | R26 | `rt_nil` reads its operand twice, so an operand with a side effect — an index expression containing a call, as in `a[Next()].x` — would be evaluated twice and could check one pointer while dereferencing another. | **Found by review of R21's fix.** The check is therefore emitted only while the designator built so far is side-effect-free (`cgen::has_call`), which is sound: the case keeps the old fault rather than gaining a wrong check. Completing it needs the operand hoisted into a statement, which is the emitter's temporary machinery (R16) and is itemised in `PLAN.md` W7.1. |
+| R33 | The **C back end** read a descriptor through a `NIL` pointer: `p IS T` and a type-`CASE` on a `NIL` pointer subject both dereferenced the first word of address zero, so a program that asked a *question* died of a fault with no message. The guard spelling had always checked first, and the second back end answered the report instead (`NIL IS T` is false, a `NIL` subject matches no label). | **Found by W9.2b** comparing the two back ends on the same module, and **fixed**: `IS` now orders the test as the guard does (`(p) != NULL && rt_is(…)`), and the type-`CASE` switches on the "no type" sentinel `0` when the subject is `NIL`, so the default arm or the located trap answers (W2.5). Row: `e2e`'s `nil-has-no-type`. |
 | R32 | The emitter could not name a type declared later in the module: `TYPE P = POINTER TO R; R = RECORD … END; VAR a: ARRAY 2 OF P` emitted the array before the record and called the record `Anon_1` where every other use said `T3__R`, so a legal program failed to compile (`unknown type name`). The cross-module sibling named a pointee `Def__Anon_1` in the header and `Def__Node` in the interface, so the two disagreed. | **Found while building the collector** (PLAN.md W10.2) — the compiler at HEAD emitted the same thing, so it was neither new nor caused by it — and **fixed in W2.4**, by the two changes its causes called for: the module's declared type names are collected *before* any type is visited, so a composite reached through a pointer (which is what an array of pointers does) keeps its own name rather than getting an anonymous one; and every named composite gets a forward `typedef struct X X;` before all the definitions, so the order `type_rank` chooses no longer matters for a pointer use. The definition repeats the same typedef, which C11 allows and `-Wall -Wextra` accepts. Rows: `e2e`'s `pointer-array-of-a-later-record`, `pointer-to-a-record-in-another-module` and `neither-side-names-the-pointee-anonymously`. |
 | R31 | The report's address is a 32-bit `INTEGER` (§11.1's `mem[a]`), and the lowering `PLAN.md` W4.1 first prescribed — `ADR(v)` → `(int32_t)(uintptr_t)&v`, then a word access through `(uint32_t *)(uintptr_t)a` — truncates it and sign-extends the truncation on the way back. | **Found while writing W4.1's own test**, and measured rather than argued: a stack address does not survive that round trip — `&v = 0x7ffff068624c` truncates to the `int32_t` `-261594548` (`0xf068624c`) and casts back to `0xfffffffff068624c`, so the store faults; the module built and the program died of SIGSEGV, while the `intptr_t` form returns `0x7ffff0686248` unchanged. **Fixed** by keeping the address as wide as the host's pointers in the *expression* (`ADR(v)` → `(intptr_t)(uintptr_t)&v`), narrowing it only where the program's own `INTEGER` does; the only other emitter change this needs is that an `ADR` operand is never fixed in a sequencing temporary, whose type would be that `INTEGER` (§9.10). `e2e/Sys.mod` takes the address of *locals* and `csmoke` executes the snippets on a local, so the defect cannot come back silently. What remains, documented rather than fixed: storing an address in an `INTEGER` — the report's own spelling — is lossless only while the host's addresses fit in 32 bits, which on this host is static data and not the stack. |
 
@@ -2305,6 +2306,80 @@ itself does not get there in a `BACKEND=clif` run, for the harness reason below.
 exit 0 with the corpus's scalar programs (86 and 67 programs), and the gate —
 `cargo test`, `cargo clippy --all-targets -- -D warnings`, `golden`, `csmoke`,
 `e2e`, both `fuzz` modes — is green.
+
+### Records, pointers and the heap **[implemented; `PLAN.md` W9.2b]**
+
+The lowerer emits the shapes §9.3 fixes, taking every offset from `layout.rs`
+rather than writing `offsetof`:
+
+* **Descriptors** are data objects under the C back end's names —
+  `TD_<Module>__<Name>` exported, `<Name>__fields` local, plus the name string they
+  carry — so a mixed build has one descriptor identity per type and therefore one
+  heap. The collector's map is the same walk the C side writes
+  (`region_fields`/`collect_record_fields`) with the computed numbers: a pointer
+  slot, a run of them, a run of descriptor-fronted records, a record field as the
+  run of one, and nothing at all for a type that reaches no pointer. `ObDesc` and
+  `ObFld`'s own field offsets are computed the same way instead of being written as
+  literals — **[verified]** against `oberon.h` by a probe: `sizeof(ObDesc) = 40`
+  with `id@8`, `name@16`, `fields@24`, `nfields@32`, and `sizeof(ObFld) = 32`. A
+  wrong `fields`/`nfields` is a collector that marks nothing, which the corpus's
+  stress blocks fail on rather than hide.
+* **`NEW`** goes through `rt_new`, so the object's descriptor is at its head and a
+  failed allocation is `NIL` (report §6.4). The descriptors of the records *inside*
+  the new object are written by the same walk as a variable's (`desc_init`, a loop
+  per array dimension), and the pointer's place is materialised once and both
+  stored and tested — the shape R26 asks of the C path, which re-evaluates it.
+* **Pointers** are the target's address width, from the ISA: a variable is an SSA
+  value or a frame slot, a field of a pointer is read after the implicit
+  dereference report §6.4 defines, and every dereference carries the `NIL` check
+  `rt_nil` makes in C — `ob_rt_trap_pos("NIL pointer dereference", at)` with the
+  *designator's* byte, which the corpus's adversarial mode compares.
+* **Records** are regions: a field adds its offset along the base chain (an
+  inherited field lives in the embedded base, which is why an extension's own
+  fields start at the base's size), and a whole-record assignment is
+  `rt_rec_copy(dst, src, size, TD_dst)` — the call that leaves the destination's
+  static descriptor in place.
+* **`IS`, guards and the type-`CASE`** all read a descriptor through `ob_rt_is`.
+  A guard's byte is *inside* the message the C back end bakes into a literal per
+  site, which a lowered call cannot spell, so `ob_rt_guard_at` formats the same
+  text (`type guard failed at byte N`) — **[verified]** byte-identical on both
+  back ends, as is the type-`CASE`'s `CASE: no matching type` with the subject's
+  byte.
+* **The collector** walks a lowered module's roots because `__init` registers them
+  (`ob_gc_root_region`, the C back end's `<var>__roots`) before the body can
+  allocate. *Found here*: word alignment is not enough — a module variable that can
+  hold a pointer (a `GCPtr`, a record with one, an array of either) has to be
+  aligned to its *type*, or the collector's walk loads a pointer from an address
+  that is not 8-aligned. UBSan reported it at `oberon_runtime.c:145` on four
+  regression seeds under `OB_GC_STRESS=1`; the fix is one `set_align` that asks
+  `layout.rs`, and the C back end has always had it from the type it declares.
+
+**One divergence, from the C path's side again.** A `NIL` pointer where an `IS`
+test or a type-`CASE` reads a descriptor: the C back end reads through the `NIL`
+and faults — the guard spelling checks first, `IS` does not — while the lowered
+code answers the report's question: `NIL IS T` is false, and a `NIL` subject of a
+type-`CASE` matches no label, so the default arm or the located trap runs.
+**[verified]** `p := NIL; CASE p OF P2: … ELSE … END` runs the `ELSE` arm under
+`--backend=clif`, and under the C path dies of a fault with no message at all. A
+C-path gap, reported rather than papered over.
+
+**The corpus is back to its full shape.** `obgen`'s fragment mode and `run.sh`'s
+clif-only branch are gone: `BACKEND=clif` runs the *same* blocks the C path runs —
+the regression list as values, as traps and in the lower-case dialect, 30 coverage
+seeds, 10 adversarial coverage seeds, and the collector's two stress blocks — with
+the adversarial variants now including the ones a pointer makes possible (a `NIL`
+field dereference, and a guard that cannot hold). **[verified]**
+`BACKEND=clif bash fuzz/run.sh`: **86 programs, 0 failures, exit 0**, the program
+count the C path runs, and `bash fuzz/run.sh` on the C path is unchanged at exit 0.
+The sanitizers prove less about a lowered *object* than about compiled C (an object
+is not instrumented), which is why the stress half of those blocks — the collector
+running on every allocation — is the part that matters.
+
+**Where `e2e` stands** (W9.2c's acceptance test). `BACKEND=clif bash e2e/run.sh`
+reaches 56 of the suite's checks before it stops, 9 of them failing: the rows it
+cannot meet are what the rest of the language is — `CHAR`/`REAL`/`SET` values, open
+arrays, `VAR` parameters, nested procedures, and the `Hello`/`Out` runtime fixtures.
+Reported as a distance rather than as a pass.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the
