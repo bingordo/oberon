@@ -421,18 +421,18 @@ check "failed-guard-traps" "1" "$(grep -c 'type guard failed at byte' "$DRV/guar
 # cast that gives a derived field its layout is not itself an lvalue, so the plain
 # spelling is used wherever a store is needed, and only where the narrowed name is
 # the whole designator (DESIGN R29, PLAN.md W7.6).
-narrow_case() { # name source
+runs_case() { # name source
     printf '%s' "$2" > "$DRV/$1.mod"
     "$OBC" build "$DRV/$1.mod" --out "$DRV" -o "$DRV/$1" >/dev/null 2>&1 || {
-        echo "FAIL narrow-$1: did not build"
+        echo "FAIL $1: did not build"
         fail=$((fail + 1))
         return
     }
     status=0
     "$DRV/$1" || status=$?
-    check "narrow-$1" "0" "$status"
+    check "$1" "0" "$status"
 }
-narrow_case assign-to-narrowed 'MODULE N1;
+runs_case narrow-assign-to-narrowed 'MODULE N1;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P; ps: PS; ok: ARRAY 1 OF INTEGER;
 BEGIN
@@ -441,7 +441,7 @@ BEGIN
   IF p # NIL THEN ok[1] := 0 END
 END N1.
 '
-narrow_case field-through-narrowed 'MODULE N2;
+runs_case narrow-field-through-narrowed 'MODULE N2;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P; ps: PS; ok: ARRAY 1 OF INTEGER;
 BEGIN
@@ -450,7 +450,7 @@ BEGIN
   CASE p OF PS: IF p.f # 7 THEN ok[1] := 0 END | : ok[1] := 0 END
 END N2.
 '
-narrow_case guard-as-target 'MODULE N3;
+runs_case narrow-guard-as-target 'MODULE N3;
   TYPE R = RECORD f: INTEGER END; S = RECORD (R) g: INTEGER END;
        P = POINTER TO R; PS = POINTER TO S;
   VAR p: P; ps: PS; s: S; ok: ARRAY 1 OF INTEGER;
@@ -462,6 +462,24 @@ BEGIN
   take(p(PS))
 END N3.
 '
+# A record value argument inside a short-circuit operand is copied where the
+# operand is evaluated, not one step earlier: `idx()` must not run when `&`
+# short-circuits, and must run when it does not (R16, PLAN.md W2.3).
+runs_case copy-inside-shortcircuit 'MODULE R16;
+  TYPE Rec = RECORD a: INTEGER END;
+  VAR arr: ARRAY 2 OF Rec; n: INTEGER; ok: ARRAY 1 OF INTEGER;
+  PROCEDURE idx(): INTEGER; BEGIN n := n + 1; RETURN 0 END idx;
+  PROCEDURE take(x: Rec): INTEGER; BEGIN RETURN x.a END take;
+BEGIN
+  arr[0].a := 5; n := 0;
+  IF FALSE & (take(arr[idx()]) = 5) THEN ok[1] := 0 END;
+  IF n # 0 THEN ok[1] := 0 END;
+  n := 0;
+  IF TRUE & (take(arr[idx()]) = 5) THEN ELSE ok[1] := 0 END;
+  IF n # 1 THEN ok[1] := 0 END
+END R16.
+'
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

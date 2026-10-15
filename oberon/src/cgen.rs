@@ -2016,16 +2016,31 @@ impl<'a> Emitter<'a> {
                 // A record value parameter is passed as a pointer to a copy the
                 // caller makes (report §10.1, DESIGN §9.7), and the copy keeps
                 // the *formal's* descriptor, not the actual's.
+                //
+                // Inside a `&&`/`||` operand the copy must happen *there*: the
+                // operand is not evaluated when the other one decides the result,
+                // so only the declaration is hoisted and the copy becomes a comma
+                // expression whose value is the copy's address (R16, PLAN.md
+                // W2.3). This is also what keeps a call in the actual's own
+                // selector from running when it should not.
                 self.anon += 1;
                 let tmp = format!("tmp__{}", self.anon);
-                let _ = writeln!(out, "    {};", self.binding(formal.ty, &tmp));
+                let decl = self.binding(formal.ty, &tmp);
                 let src = self.designator_of(a, level);
                 let desc = self.descriptor_name(formal.ty);
-                let _ = writeln!(
-                    out,
-                    "    rt_rec_copy(&{tmp}, &({src}), (int32_t)sizeof({tmp}), {desc});"
-                );
-                actuals.push(format!("&{tmp}"));
+                if self.in_conditional > 0 {
+                    let _ = writeln!(self.prelude, "    {decl};");
+                    actuals.push(format!(
+                        "((rt_rec_copy(&{tmp}, &({src}), (int32_t)sizeof({tmp}), {desc}), &{tmp}))"
+                    ));
+                } else {
+                    let _ = writeln!(out, "    {decl};");
+                    let _ = writeln!(
+                        out,
+                        "    rt_rec_copy(&{tmp}, &({src}), (int32_t)sizeof({tmp}), {desc});"
+                    );
+                    actuals.push(format!("&{tmp}"));
+                }
                 continue;
             }
             let got = self.sema.type_at(a.span, self.types);

@@ -189,12 +189,18 @@ and the failing record-spelling write compiles and traps with the guard's offset
 under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
 program built with `--cc clang`). The pointer spelling was already tested.
 
-**W2.3 R16: a structured value argument inside a short-circuit operand is copied eagerly**
+**W2.3 R16: a structured value argument inside a short-circuit operand is copied eagerly** — **done**
 Why: a record argument inside `AND`/`OR` whose own index expressions contain
 calls is copied one step earlier than Oberon evaluates it — a documented
 deviation, but a deviation.
 Done when: the copy happens where the operand is evaluated (or the design
-argues why it cannot), with a test that observes the order.
+argues why it cannot), with a test that observes the order. **Done**: inside a
+`&&`/`||` operand the copy's declaration is hoisted and the copy is a comma
+expression whose value is the copy's address — `((rt_rec_copy(&tmp, &(src), …),
+&tmp))` — so the copy, and a call in the actual's own selector, happen where the
+language evaluates the operand. `e2e`'s `copy-inside-shortcircuit` counts the calls
+in both directions (none when short-circuited, one when not) and traps under the
+old code.
 
 ---
 
