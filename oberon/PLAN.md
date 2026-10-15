@@ -1054,6 +1054,60 @@ only), so a user who trips one has no location — the runtime has the offset in
 at every one of those sites already, since each is emitted as a call. Adopt the
 same `(at byte N of the source)` suffix, then extend the matrix's expectations.
 
+## W10 — a garbage collector
+
+**W10.1 the collector, and what it costs the emitter** — **open**
+
+Why: Oberon-07 has `NEW` and no `DISPOSE` — the report's §6.4 defines allocation and
+says nothing about freeing — so every program this compiler builds leaks by
+construction, and a long-running one dies of it rather than of its own logic. No
+amount of book-keeping in the front end fixes that; it is a runtime subsystem. Two
+things already in the design make it cheap here: there is exactly one allocation
+point (`rt_new`, made the only one in W7.4), and every heap object begins with its
+own `ObDesc`, so a collector has one place to hook and something to walk.
+
+Research to start from — read it, do not assume it: the Oberon report §6.4 (`NEW`
+and the absence of a free); this design's descriptor, runtime and frame sections
+(§6.4, §9.2, §10); the chapters on runtime systems and memory management in
+`books/` (Appel, *Modern Compiler Implementation in C*; the *Compiler Design
+Handbook*); and Wirth's own Oberon compilers, whose `NEW`-plus-descriptor scheme is
+the ancestor of this layout. Decide and record, with the reason:
+
+1. **Precise or conservative marking.** A precise mark needs a pointer map per
+   type, which the descriptor does not carry today (it holds base, size and a
+   name). A conservative mark needs neither that nor a stack map, but it must
+   reckon with the values in a frame that are *not* pointers — the hidden
+   open-array length is an `int32_t` that may look like one — and with interior
+   pointers. Retaining garbage is acceptable; freeing a live object is not. The C
+   back end cannot supply a stack map, so conservative is the only option there,
+   while the Cranelift back end can (W9's research), which points at: a
+   descriptor-driven mark with a conservative stack and register walk first, and
+   precise stack maps as the Cranelift back end's follow-up.
+2. **What the descriptor gains.** If the mark is precise, the descriptor needs the
+   pointer-field information the emitter can already produce — `desc_init` walks
+   exactly those fields to install nested descriptors — and the item must say what
+   that costs in object size and when the interface format version changes (W3.2).
+3. **The root set, stated explicitly.** Module-level variables, the live state of
+   the command table, and the stack. Said as sharply: a value parameter's *copy* is
+   a root, a `VAR` parameter's original is, an open array's hidden length is not,
+   and a `NIL` is not.
+4. **When to collect.** Before `NEW` gives up, so that the report's
+   `NEW`-yields-`NIL` (§6.4) keeps its meaning with a bounded heap — and so that
+   `OB_ALLOC_FAIL_AT` stays a *test* hook rather than the only path to a failing
+   allocation. A collection that frees nothing must terminate, not loop.
+5. **What it must never do.** Free a live object (the fuzzer's self-checks are the
+   oracle), and move objects: the emitter addresses them through raw pointers
+   today, so this is a reclaimer, not a compactor.
+
+Plan: extend the descriptor with whatever the chosen design needs, put the
+collector in the runtime header (a mark stack, a sweep over the allocated list, the
+`rt_new` hook), keep the allocator's single entry point, and drive it from a mode
+the tests can force — `OB_GC_STRESS=1`, the shape `OB_ALLOC_FAIL_AT` already has.
+
+Done when: a program that allocates in a loop runs in a bounded heap; the fuzzer's
+seeds pass with the collector forced on every allocation; and the design states the
+root set and the mark/precision decision, with the reason it was taken.
+
 ## Ideas not yet in the design (adopt or drop)
 
 - Fuzz the *lexer* with random bytes and random token streams: assert no panic
