@@ -1419,7 +1419,10 @@ written down):
   assignment and copies, `POINTER TO`, `NEW` through `rt_new`, and the type-`CASE`
   and guards that read a descriptor. Done when the corpus's *collector* blocks run
   in the clif mode (`fuzz/run.sh`, `obgen --backend=clif` widening accordingly): a
-  pointer graph is the only thing that takes those paths apart.
+  pointer graph is the only thing that takes those paths apart. **Done**: the clif
+  path runs the same seven blocks the C path runs — 86 programs, 0 failures,
+  including the collector's stress blocks — and `BACKEND=clif bash e2e/run.sh`
+  reaches 56 check lines, which is the distance W9.2c and W9.2d close.
   **Done.** Descriptors, field maps and root registrations are data objects under
   the C back end's names, with every offset from `layout.rs`; `NEW` allocates
   through `rt_new` and initialises the nested descriptors; fields, implicit
@@ -1435,11 +1438,16 @@ written down):
   type-`CASE` read through a `NIL` pointer where the report's answer is "no match"
   and the lowered code gives it. `e2e` through clif reaches 56 checks with 9
   failing — the distance W9.2c closes, reported rather than made to pass.
-* **W9.2c — the rest, and `e2e`.** Open arrays and `VAR` parameters, nested
-  procedures with static links, `REAL`/`CHAR`/`SET`, string and record copies,
-  imports and cross-module calls, `SYSTEM`. Done when `BACKEND=clif bash
-  e2e/run.sh` passes every row the C path does — the harness is already there, and
-  it stops at the first row the back end cannot meet.
+* **W9.2c — the value types, open arrays and `VAR` parameters.** `REAL`, `CHAR` and
+  `SET` (with the ordinal and set operations `csmoke` pins on the C side), open
+  arrays in both modes with the hidden length, `VAR` parameters, and the string and
+  record copies the parameter modes require. Done when the `e2e` rows about values
+  and parameters pass under `BACKEND=clif`.
+* **W9.2d — the scope machinery, and every row.** Nested procedures with static
+  links, imports and cross-module calls (the loader already links either back end),
+  `SYSTEM`, and whatever rows remain. Done when `BACKEND=clif bash e2e/run.sh`
+  passes every row the C path does — 126 as of W9.2b, and the harness is there to
+  say so.
 
 **W7.7 a byte for every trap, not only the memory ones** — **done**
 
