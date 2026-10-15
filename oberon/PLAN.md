@@ -496,7 +496,7 @@ Oberon-2 §6.1, Component Pascal §6.1, VOC and Oberon+ (which goes further with
 Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`, `COND`, `REG`, `LDREG`, `LDPSR`, `LED`, `ADC`, `SBC`, `UML`; VOC adds `INT8`…`INT64`, `SET32`/`SET64`, `ADDRESS`; AntKrotov adds `GET8/16/32`, `PUT8/16/32`, `SADR`, `WSADR`, `MOVE`, `TYPEID`, `CODE` and, on STM32, `WCHAR`/`WCHR`. Decision to take in W4.1: the report's portable five, plus the *sized* accessors (`GET8/16/32`, `PUT8/16/32`) because a byte-address model needs them, while register/PSR/`LED`/`CODE`/`WCHAR` are target-specific and stay refused by name.
 
 **W8.8 what the survey says to reject** — recorded so the question does not come back
-* syntax conveniences: `_` in identifiers, `//` comments, lower-case keywords, optional end names, single-quoted strings, conditional compilation (AntKrotov, Oberon+) — each makes a program non-portable to a report compiler, and our value is strict conformance;
+* syntax conveniences *other than the keyword case above* (which is W8.10): `_` in identifiers, `//` comments, optional end names, single-quoted strings, conditional compilation (AntKrotov, Oberon+) — each makes a program non-portable to a report compiler, and our value is strict conformance;
 * type-width *models* (VOC's `-O2`/`-OC`/`-OV`, Oberon+'s fixed-width set) — a dialect matrix multiplies the type algebra; the report fixes `INTEGER` = 32 bits and `REAL` = 32 bits;
 * `WITH` — superseded by guards, `IS` and type-`CASE`, and Wirth removed it;
 * type-bound procedures/methods (all four dialects) — the report's `IS`/guards/type-`CASE`/procedure variables already cover dynamic dispatch without a vtable model;
@@ -506,7 +506,22 @@ Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`
 **W8.9 a lesson that is not an extension: our overflow stance is ahead of production**
 VOC's C back end does not establish `-fwrapv`, so signed overflow there is undefined C. Our design fixes it deliberately (R4) and R20 is about making that choice *warning-clean* — not about giving it up.
 
-Done when: each recommended item has either landed with tests or been declined in DESIGN §13, and DESIGN §1 points here so a reader knows the extension question has been asked and answered.
+**W8.10 lower-case keywords** — *requested; opt-in by default, see the rule below*
+What: accept reserved words spelled in lower case (`module`, `begin`, `if`, …) so a program can be written in the host toolchain's taste; identifiers stay case-sensitive, so `Foo` and `foo` remain distinct.
+Why: both surveyed compilers that care about embedding Oberon in a lower-case codebase do exactly this — AntKrotov's Oberon-07 lists "lower-case keywords" among its differences from the original, and Oberon+ accepts "lower-case forms of reserved words" (together with shorter variants and omitted semicolons, which we are *not* taking) while documenting the reserved-word collision as the price.
+
+The rule that decides the default, and it is worth stating once: **W8.1–W8.5 are additive and may be on by default, because a report program is unaffected; a keyword-case fold is not additive, because the report makes capital and lower-case letters distinct (report §3), so a report program that uses `Begin` or `integer` as an identifier would tokenise differently.** Hence the flag, off by default, and the compiler stays a strict report implementation unless asked otherwise.
+
+Implementation is small and local: keyword recognition is one table and one comparison (`KEYWORDS` and the lookup in `src/lexer.rs`), so the dialect is a field on `Lexer` (`Lexer::new` keeps the report behaviour) compared with `eq_ignore_ascii_case` instead of `==`. Nothing downstream changes: the token stream is identical, so the grammar, AST, checker and emitter never learn about the dialect.
+
+A second, separate decision that falls out of it: `INTEGER`, `CHAR`, `TRUE`, `FALSE`, `NIL` and the §10.2 procedure names are *predeclared identifiers*, not keywords, so their lower-case forms are aliases in `sema::predefine` rather than a lexer concern — and because a user declaration shadows a predeclared name, that half **is** additive and can be on by default. Worth doing separately from the keyword fold, and cheap.
+
+Cost and risk: the collision surface is "every identifier whose spelling matches a keyword case-insensitively", and the failure must be explained rather than merely reported — the diagnostic for a token where an identifier was expected should say that the current dialect folds keyword case, or the reader will not know why `begin` stopped being a name.
+
+Tests: the existing near-miss table extended with a lower/mixed-case spelling per keyword; a negative test that the default dialect still rejects `begin`; a test that identifiers are not folded; a test that a module declaring its own `integer` or `nil` still compiles with the aliases in place; an `e2e/Lower.mod` built and run through the driver with the flag; and the generator gains a lower-case rendering mode, so the fuzzer covers the dialect end to end.
+Done when: the flag reaches both CLIs, the default is provably unchanged (the suites are the proof), those tests pass, the collision diagnostic names the dialect, the dialect is recorded in the interface header (with the version line of W3.2), and DESIGN §3 documents it.
+
+Done when: each item above has either landed with tests or been declined in DESIGN §13, and DESIGN §1 points here so a reader knows the extension question has been asked and answered.
 
 ---
 
