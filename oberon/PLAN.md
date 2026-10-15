@@ -189,6 +189,45 @@ and the failing record-spelling write compiles and traps with the guard's offset
 under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
 program built with `--cc clang`). The pointer spelling was already tested.
 
+**W2.4 a pointer array cannot see a record declared later in the module** — **open**
+
+**Found while building the collector** (W10.2), and *not* caused by it: the same
+output comes from the compiler at HEAD. A legal Oberon-07 program does not build:
+
+```
+MODULE T3;
+  TYPE P = POINTER TO R; R = RECORD x: INTEGER END;
+  VAR a: ARRAY 2 OF P;
+BEGIN NEW(a[0]); a[0].x := 1
+END T3.
+```
+```
+./T3.h:6:21: error: unknown type name `T3__Anon_1`
+./T3.c:16:51: error: request for member `desc` in something not a structure or union
+```
+Two causes, both in the emitter's type naming and ordering:
+
+1. **ordering.** `type_rank` gives an array `100 + rank(elem)` and a record `200 + …`,
+   and a pointer ranks 0, so `ARRAY 2 OF P` is emitted *before* the record it points
+   at. A pointer field imposes no order — the comment in `type_rank` says so — and
+   neither does a pointer in an array; what such a use needs is a *forward*
+   declaration, which is what is missing.
+2. **naming.** naming a composite happens on first *visit*, and the visit reaches
+   `R` through `P`'s pointer arm while `R` is not yet declared, so it is named
+   `T3__Anon_1` — while the interface and every later use call it `T3__R`. A
+   pre-pass over the module's declared types would know the name before any visit;
+   that is the same shape as the deliberate "name on visit so recursive types
+   terminate" rule, which a pre-pass keeps.
+
+A sibling of the same root cause, and the worse one: a *cross-module* pair
+(`TYPE P* = POINTER TO Node; Node* = RECORD … END`) names it `Def__Anon_1` in the
+header but `Def__Node` in the interface, so the header and the `.sym` disagree.
+
+Done when: a pointer array of a same-module record compiles and runs, the
+cross-module pair's header and interface agree on the name, and both are pinned —
+`e2e`'s pointer-array row currently borrows its pointee from another module, which
+is exactly what this hides.
+
 **W2.3 R16: a structured value argument inside a short-circuit operand is copied eagerly** — **done**
 Why: a record argument inside `AND`/`OR` whose own index expressions contain
 calls is copied one step earlier than Oberon evaluates it — a documented
@@ -382,11 +421,20 @@ It is mechanical because the phase interfaces are three plain data types, and it
 pays off when a phase grows — `syntax` is the only crate that may know LALRPOP.
 Done when: the four crates exist with the same tests and suites green.
 
-**W4.4 a `.sym`-only fast path** — *proposed, not from the design*
+**W4.4 a `.sym`-only fast path** — *proposed, not from the design* — **measured; the condition has not fired**
 Why: `obc build` has no up-to-date check (nothing in the driver looks at
 timestamps), so every module of the import graph is re-checked on each run. A
 timestamped interface would skip the front end for unchanged modules.
-Only worth doing if build times become a complaint.
+Only worth doing if build times become a complaint. **Measured**, because the item
+conditions itself on a complaint: `obc check` of `e2e/Torture.mod` — lex, parse,
+resolve and check, the whole front end on the largest module in the tree — takes
+**0.04 s**, while `obc build` of the same program (front end, emit, and `cc` over
+four modules) takes **0.73–0.98 s**. The front end is about 5% of a build, so a
+`.sym`-only fast path would save a few hundredths of a second per module and the
+complaint it waits for is not here. What *would* move build times is at the C end —
+not recompiling objects whose source has not changed, or `ccache` — which is a
+different design and a different item, and not needed either at these sizes. The
+item stays open, now with the number that says when to revisit it.
 
 **W4.5 the collector's design: a study, before any code** — **research, recorded as
 DESIGN §15; the implementation is W10.2**
@@ -438,12 +486,18 @@ The questions the study has to answer, each with what to read:
 4. **What it breaks, honestly** — `SYSTEM` (W4.1) can hide the only reference to
    an object in an `INTEGER`, so a *precise* collector is unsound for programs
    that do that: document the convention (Wirth's systems have the same caveat)
-   or take the conservative root scan; ASan, which is a verification mode of ours
-   (W7.5), cannot see inside a collector-managed heap, so the sanitised suites
-   must run with the collector **off** and the collector gets its own stress
-   mode; moving/compacting and generational collectors are out *because* they
-   invalidate addresses that `ADR`/`PUT` may have published — the study should
-   state that rather than leave it implied.
+   or take the conservative root scan; *this* paragraph said the sanitised suites
+   would have to run with the collector **off**, because ASan cannot see inside a
+   collector-managed heap — **W10.2 measured that to be false, and the opposite is
+   true**: ASan keeps locals in a fake stack (`detect_stack_use_after_return`),
+   so a conservative walk misses every local and silently frees live objects, and
+   the collector had to be *fixed* rather than avoided (the runtime turns that
+   option off and unpoisons the region it reads). The stress blocks therefore
+   build with the sanitizers *on*, and keeping them on is what found that defect;
+   §15's ASan note records the contract it implies. Moving/compacting and
+   generational collectors are out *because* they invalidate addresses that
+   `ADR`/`PUT` may have published — the study should state that rather than leave
+   it implied.
 5. **The harness, which already exists** — allocation-heavy generated programs
    (W6.1), a mode that collects at every `NEW`, and the `allocated`-counter
    assertion give a stress test without writing one.
@@ -1020,7 +1074,7 @@ Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`
 **W8.9 a lesson that is not an extension: our overflow stance is ahead of production** — **recorded; closed**
 VOC's C back end does not establish `-fwrapv`, so signed overflow there is undefined C. Our design fixes it deliberately (R4) and R20 is about making that choice *warning-clean* — not about giving it up.
 
-**W8.10 lower-case keywords** — *requested; opt-in by default, see the rule below*
+**W8.10 lower-case keywords** — **done** (the keyword fold; the predeclared-name aliases are the separate additive half, not taken)
 What: accept reserved words spelled in lower case (`module`, `begin`, `if`, …) so a program can be written in the host toolchain's taste; identifiers stay case-sensitive, so `Foo` and `foo` remain distinct.
 Why: both surveyed compilers that care about embedding Oberon in a lower-case codebase do exactly this — AntKrotov's Oberon-07 lists "lower-case keywords" among its differences from the original, and Oberon+ accepts "lower-case forms of reserved words" (together with shorter variants and omitted semicolons, which we are *not* taking) while documenting the reserved-word collision as the price.
 
@@ -1033,7 +1087,7 @@ A second, separate decision that falls out of it: `INTEGER`, `CHAR`, `TRUE`, `FA
 Cost and risk: the collision surface is "every identifier whose spelling matches a keyword case-insensitively", and the failure must be explained rather than merely reported — the diagnostic for a token where an identifier was expected should say that the current dialect folds keyword case, or the reader will not know why `begin` stopped being a name.
 
 Tests: the existing near-miss table extended with a lower/mixed-case spelling per keyword; a negative test that the default dialect still rejects `begin`; a test that identifiers are not folded; a test that a module declaring its own `integer` or `nil` still compiles with the aliases in place; an `e2e/Lower.mod` built and run through the driver with the flag; and the generator gains a lower-case rendering mode, so the fuzzer covers the dialect end to end.
-Done when: the flag reaches both CLIs, the default is provably unchanged (the suites are the proof), those tests pass, the collision diagnostic names the dialect, the dialect is recorded in the interface header (with the version line of W3.2), and DESIGN §3 documents it.
+Done when: the flag reaches both CLIs, the default is provably unchanged (the suites are the proof), those tests pass, the collision diagnostic names the dialect, the dialect is recorded in the interface header (with the version line of W3.2), and DESIGN §3 documents it. **The keyword fold is done**: `-Odialect=report|lower` on both CLIs, `Lexer::with_folded_keywords` behind it, a `DIALECT <name>` line in the interface for a non-default dialect (written only then, so a report interface is byte-identical to before; an unknown name is refused), and the collision note that names the dialect — with the note *not* firing for a reserved word spelled the way the report spells it, since nothing about the dialect explains that. Tests: `lower_case_keywords_need_the_dialect` (the report dialect still rejects `module`; `Foo` and `foo` stay distinct; a lowercase `integer` is an ordinary identifier) and `a_folded_collision_explains_itself`. The lower-case rendering mode for the *generator* — the item's last test line — is obgen's to add and is not in this change.
 
 **W8.11 Oberon-2 support: consider it as a dialect, not as dribbled extensions** — **considered; the decision and the mechanism are recorded in DESIGN §5 and §13**
 Why: everything in this wave is a piece of Oberon-2, so the honest question is
@@ -1245,7 +1299,11 @@ that gains the pointer-field offsets, a conservative stack walk now and a precis
 one when W9's back end can supply stack maps, and collection before `NEW` gives up.
 The implementation is W10.2.
 
-**W10.2 the collector itself** — **open**
+**W10.2 the collector itself** — **implemented: `src/oberon_h.inc`,
+`src/oberon_runtime.inc`, `src/cgen.rs`, `src/bin/obgen.rs`, `fuzz/run.sh`,
+`e2e/run.sh` (five rows) and one line of `e2e/Texts.c`, whose hand-written
+descriptor literal had to list the descriptor's two new fields like any other
+positional initializer under the e2e build's `-Werror`**
 
 Implement DESIGN §15: extend `ObDesc` with the pointer-field offsets the emitter
 already knows (`desc_init`'s walk), add the mark stack, the sweep over the allocation
@@ -1259,6 +1317,45 @@ Done when: a program that allocates in a loop runs in a bounded heap; `fuzz` pas
 with the stress mode on (its self-checks are the "no live object was freed" oracle);
 and the standard suite is green with it off, so the collector costs nothing when it
 is idle.
+
+**Done**, and §15 now records each answer with the run that executes it:
+
+* **The list is a header in front of the payload** (`ObBlock`: next, payload size,
+  mark), so the descriptor stays at offset 0 of the object and the sweep has both the
+  next block and the size an interior pointer is tested against. The descriptor gains
+  `const ObFld *fields; int32_t nfields;`, where an entry is
+  `{off, stride, n, desc}`: pointer slots (`desc == NULL`, one or a run), or a run of
+  records whose own map takes over. A type that reaches no pointer gets no map, so
+  marking it is one NULL test. The map is emitted by the same walk `desc_init` uses,
+  with `offsetof` expressions, so it follows the C layout the back end does not
+  compute for itself.
+* **The trigger besides a failing allocation is `OB_GC_LIMIT=n`**, a byte budget on
+  headers plus payloads: over it, the collector runs, and `NEW` yields `NIL` if it is
+  still over — the report's failure case with a heap that never runs out of malloc.
+  A collection that frees nothing ends the attempt; nothing loops.
+* **`OB_GC_STRESS=1` collects before every allocation** and changes no answer: only
+  unreachable blocks are freed, nothing moves, and which address a later `NEW` gets
+  was always `malloc`'s to decide. Roots are each module's own variables, registered
+  from `__init` before its body can allocate (a pointer variable's slot, a record
+  variable's type, an `ARRAY OF RECORD` as a run); the command table needs no entry,
+  holding names and code addresses only, and everything else is the conservative
+  stack walk — with a `setjmp` for the registers a frame carries across the call.
+  The runtime also collects once at exit, so what a leak checker sees is what the
+  program still holds.
+
+Evidence: `e2e`'s six collector rows (1000 rounds of 20 nodes = 20000 allocations in
+a 4096-byte heap, completing in the stress, limit and idle modes with the same
+checked value; a live chain over the limit reaching `NIL` and counted back intact;
+and one root of each kind, including a type whose map lives in another module and
+one whose pointer field the base of the object's type declares); the generated
+fragment's heap probe, which keeps a chain per root kind across churn; `fuzz`'s two
+stress blocks, built with the sanitizers whether or not `SAN=1` is set, because a
+freed object whose memory is not reused yet still reads correctly — ASan is what
+caught the one defect this walk had while it was being written (under
+`-fsanitize=address` locals live in a fake stack the walk cannot see, so the runtime
+turns `detect_stack_use_after_return` off and unpoisons the region it reads). The
+standard suites are unchanged with the collector idle: no stress, no limit, and the
+only path that collects is a `malloc` failure.
 
 **W10.3 collector pauses** — **open, a feature in its own right**
 

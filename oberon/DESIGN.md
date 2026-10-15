@@ -188,6 +188,38 @@ carry the offending byte and are reported as `ParseError::User`; while they are
 structurally parser errors, they are *not* recoverable by LALRPOP's `!`
 mechanism, which is why §5 records the (deliberate) choice to fail fast in v1.
 
+### The one dialect the lexer has: `-Odialect=lower` **[implemented; `PLAN.md` W8.10]**
+
+`IF` / `If` above is the row this changes. A dialect that folds reserved-word case
+accepts `if`, `If`, `iF` — the comparison becomes `eq_ignore_ascii_case` in one place
+— while *identifiers* stay case-sensitive, so `Foo` and `foo` remain two names.
+
+Why this is the one extension that needed a switch rather than being additive
+(§13 decision 13): the report makes capital and lower-case letters distinct, so a
+*report* program may legitimately write `var Begin: INTEGER` with `Begin` as a
+variable, and folding would silently tokenise it as the reserved word `BEGIN` — a
+program that compiles today would stop. `CASE … ELSE`, `EXIT`, a `RETURN`
+statement and `MIN`/`MAX` cannot do that to an existing program; this can.
+
+Three consequences worth stating, each with what it costs:
+
+* **the collision has to explain itself.** A reader who wrote `var begin: INTEGER`
+  would otherwise meet "unexpected `BEGIN`" with no way to see why, so the
+  diagnostic carries a note naming the dialect and the reserved word it folded
+  (`W8.10`), and a genuinely upper-case `BEGIN` gets no such note, because then
+  nothing about the dialect explains the error;
+* **the predeclared *identifiers* are not folded with the keywords.**
+  `INTEGER`, `CHAR`, `TRUE`, `NIL` and the §10.2 procedure names are predeclared
+  names rather than keywords, so `integer` is a *different name*, and a program may
+  still declare its own. Aliasing those lower-case forms is a separate decision
+  that W8.10 records as additive — it is not part of this switch;
+* **the interface says so.** A non-default dialect is written into the interface
+  header as `DIALECT <name>`, and a reader that does not know the name refuses the
+  file rather than guessing. It is *recorded* rather than enforced: an interface is
+  a list of names, those stay case-sensitive, and so a client needs no shared
+  dialect to use it. A report-mode interface is byte-identical to what it was before
+  this line existed.
+
 ---
 
 ## 5. Grammar
@@ -1466,7 +1498,7 @@ section or risk each item comes from.
 |---|---|---|
 | R1 | The report's grammar is not LR(1) in three places. | **Found and resolved**, not papered over: D2 and D3 move two decisions to the resolver; D1 is a local factoring. Evidence in §5. |
 | R2 | Type guard vs. call argument list is decided by a *semantic* rule. | Sound (types and variables share one namespace), pinned by tests. The residual case `f(x)(y)` is diagnosed rather than mis-parsed. |
-| R3 | No garbage collector. | **Decided, not yet built** (§15, PLAN.md W10.1/W10.2): mark-sweep and non-moving, a precise mark driven by a descriptor that gains the pointer-field offsets, a conservative stack walk until the Cranelift back end can supply stack maps, and collection before `NEW` gives up. `NEW` failures already yield `NIL`, which is specified, and one allocation entry point (`rt_new`) is where all of it hangs. |
+| R3 | No garbage collector. | **Implemented** (W10.2, design in §15): mark-sweep and non-moving, a precise mark driven by the descriptor's `ObFld` map, a conservative stack and register walk, one header per block in front of the payload, collection before `NEW` gives up (either the `malloc` failure or the `OB_GC_LIMIT` byte budget) and once at exit. Roots are each module's own variables, registered from `__init`. Evidence: `e2e`'s six collector rows (a 20000-allocation program in a 4096-byte heap in the stress, limit and idle modes; a live set over the limit reaching `NIL`; one root of each kind, including an `ARRAY OF POINTER` and a map from another module's translation unit; and a pointer field the *base* of the object's type declares) and `fuzz`'s stress blocks, which build the corpus with the sanitizers because a freed object whose memory is not reused yet still reads correctly. `NEW` failures still yield `NIL`, which is specified. |
 | R4 | Signed overflow: C's UB vs. Oberon's unspecified wrap. | `-fwrapv` in the documented compile line **[verified]**; the emitted code never relies on the C compiler's optimiser reasoning about overflow. |
 | R5 | `SYSTEM` (§11.1) was not implemented. | **Implemented** (`PLAN.md` W4.1): the import resolves to a builtin module (§9.10), the report's six portable entries are lowered in place, and the RISC-specific extras (`VAL`, `ADC`, `SBC`, `UML`, `COND`, `LED`) are still refused *by name*. R31 records the one thing the report's model does not give on a 64-bit host. |
 | R6 | `FOR` loops that end at the largest `INTEGER`: `v += k` wraps and the guard is re-tested against a wrapped value. | **Resolved**: the report's own equivalence (§9.8) is `v := beg; WHILE v <= end DO S; v := v + inc END`, so the wrap and the re-test *are* the specified behaviour, and with `-fwrapv` it is defined C. No check is added, and W3.1's flag does not need one: a `FOR` loop cannot exceed its bound. |
@@ -1493,6 +1525,7 @@ section or risk each item comes from.
 | R30 | `rt_new` took its size as `int32_t`, so routing `NEW` through it (the fix for the matrix's `NEW` row) truncated a record larger than 2 GiB to its low word: the allocation was `sizeof(T)` no longer, and the default `-Werror` build rejected the conversion. | **Found by review** of the W7.4 commit pair, by source analysis rather than a run, with the input that shows it (`ARRAY 1073741824 OF INTEGER`, 4 GiB). Fixed: the parameter is `size_t`, as `malloc`'s is, so the size `NEW` computes survives the call; the compile of that record is the evidence. |
 | R28 | An assignment **through a guard** (`p(S).f := 1`) emitted the guard's comma expression in an lvalue position, so the program did not compile at all. | **Found by the trap matrix** while adding the guard row (W7.4). A comma expression is not an lvalue; the guard's check is now hoisted into the prelude — which the assignment emitter already flushes after rendering its target — and the view alone is the expression. The *static* problem the design already records as R15 (gcc sees a read out of the allocation's bounds when the guard *fails*) is untouched and still documented. |
 | R26 | `rt_nil` reads its operand twice, so an operand with a side effect — an index expression containing a call, as in `a[Next()].x` — would be evaluated twice and could check one pointer while dereferencing another. | **Found by review of R21's fix.** The check is therefore emitted only while the designator built so far is side-effect-free (`cgen::has_call`), which is sound: the case keeps the old fault rather than gaining a wrong check. Completing it needs the operand hoisted into a statement, which is the emitter's temporary machinery (R16) and is itemised in `PLAN.md` W7.1. |
+| R32 | The emitter could not name a type declared later in the module: `TYPE P = POINTER TO R; R = RECORD … END; VAR a: ARRAY 2 OF P` emitted the array before the record and called the record `Anon_1` in one place and `T3__R` in another, so a legal program failed to compile (`unknown type name`). The cross-module sibling names a pointee `Def__Anon_1` in the header and `Def__Node` in the interface, so the two disagree. | **Found while building the collector** (PLAN.md W10.2) — the compiler at HEAD emits the same thing, so it is neither new nor caused by it — and opened as PLAN.md W2.4 with the repro, both causes (`type_rank` orders an array by its element's rank, and naming-on-visit reaches a record through a pointer before its declaration) and the fix direction (a pre-pass over the declared names, plus a forward `typedef` for every named composite). |
 | R31 | The report's address is a 32-bit `INTEGER` (§11.1's `mem[a]`), and the lowering `PLAN.md` W4.1 first prescribed — `ADR(v)` → `(int32_t)(uintptr_t)&v`, then a word access through `(uint32_t *)(uintptr_t)a` — truncates it and sign-extends the truncation on the way back. | **Found while writing W4.1's own test**, and measured rather than argued: a stack address does not survive that round trip — `&v = 0x7ffff068624c` truncates to the `int32_t` `-261594548` (`0xf068624c`) and casts back to `0xfffffffff068624c`, so the store faults; the module built and the program died of SIGSEGV, while the `intptr_t` form returns `0x7ffff0686248` unchanged. **Fixed** by keeping the address as wide as the host's pointers in the *expression* (`ADR(v)` → `(intptr_t)(uintptr_t)&v`), narrowing it only where the program's own `INTEGER` does; the only other emitter change this needs is that an `ADR` operand is never fixed in a sequencing temporary, whose type would be that `INTEGER` (§9.10). `e2e/Sys.mod` takes the address of *locals* and `csmoke` executes the snippets on a local, so the defect cannot come back silently. What remains, documented rather than fixed: storing an address in an `INTEGER` — the report's own spelling — is lossless only while the host's addresses fit in 32 bits, which on this host is static data and not the stack. |
 
 Decisions taken during implementation, recorded because the report is silent
@@ -1566,6 +1599,15 @@ or self-inconsistent and a compiler has to choose once and then be consistent:
     cost (numeric inclusion, type-bound procedures, `WITH`) stay rejected, and the
     syntaxes that are another spelling of machinery we already have are not worth
     their keyword.
+
+    **The one extension that needed the switch is implemented behind it**:
+    `-Odialect=lower` folds reserved-word case (§3). It is the case the rule above
+    exists for — a report program may write `Begin` as a variable, and folding would
+    tokenise that as the reserved word — so it is off unless asked for, its
+    collisions explain themselves in the diagnostic, and the dialect is recorded in
+    the interface header. `MIN`/`MAX`'s aliasing of the predeclared *names*
+    (`integer`, `nil`) is the additive half W8.10 describes and is deliberately not
+    part of it.
 
 12. **The SYSTEM address model** (report §11.1, `PLAN.md` W4.1). The report's
    `mem[a]` is an array of *words* on a machine whose addresses are words, and it
@@ -1815,7 +1857,7 @@ for `ARRAY` value parameters. 67 cases pass under
   `gcc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror`; the one FAIL line is the
   documented `ROR` spec bug (R11), not a mapping failure.
 
-## 15. Storage reclamation: what the research settles **[decided; the collector itself is PLAN.md W10.2]**
+## 15. Storage reclamation: what the research settles **[implemented; PLAN.md W10.2. The runs that execute each claim are named where it is made — `e2e`'s collector rows, `fuzz`'s stress blocks, and the descriptor shapes they compile]**
 
 Oberon-07 has `NEW` and no `DISPOSE` (report §6.4), so every program this compiler
 builds leaks until it dies of it. The language's own shape makes the fix cheap: a
@@ -1873,9 +1915,94 @@ From those three, the decisions:
    are the oracle, and the corpus is what will say whether a reclaimer is correct —
    and move one.
 
-The implementation questions this leaves open, for W10.2: whether the allocation
-list needs a header *before* the payload (which would keep the descriptor at offset
-0 of the object and give the sweep a size and a next-pointer, at the cost of
-allocating it) or a separate table; when a collection is triggered besides a failing
-allocation; and how `OB_GC_STRESS=1` forces one per allocation without changing the
-program's answers.
+7. **The allocation list is a header in front of the payload.** `rt_new`
+   allocates `sizeof(ObBlock) + sizeof(T)`, links the block into one list, and
+   returns the payload — so the object's first word is still its descriptor and
+   §9.3's layout rule is untouched. The header carries the next block, the
+   payload's size and the mark, which is what the sweep needs; and a size is also
+   what decides whether a word points *into* a block rather than at its first
+   byte, which is the interior-pointer case a separate table would have to answer
+   with the same range test anyway while staying in step with the heap by hand.
+   It costs one `ObBlock` (24 bytes) per object, and `OB_GC_LIMIT` counts it, so
+   a bounded heap is bounded in the bytes it really takes.
+8. **The trigger besides a failing allocation is a byte budget,
+   `OB_GC_LIMIT=n`.** The heap's live bytes are the headers plus the payloads;
+   when the next allocation would take them past `n`, the collector runs, and
+   `NEW` yields `NIL` if it still would afterwards — which is the report's
+   failure case (§6.4) reached without a failing `malloc`, and the one thing that
+   makes a bounded heap testable at all. `malloc` failing collects once and
+   retries once, so no path loops. Item 5's "ends the attempt"
+   is therefore two `NIL` returns and no loop: a collection that frees nothing
+   leaves the budget over, and the attempt ends. Evidence: `e2e`'s
+   `gc-runs-in-a-bounded-heap-limit` collects 20000 allocations into a
+   4096-byte heap and completes, and `a-live-set-over-the-limit-yields-nil`
+   reaches the `NIL` with a live chain longer than the limit and then counts it
+   back intact.
+9. **`OB_GC_STRESS=1` collects before every allocation**, so a suite sees the
+   collector run without arranging a heap small enough to fail. It changes no
+   answer because the mark is exact in the direction that matters: what is
+   reclaimed is what no root could reach — a module variable, a pointer inside a
+   live object or a record variable, or a word in the stack that points into the
+   heap — and nothing moves, so a pointer a program still holds is still valid.
+   The one observable difference is when an *address* is reused, and that is
+   `malloc`'s to decide in every build, collector or not. Evidence: the fuzz
+   corpus, whose probe keeps a chain alive per root kind and checks it after
+   churn, passes under `OB_GC_STRESS=1`; `e2e`'s three `gc-runs-in-a-bounded-heap-*`
+   rows are the same program with the collector stressed, limit-triggered and
+   idle, and all three end in the same value.
+10. **The descriptor gains the map, and only records that need one.** `ObDesc`
+    is now `{base, id, name, fields, nfields}`, and an `ObFld` is
+    `{off, stride, n, desc}`: `desc == NULL` is `n` pointer slots `stride` bytes
+    apart (one slot, or an array of pointers), and `desc` non-NULL is `n` records
+    of that type beginning there — a record field, or an `ARRAY OF RECORD` —
+    whose own map takes over. A type that reaches no pointer has `fields == NULL`
+    and `nfields == 0`, so marking an object of such a type is one test rather
+    than a walk, and a program that keeps no pointers registers no root. The map
+    is emitted by the same walk `desc_init` uses to give nested records their
+    descriptors, and its offsets are `offsetof` expressions, so the map follows
+    the C layout the back end does not compute for itself. Because a base is a
+    derived record's first member, a base's pointer fields arrive through one
+    more `offsetof` term per level. The one hand-written descriptor literal in
+    the tree — `e2e/Texts.c`, a fixture in the emitted shape — lists the two new
+    fields, which is not collateral: `-Wextra`'s `-Wmissing-field-initializers`
+    would reject the old literal under the e2e build's `-Werror`.
+11. **The roots are the module variables whose storage can reach the heap.**
+    `__init` registers each one — before its body can allocate — with
+    `ob_gc_root_region(&var, map, n)`: a pointer variable is one slot at offset
+    0, a record variable is its own type's map, and an `ARRAY OF RECORD` is a run
+    of them. The command table needs no entry of its own: it holds names and code
+    addresses, and what it can reach it reaches through the module variables that
+    are already roots. Everything else is item 3's conservative walk. Evidence:
+    `e2e`'s `gc-roots-hold-their-objects` (a module-level `ARRAY OF POINTER`, and
+    a record type whose map is emitted in another module's translation unit),
+    `gc-an-inherited-pointer-field-is-a-root` (a field the *base* of the object's
+    type declares, which the derived type's map has to reach one level in), and
+    `fuzz`'s probe, which holds a chain in a local, in a module-level pointer
+    variable, and in a module-level record both as one field and as a run.
+
+Two things only a run could settle, and both are in the runtime as written:
+
+* **A sanitized build needs two concessions from the collector, and they are part
+  of the walk's contract rather than a test-only workaround.** A conservative walk
+  is only correct if it may read the region it walks: ASan keeps locals in a "fake
+  stack", which a walk of the stack cannot see, and poisons the space around the
+  variables that are on the stack, which that read would trip over. The runtime
+  therefore turns `detect_stack_use_after_return` off in a constructor that runs
+  before the one capturing the stack top, and unpoisons the region it is about to
+  read; both are no-ops without a sanitizer, and neither changes what the
+  collector does. A program built with ASan and the collector on is then correct
+  for the same reason it is without one. This is worth the six lines: the value
+  checks alone did not notice a live object being freed (freed memory reads
+  correctly until it is reused), and ASan is what found a defect in the walk while
+  this was being written. The stress blocks of `fuzz/run.sh` therefore build with
+  the sanitizers whether or not `SAN=1` is set.
+* **The walk covers the frames from the collector's own up to a base captured
+  before `main`** (a constructor's frame is above every frame the program itself
+  will use). A host that kept a heap pointer only in its own `main` frame would
+  be outside it; the generated `main` calls the module loaders and the command
+  runner and holds no Oberon variable, so nothing is. The setjmp in the same
+  helper is what covers the *registers*: a value a callee-saved register carries
+  across the call to `rt_new` is nowhere in the stack until something spills it,
+  and `setjmp` puts it in the frame the walk is already reading. Completing this
+  precisely is what W9's stack maps are for, and it would change nothing else
+  here.
