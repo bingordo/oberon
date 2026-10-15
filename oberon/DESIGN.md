@@ -14,7 +14,7 @@ meant to be kept:
 | Artefact | What it is | Status |
 |---|---|---|
 | `src/bin/obgen.rs`, `fuzz/` | **A random program generator used as a self-checking oracle**: it writes a module *and* the value every variable must have (its own interpreter, so no circularity), and a mismatch traps in the module itself | 25 seeds run, 0 survived: it found three defects in the emitted C that the hand-written suites had missed (§13 R20) |
-| `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 47 tests pass, clippy clean |
+| `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 50 tests pass, clippy clean |
 | `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
 | `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
 | `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 26 checks pass; it found the emitter and checker bugs listed in §14 |
@@ -191,9 +191,11 @@ mechanism, which is why §5 records the (deliberate) choice to fail fast in v1.
 
 ## 5. Grammar
 
-`src/oberon.lalrpop` is a direct transcription of the report's appendix,
-with five changes. Each change exists because the report's own grammar is not
-LR(1) at that point; each is stated with the evidence that forced it.
+`src/oberon.lalrpop` is a direct transcription of the report's appendix, with
+five changes to its productions (D1–D5) plus two decisions that shape the
+grammar without changing what it accepts as a correct program (D6, D7). Each
+change exists because the report's own grammar is not LR(1) at that point; each
+is stated with the evidence that forced it.
 
 One decision here is about the grammar's *shape* rather than its content, and it
 predates any dialect: **a dialect is a gated grammar, not a second grammar.**

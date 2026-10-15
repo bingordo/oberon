@@ -8,7 +8,7 @@ An item is done when **the four suites and clippy pass** and the evidence it
 promises exists as a test or a suite check:
 
 ```
-cargo test                  # 47 unit tests
+cargo test                  # 50 unit tests
 bash golden/run.sh          # the golden cases, run twice: plain and under ASan/UBSan
 bash csmoke/run.sh          # 67 C-level cases
 bash e2e/run.sh             # 26 checks, end to end through the driver
