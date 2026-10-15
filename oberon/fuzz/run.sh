@@ -10,10 +10,11 @@
 #
 # The default run is the standard suite: every seed that once found a defect
 # (regressions.txt), as a value oracle and as a trap oracle, then a block for
-# coverage. It is sized to sit beside the other suites in the gate; the slower
-# variants are one flag away — `SAN=1` adds the sanitizers to whatever runs, and
-# SEEDS/BASE/COVER/ADVCOVER select ranges and sizes. Either way a seed reproduces
-# a program exactly, on any machine.
+# coverage, and then the same value oracle with the collector forced on. It is
+# sized to sit beside the other suites in the gate; the slower variants are one
+# flag away — `SAN=1` adds the sanitizers to whatever runs, and
+# SEEDS/BASE/COVER/ADVCOVER/GCCOVER select ranges and sizes. Either way a seed
+# reproduces a program exactly, on any machine.
 set -e
 cd -- "$(dirname -- "$0")"
 
@@ -23,28 +24,54 @@ WORK=${WORK:-findings}
 LIST=${LIST:-regressions.txt}
 COVER=${COVER:-30}
 ADVCOVER=${ADVCOVER:-10}
+GCCOVER=${GCCOVER:-10}
 BASE=${BASE:-1}
 
 # SAN=1 builds every generated program with the sanitizers the golden suite uses,
 # which makes a clean run evidence about the *emitted* code rather than about the
-# program's own arithmetic (PLAN.md W7.5). Leak detection stays on: the fragment
-# allocates nothing yet, so a leak would be a finding rather than a language
-# property -- when it does allocate, W10 decides what a leak means.
+# program's own arithmetic (PLAN.md W7.5). Leak detection stays on: what is still
+# on the heap when the program ends is what it still holds, because the runtime
+# collects once at exit (W10.2), so a leak here is a finding rather than a
+# language property.
 #
 # The adversarial mode appends one deliberate violation per program (an index
 # past the end, a NIL dereference, a guard that cannot hold, a computed zero
 # divisor, a false assertion) and the run must produce the exact trap line --
 # message *and* source byte. That is the only test of those paths that does not
 # come from a hand-written case.
+#
+# GC=1 runs a block with the collector forced on every allocation, through
+# `OB_GC_STRESS=1` in the environment of `obgen` and so of every program it
+# builds and runs (PLAN.md W10.2). The oracle is the programs' own checks: each
+# generated program now has a heap probe that keeps a chain alive per kind of
+# root -- in a local, in a module variable, and inside a module record -- and
+# checks it after some churn, so a collector that freed a live object makes the
+# seed fail rather than pass quietly. Such a block always builds with the
+# sanitizers, SAN=1 or not: a freed object whose memory has not been reused yet
+# still reads correctly, so the value checks alone cannot see the one thing the
+# collector must never do, which is exactly how the address sanitizer earned its
+# place here while W10.2 was being written.
+SAN_FLAGS=(
+    --cflag -fsanitize=address,undefined
+    --cflag -fno-sanitize-recover=all
+    --cflag -g
+)
 FLAGS=()
 if [ -n "${SAN:-}" ]; then
-    FLAGS=(--cflag -fsanitize=address,undefined --cflag -fno-sanitize-recover=all --cflag -g)
-    export ASAN_OPTIONS=detect_leaks=1
-    export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+    FLAGS=("${SAN_FLAGS[@]}")
 fi
+export ASAN_OPTIONS=detect_leaks=1
+export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
 status=0
-run() { "$OBG" --obc "$OBC" --work "$WORK" "${FLAGS[@]}" "$@" || status=$?; }
+run() {
+    local -a flags=("${FLAGS[@]}")
+    if [ -n "${GC:-}" ]; then
+        export OB_GC_STRESS=1
+        flags+=("${SAN_FLAGS[@]}")
+    fi
+    "$OBG" --obc "$OBC" --work "$WORK" "${flags[@]}" "$@" || status=$?
+}
 
 if [ -n "${SEEDS:-}" ]; then
     run --seeds "$SEEDS" --base "$BASE" "$@"
@@ -57,6 +84,10 @@ else
     run --seeds "$COVER" --base "$BASE" "$@"        # coverage
     echo "----"
     run --seeds "$ADVCOVER" --base "$BASE" --adversarial "$@"
-    echo "SUMMARY fuzz: regression list (values, traps) + $COVER coverage + $ADVCOVER adversarial${SAN:+ under sanitizers}, exit $status"
+    echo "----"
+    GC=1 run --seed-list "$LIST" "$@"               # the value oracle, under GC stress
+    echo "----"
+    GC=1 run --seeds "$GCCOVER" --base "$BASE" "$@" # and fresh programs under it
+    echo "SUMMARY fuzz: regression list (values, traps, values under stress) + $COVER coverage + $ADVCOVER adversarial + $GCCOVER under stress${SAN:+ under sanitizers}, exit $status"
 fi
 exit $status

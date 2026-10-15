@@ -84,6 +84,11 @@ pub struct Emitter<'a> {
     module: String,
     /// C struct names for record and array types.
     type_names: HashMap<TypeId, String>,
+    /// Whether a type reaches a pointer at all, memoized: it decides whether a
+    /// record needs a pointer map and whether a variable is a root, and the walk
+    /// that answers it is exponential in the depth of a type graph without the
+    /// memo (DESIGN §15.2).
+    reaches: HashMap<TypeId, bool>,
     /// The Oberon name of every type this module declares, so an interface can
     /// refer to it the way its reader spells it.
     oberon_names: HashMap<TypeId, String>,
@@ -191,6 +196,7 @@ impl<'a> Emitter<'a> {
             sema,
             module,
             type_names: HashMap::new(),
+            reaches: HashMap::new(),
             oberon_names: HashMap::new(),
             unresolved: 0,
             aliases: HashMap::new(),
@@ -291,6 +297,34 @@ impl<'a> Emitter<'a> {
         self.frames.push(Frame { frame: String::new(), level: 1, path: "init".into() });
         self.push_scope();
         let _ = writeln!(tail, "void {}__init(void) {{", self.module);
+        // The collector's roots, before the body can allocate (DESIGN §15.4):
+        // every module-level variable whose storage can reach the heap, with the
+        // map of that storage — a pointer variable's single slot at offset 0, a
+        // record variable's own type, an ARRAY OF RECORD's element type. A
+        // variable whose type reaches no pointer is not registered, so a module
+        // that holds no pointers registers nothing at all. It is emitted here
+        // rather than in the interface because the storage is this module's, and
+        // a client of an exported variable never allocates through it.
+        for v in &module.decls.vars {
+            let ty = self.decl_type(&v.ty);
+            for (name, _) in &v.names {
+                let map = self.region_fields(ty, "0");
+                if map.is_empty() {
+                    continue;
+                }
+                let cname = self.cname(name);
+                let _ = writeln!(self.globals, "static const ObFld {cname}__roots[] = {{");
+                for e in &map {
+                    let _ = writeln!(self.globals, "    {{ {e} }},");
+                }
+                let _ = writeln!(self.globals, "}};");
+                let _ = writeln!(
+                    tail,
+                    "    ob_gc_root_region(&{cname}, {cname}__roots, {});",
+                    map.len()
+                );
+            }
+        }
         // Oberon does not require a module to read its own variables, and a
         // `static` C variable the file never mentions is a `-Werror` failure
         // (R20). Marking them costs a read of a zeroed static, exactly as the
@@ -534,10 +568,26 @@ impl<'a> Emitter<'a> {
                     },
                     None => "NULL".into(),
                 };
+                // The pointer map the collector marks by (DESIGN §15.2). It is
+                // written from the same walk `desc_init` uses to give every
+                // nested record its descriptor, and a type that reaches no
+                // pointer gets no map at all rather than an empty one.
+                let map = self.record_fields(t);
+                let fields_ref = if map.is_empty() {
+                    "NULL".into()
+                } else {
+                    let _ = writeln!(self.descriptors, "static const ObFld {name}__fields[] = {{");
+                    for e in &map {
+                        let _ = writeln!(self.descriptors, "    {{ {e} }},");
+                    }
+                    let _ = writeln!(self.descriptors, "}};");
+                    format!("{name}__fields")
+                };
                 let _ = writeln!(
                     self.descriptors,
-                    "const ObDesc TD_{name} = {{ {base_ref}, {}u, \"{name}\" }};",
-                    t.0
+                    "const ObDesc TD_{name} = {{ {base_ref}, {}u, \"{name}\", {fields_ref}, {} }};",
+                    t.0,
+                    map.len()
                 );
                 let _ = writeln!(self.header, "extern const ObDesc TD_{name};");
             }
@@ -1749,6 +1799,113 @@ impl<'a> Emitter<'a> {
             };
         }
         path
+    }
+
+    /// The pointer map of a record type: where the pointers are inside a region
+    /// of that type (DESIGN §15.2). It is the same walk `desc_init` uses to give
+    /// every nested record its descriptor, written as `offsetof` expressions so
+    /// the map follows the C layout the back end does not compute for itself.
+    /// A base's fields are a derived record's too — `base` is its first member —
+    /// so each level of the chain adds one more `offsetof` term.
+    fn record_fields(&mut self, t: TypeId) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_record_fields(t, "", &mut out);
+        out
+    }
+
+    fn collect_record_fields(&mut self, t: TypeId, prefix: &str, out: &mut Vec<String>) {
+        let (base, fields, here) = match self.types.get(t) {
+            Type::Record { base, fields, .. } => {
+                (*base, fields.clone(), self.type_c_name(t).unwrap_or_default())
+            }
+            _ => return,
+        };
+        if let Some(b) = base {
+            self.collect_record_fields(b, &format!("{prefix}offsetof({here}, base) + "), out);
+        }
+        for f in &fields {
+            let off = format!("{prefix}offsetof({here}, {})", mangle(&f.name));
+            out.extend(self.region_fields(f.ty, &off));
+        }
+    }
+
+    /// The map entries for a region of type `t` whose first byte is at `off`
+    /// (DESIGN §15.2). A pointer field is one slot; an array of pointers is a run
+    /// of slots; an array of records is a run of descriptor-fronted records,
+    /// which their own map then walks; and a record field is the run of one.
+    /// Anything else — an `INTEGER`, a procedure variable, which holds a code
+    /// address and never an object — reaches no pointer, and a record that
+    /// reaches none gets no map at all, so marking it costs one NULL test.
+    fn region_fields(&mut self, t: TypeId, off: &str) -> Vec<String> {
+        match self.types.get(t).clone() {
+            Type::Pointer { .. } => vec![format!("{off}, 0, 1, NULL")],
+            Type::Array { .. } => {
+                let (n, elem) = self.array_run(t);
+                if !self.reaches_pointer(elem) {
+                    return Vec::new();
+                }
+                match self.types.get(elem).clone() {
+                    Type::Pointer { .. } => vec![format!("{off}, sizeof(void *), {n}, NULL")],
+                    Type::Record { .. } => vec![format!(
+                        "{off}, sizeof({}), {n}, {}",
+                        self.c_type(elem),
+                        self.descriptor_name(elem)
+                    )],
+                    _ => Vec::new(),
+                }
+            }
+            Type::Record { .. } => {
+                if !self.reaches_pointer(t) {
+                    return Vec::new();
+                }
+                vec![format!("{off}, 0, 1, {}", self.descriptor_name(t))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// An array type flattened to its innermost element and its element count:
+    /// the dimensions are contiguous in the C struct — each is a single-member
+    /// struct of the next — so one run at the element's size covers the whole
+    /// array, however many dimensions the source wrote.
+    fn array_run(&self, t: TypeId) -> (usize, TypeId) {
+        // The product saturates: a type with that many elements has no storage
+        // any machine could hold, so its map is never walked — and a wrapped
+        // count would be a wrong run rather than an unreachable one.
+        let mut n: usize = 1;
+        let mut elem = t;
+        while let Type::Array { len, elem: e } = self.types.get(elem).clone() {
+            n = n.saturating_mul(len as usize);
+            elem = e;
+        }
+        (n, elem)
+    }
+
+    /// Does a region of this type reach a pointer at all? Memoized, because a
+    /// type graph is a DAG and answering this per field without a memo is
+    /// exponential in its depth; a record cannot contain itself by value, so the
+    /// recursion terminates (a pointer back to it ends the walk at the pointer).
+    fn reaches_pointer(&mut self, t: TypeId) -> bool {
+        if let Some(&known) = self.reaches.get(&t) {
+            return known;
+        }
+        let found = match self.types.get(t).clone() {
+            Type::Pointer { .. } => true,
+            Type::Array { .. } => {
+                let (_, elem) = self.array_run(t);
+                self.reaches_pointer(elem)
+            }
+            Type::Record { base, fields, .. } => {
+                let mut any = base.map(|b| self.reaches_pointer(b)).unwrap_or(false);
+                for f in &fields {
+                    any = any || self.reaches_pointer(f.ty);
+                }
+                any
+            }
+            _ => false,
+        };
+        self.reaches.insert(t, found);
+        found
     }
 
     /// Does a type contain a record anywhere (so its descriptor fields need

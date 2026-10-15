@@ -1,6 +1,17 @@
 # Build artefacts.  The generated parsers, objects and binaries belong outside
 # the tree, and every run.sh builds into a temporary directory for that reason.
 /oberon/target/
+# What a build of a fixture writes beside it. `Texts.c`, `Texts.h`, `Oberon.c` and
+# `Oberon.h` are hand-written fixtures and are deliberately not listed here.
+/oberon/e2e/Out.c
+/oberon/e2e/Out.h
+/oberon/e2e/Out.sym
+/oberon/e2e/Torture.c
+/oberon/e2e/Torture.h
+/oberon/e2e/Torture.sym
+/oberon/e2e/Hello.c
+/oberon/e2e/Hello.h
+/oberon/e2e/Hello.sym
 *.o
 /oberon/golden/constexpr
 /oberon/golden/golden

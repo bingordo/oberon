@@ -588,6 +588,68 @@ impl Program {
         m
     }
 
+    /// The heap probe's procedures (PLAN.md W10.2). The fragment allocates
+    /// nothing by itself, so without these the collector's oracle would be
+    /// silent: `OB_GC_STRESS=1` would collect empty heaps and prove nothing.
+    fn gc_procs(&self) -> String {
+        "  PROCEDURE GCLink(n: INTEGER): GCPtr;\n\
+         \x20   VAR head, p: GCPtr;\n\
+         \x20 BEGIN\n\
+         \x20   head := NIL; p := NIL;\n\
+         \x20   WHILE n > 0 DO NEW(p); p.val := n; p.next := head; head := p; n := n - 1 END;\n\
+         \x20   RETURN head\n\
+         \x20 END GCLink;\n\n\
+         \x20 PROCEDURE GCSum(h: GCPtr): INTEGER;\n\
+         \x20   VAR s: INTEGER;\n\
+         \x20 BEGIN\n\
+         \x20   s := 0;\n\
+         \x20   WHILE h # NIL DO s := s + h.val; h := h.next END;\n\
+         \x20   RETURN s\n\
+         \x20 END GCSum;\n\n\
+         \x20 PROCEDURE GCChurn(n: INTEGER);\n\
+         \x20   VAR p: GCPtr;\n\
+         \x20 BEGIN\n\
+         \x20   WHILE n > 0 DO p := GCLink(3); p := NIL; n := n - 1 END\n\
+         \x20 END GCChurn;\n\n"
+            .to_string()
+    }
+
+    /// The heap probe's body: one chain per root kind the collector has to find
+    /// -- in a local (which the conservative stack walk finds), in a module-level
+    /// pointer variable, and inside a module-level record, both as one field and
+    /// as a run of them -- and then a churn that leaves garbage behind, so that
+    /// `OB_GC_STRESS=1` collects on every allocation in between. Each chain is
+    /// checked afterwards: a collector that freed a live node would have let the
+    /// churn reuse it and change a `val`, and the check traps.
+    ///
+    /// The value of a chain of `n` nodes is `1 + .. + n`, and one copied from
+    /// its head goes on with `n - 1` of them, from `2` -- `GCLink` pushes the
+    /// newest node, whose value is the loop's last, at the head, so the head's
+    /// own value is 1.
+    fn gc_probe(&self) -> String {
+        let n: i32 = 3 + (self.seed % 6) as i32;
+        let sum = n * (n + 1) / 2;
+        let rest = sum - 1;
+        format!(
+            "  (* the heap probe: chains, churn, and a check per root kind *)\n\
+             \x20 gcN := {n};\n\
+             \x20 gcHead := GCLink(gcN);\n\
+             \x20 gcHold.first := GCLink(gcN);\n\
+             \x20 gcTmp := GCLink(gcN); gcHold.node := gcTmp^;\n\
+             \x20 gcTmp := GCLink(gcN); gcHold.many[0] := gcTmp^;\n\
+             \x20 gcTmp := GCLink(gcN); gcHold.many[1] := gcTmp^;\n\
+             \x20 GCChurn(20);\n\
+             \x20 IF GCSum(gcHead) # {sum} THEN fail[1] := 0 END;  (* a local chain, and the module variable *)\n\
+             \x20 IF GCSum(gcHold.first) # {sum} THEN fail[1] := 0 END;  (* a pointer inside a module record *)\n\
+             \x20 IF GCSum(gcHold.node.next) # {rest} THEN fail[1] := 0 END;  (* a record field and its map *)\n\
+             \x20 IF GCSum(gcHold.many[0].next) # {rest} THEN fail[1] := 0 END;  (* a run of records and its map *)\n\
+             \x20 IF gcHold.many[1].val # 1 THEN fail[1] := 0 END;\n\
+             \x20 GCChurn(20);\n\
+             \x20 IF GCSum(gcHold.many[1].next) # {rest} THEN fail[1] := 0 END;\n\
+             \x20 IF GCSum(gcHead) # {sum} THEN fail[1] := 0 END;\n"
+        )
+    }
+
     fn render(&self) -> String {
         self.render_with_expectation().0
     }
@@ -606,13 +668,24 @@ impl Program {
             }
         }
 
+        // The heap probe's types (PLAN.md W10.2): the fuzz fragment allocates
+        // now, so that a collector run per allocation has something to be right
+        // about. `GCPtr` first, because a field may only name a pointer whose
+        // base type is already declared (report 6.4).
+        let _ = writeln!(out, "  TYPE");
+        let _ = writeln!(out, "    GCPtr = POINTER TO GCNode;");
+        let _ = writeln!(out, "    GCNode = RECORD val: INTEGER; next: GCPtr END;");
+        let _ = writeln!(
+            out,
+            "    GCHold = RECORD first: GCPtr; node: GCNode; many: ARRAY 2 OF GCNode END;"
+        );
         if self.adversarial {
             // The machinery the violations need. It is declared but never used
             // by the generated part of the program, so it cannot affect a value
             // the mirror predicts.
             // Names the generator never produces: it names its procedures
-            // `F0`, `F1` and `R`, and its variables `m<i>`/`c<i>`/`fail`.
-            let _ = writeln!(out, "  TYPE");
+            // `F0`, `F1` and `R`, its variables `m<i>`/`c<i>`/`fail`, and the
+            // heap probe's `gc*`/`GC*`.
             let _ = writeln!(out, "    ARec = RECORD x: INTEGER END;");
             let _ = writeln!(out, "    AExt = RECORD (ARec) y: INTEGER END;");
             let _ = writeln!(out, "    APtr = POINTER TO ARec; AExtPtr = POINTER TO AExt;");
@@ -624,6 +697,12 @@ impl Program {
         }
         // The trap trigger: out of range for its own length, on purpose.
         let _ = writeln!(out, "    fail: ARRAY 1 OF INTEGER;");
+        // The heap probe's roots: a pointer variable, a record variable holding
+        // pointers, and the temporaries the record copies need.
+        let _ = writeln!(
+            out,
+            "    gcHead, gcTmp: GCPtr; gcHold: GCHold; gcN: INTEGER;"
+        );
         if self.adversarial {
             let _ = writeln!(out, "    arr: ARRAY 4 OF INTEGER; pa: APtr;");
         }
@@ -631,6 +710,7 @@ impl Program {
         for f in &g.funcs {
             render_func(g, f, &mut out);
         }
+        out.push_str(&self.gc_procs());
 
         let _ = writeln!(out, "BEGIN");
         let trace = self.per_statement.map(|v| self.explain(v));
@@ -660,6 +740,7 @@ impl Program {
                 }
             }
         }
+        out.push_str(&self.gc_probe());
         let expected = self.expectations();
         for (k, name) in g.mvars.iter().enumerate() {
             let _ = writeln!(

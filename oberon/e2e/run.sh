@@ -362,6 +362,168 @@ status=0
 OB_ALLOC_FAIL_AT=1 sh -c '"$0" >/dev/null 2>&1' "$DRV/T10" || status=$?
 check "a-failing-new-yields-nil" "0" "$status"
 
+# W10.2's collector: a program whose live set stays bounded while its allocation
+# count grows must run in a bounded heap. `OB_GC_LIMIT` is a hard bound, so with
+# nothing reclaiming, `NEW` would give out after 85 of the 20000 allocations
+# (a 4096-byte heap, a 48-byte block), the NIL dereference would trap, and the
+# program would die; with the collector it completes, and the sum it checks says
+# no node of a live chain was reclaimed. Three modes, one answer: collection
+# forced on every allocation, collection triggered by the limit, and collection
+# idle (`OB_GC_STRESS` and `OB_GC_LIMIT` unset) -- which is also the evidence
+# that a program that never needs the collector pays nothing for it.
+cat > "$DRV/Gc.mod" <<'MODEOF'
+MODULE Gc;
+  TYPE P = POINTER TO Node;
+       Node = RECORD x: INTEGER; next: P END;
+  VAR total, i: INTEGER; fail: ARRAY 2 OF INTEGER;
+
+  PROCEDURE Round(n: INTEGER): INTEGER;
+    VAR head, p: P; s: INTEGER;
+  BEGIN
+    head := NIL; s := 0;
+    WHILE n > 0 DO NEW(p); p.x := n; p.next := head; head := p; n := n - 1 END;
+    WHILE head # NIL DO s := s + head.x; head := head.next END;
+    RETURN s
+  END Round;
+BEGIN
+  total := 0;
+  FOR i := 1 TO 1000 DO total := total + Round(20) END;
+  IF total # 210000 THEN fail[2] := 0 END
+END Gc.
+MODEOF
+if "$OBC" build "$DRV/Gc.mod" --out "$DRV" -o "$DRV/gc" >/dev/null 2>&1; then
+    # 1000 rounds of 20 nodes: 20000 allocations, each round's chain dead before
+    # the next one starts, so the live set is one 20-node chain -- 960 bytes, a
+    # 24-byte header in front of each 24-byte node -- and the whole run would
+    # need 960000. 210000 is the sum of the values 1..20, a thousand times over.
+    for mode in stress limit idle; do
+        status=0
+        case $mode in
+            stress) OB_GC_STRESS=1 OB_GC_LIMIT=4096 "$DRV/gc" || status=$? ;;
+            limit) OB_GC_LIMIT=4096 "$DRV/gc" || status=$? ;;
+            idle) "$DRV/gc" || status=$? ;;
+        esac
+        check "gc-runs-in-a-bounded-heap-$mode" "0" "$status"
+    done
+else
+    echo "FAIL gc-runs-in-a-bounded-heap: the module did not build"
+    fail=$((fail + 1))
+fi
+
+# A live set larger than the limit: `NEW` yields NIL (report §6.4) and the
+# attempt ends there -- a collection that frees nothing must not loop -- while
+# every node that did fit is still there, which is what the count says.
+cat > "$DRV/GcNil.mod" <<'MODEOF'
+MODULE GcNil;
+  TYPE P = POINTER TO Node;
+       Node = RECORD x: INTEGER; next: P END;
+  VAR head, p: P; k, count: INTEGER; done: BOOLEAN; fail: ARRAY 2 OF INTEGER;
+BEGIN
+  head := NIL; k := 0; done := FALSE;
+  WHILE (~done) & (k < 100) DO
+    NEW(p);
+    IF p = NIL THEN done := TRUE ELSE p.x := k; p.next := head; head := p; k := k + 1 END
+  END;
+  IF ~done THEN fail[2] := 0 END;                 (* the limit must have bitten *)
+  IF (k < 2) OR (k = 100) THEN fail[2] := 0 END;  (* and only after two fitted *)
+  count := 0; p := head;
+  WHILE p # NIL DO count := count + 1; p := p.next END;
+  IF count # k THEN fail[2] := 0 END              (* and nothing live was reclaimed *)
+END GcNil.
+MODEOF
+if "$OBC" build "$DRV/GcNil.mod" --out "$DRV" -o "$DRV/gcnil" >/dev/null 2>&1; then
+    status=0
+    OB_GC_LIMIT=128 "$DRV/gcnil" || status=$?
+    check "a-live-set-over-the-limit-yields-nil" "0" "$status"
+else
+    echo "FAIL a-live-set-over-the-limit-yields-nil: the module did not build"
+    fail=$((fail + 1))
+fi
+
+# The roots the collector has to find (W10.2), in the two shapes `Gc.mod` does
+# not have: an ARRAY OF POINTER at module level, and a record type whose map is
+# emitted in *another* module's translation unit. `GcDef` is a module, not a
+# hand-written fixture, so the driver checks and compiles it like any other.
+cat > "$DRV/GcDef.mod" <<'MODEOF'
+MODULE GcDef;
+  TYPE Node* = RECORD val*: INTEGER END;
+       P* = POINTER TO Node;
+END GcDef.
+MODEOF
+cat > "$DRV/GcRoots.mod" <<'MODEOF'
+MODULE GcRoots;
+  IMPORT GcDef;
+  VAR runs: ARRAY 3 OF GcDef.P; i, sum: INTEGER; fail: ARRAY 2 OF INTEGER;
+
+  PROCEDURE Fill(VAR v: ARRAY OF GcDef.P; n: INTEGER);
+    VAR k: INTEGER; p: GcDef.P;
+  BEGIN
+    k := 0;
+    WHILE k < n DO
+      NEW(p);
+      IF p # NIL THEN p.val := k + 1; v[k] := p END;
+      k := k + 1
+    END
+  END Fill;
+
+  PROCEDURE Churn(n: INTEGER);
+    VAR p: GcDef.P;
+  BEGIN
+    WHILE n > 0 DO NEW(p); p.val := 0; p := NIL; n := n - 1 END
+  END Churn;
+BEGIN
+  Fill(runs, 3);
+  Churn(100);
+  sum := 0; i := 0;
+  WHILE i < 3 DO sum := sum + runs[i].val; i := i + 1 END;
+  FOR i := 1 TO 20 DO Churn(5) END;
+  IF sum # 6 THEN fail[2] := 0 END   (* 200 collections later, all three are still 1, 2, 3 *)
+END GcRoots.
+MODEOF
+if "$OBC" build "$DRV/GcRoots.mod" --out "$DRV" -I "$DRV" -o "$DRV/gcroots" >/dev/null 2>&1; then
+    status=0
+    OB_GC_STRESS=1 "$DRV/gcroots" || status=$?
+    check "gc-roots-hold-their-objects" "0" "$status"
+else
+    echo "FAIL gc-roots-hold-their-objects: the modules did not build"
+    fail=$((fail + 1))
+fi
+
+# A pointer field the *base* of the object's type declares: the object's own
+# descriptor is the extension's, so the map has to reach the field one level in,
+# through `offsetof(S, base) + offsetof(R, q)`. `head.q` is the only reference to
+# the leaf object, so a map that missed the inherited field loses it.
+cat > "$DRV/GcExt.mod" <<'MODEOF'
+MODULE GcExt;
+  TYPE Q = POINTER TO Leaf;
+       Leaf = RECORD y: INTEGER END;
+       R = RECORD a: INTEGER; q: Q; pad: ARRAY 2 OF Leaf END;
+       S = RECORD (R) b: INTEGER END;
+  VAR head: POINTER TO S; leaf: Q; total: INTEGER; fail: ARRAY 2 OF INTEGER;
+
+  PROCEDURE Churn(n: INTEGER);
+    VAR p: Q;
+  BEGIN
+    WHILE n > 0 DO NEW(p); p.y := 0; p := NIL; n := n - 1 END
+  END Churn;
+BEGIN
+  NEW(leaf); leaf.y := 7;
+  NEW(head); head.a := 0; head.b := 0; head.q := leaf;
+  head.pad[1] := leaf^;                    (* a record inside the base as well *)
+  Churn(200);
+  total := head.q.y;
+  IF total # 7 THEN fail[2] := 0 END
+END GcExt.
+MODEOF
+if "$OBC" build "$DRV/GcExt.mod" --out "$DRV" -o "$DRV/gcext" >/dev/null 2>&1; then
+    status=0
+    OB_GC_STRESS=1 "$DRV/gcext" || status=$?
+    check "gc-an-inherited-pointer-field-is-a-root" "0" "$status"
+else
+    echo "FAIL gc-an-inherited-pointer-field-is-a-root: the module did not build"
+    fail=$((fail + 1))
+fi
+
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true

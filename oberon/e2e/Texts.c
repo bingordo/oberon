@@ -3,7 +3,7 @@
 #include "Texts.h"
 #include <stdio.h>
 
-const ObDesc TD_Texts__Writer = { NULL, 9001u, "Texts.Writer" };
+const ObDesc TD_Texts__Writer = { NULL, 9001u, "Texts.Writer", NULL, 0 };
 
 void Texts__OpenWriter(Texts__Writer *w) {
     w->desc = &TD_Texts__Writer;

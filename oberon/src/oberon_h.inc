@@ -3,8 +3,8 @@
  * Every helper here is `static inline`, so a translation unit includes exactly
  * the ones it calls and an unused helper never trips -Wunused-function.
  * The few things that must be shared across modules (the type descriptors'
- * identity and the command registry) have external linkage and live in
- * oberon_runtime.c.
+ * identity, the heap and its collector, and the command registry) have external
+ * linkage and live in oberon_runtime.c.
  *
  * The semantics of these helpers are the ones verified in oberon/csmoke and
  * oberon/golden: floor DIV/MOD with the INT32_MIN/-1 case, shifts with the count
@@ -13,18 +13,40 @@
 #ifndef OBERON_H
 #define OBERON_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* One entry of a record type's field map: where the pointers are inside a region
+ * of that type (DESIGN 15.2). `n == 1` is one slot at `off`; `n > 1` is `n`
+ * slots `stride` bytes apart, which is what an array field is. `desc` is NULL
+ * when the slots hold pointers, and the embedded type's descriptor when they
+ * hold records -- a record field, or an ARRAY OF RECORD -- whose own map then
+ * takes over. The descriptor word itself is never an entry: it is at offset 0 of
+ * every view of a record (DESIGN 9.3) and points at static data, not at an
+ * object. Offsets and strides are `size_t`, like `rt_new`'s size, because a
+ * record may be larger than any 32-bit extent (R30). */
+typedef struct ObDesc ObDesc;
+typedef struct ObFld ObFld;
+struct ObFld {
+    size_t off;
+    size_t stride;
+    size_t n;
+    const ObDesc *desc;
+};
+
 /* A type descriptor. Records that can be extended keep one in their first word
  * (a record variable's own, or the one stored in a heap block for `POINTER TO`),
- * so `IS`, a type guard and a type CASE all walk `base` (report 6.3, 6.4). */
-typedef struct ObDesc ObDesc;
+ * so `IS`, a type guard and a type CASE all walk `base` (report 6.3, 6.4). A
+ * record whose type reaches no pointer at all has no map, which is what makes a
+ * program that does not use the heap pay nothing to be collectable. */
 struct ObDesc {
     const ObDesc *base;
     int32_t id;
     const char *name;
+    const ObFld *fields;
+    int32_t nfields;
 };
 
 /* A parameterless exported procedure, callable by name (report 11). */
@@ -221,6 +243,15 @@ static inline int32_t rt_is(const ObDesc *d, const ObDesc *target) {
  * W2.2). Across a translation unit boundary it cannot, and the guard's own check
  * traps first at run time, as the language requires. */
 void *rt_new(size_t size, const ObDesc *d);
+
+/* One module-level variable that can reach the heap, as the collector needs it
+ * (DESIGN 15.4): `base` is the variable's storage, and `fields` says where the
+ * pointers are inside it -- a record variable's map, an ARRAY OF RECORD's
+ * element map, and for a pointer variable the single slot at offset 0. A module
+ * calls this from `__init`, before its body can allocate; a variable whose type
+ * reaches no pointer is not registered at all, so a program without heap
+ * pointers registers nothing. */
+void ob_gc_root_region(const void *base, const ObFld *fields, int32_t n);
 
 /* ------------------------------------------------------------- PACK/UNPK */
 
