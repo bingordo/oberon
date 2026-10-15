@@ -350,8 +350,16 @@ fn emit_tree(
                     if !interfaces.iter().any(|i| i.module == m) {
                         // An interface that was *refused* (a version this compiler
                         // does not read) is not a missing one, and saying which it
-                        // is here means no unrelated `.sym` on the search path is
-                        // reported (PLAN.md W3.2).
+                        // is means no unrelated `.sym` on the search path gets the
+                        // blame (PLAN.md W3.2).
+                        //
+                        // A module whose C *is* found does not reach this arm, so
+                        // `emit_tree` reports the same refusal from the checker's
+                        // diagnostic instead. The two are exclusive, so neither
+                        // path can report it twice.
+                        if let Some(why) = refused.get(&m) {
+                            return Err(why.to_string());
+                        }
                         return Err(format!(
                             "no interface for module `{m}` on the search path (looked for {m}.sym, \
                              {m}.mod and {m}.c)"

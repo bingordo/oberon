@@ -1935,11 +1935,15 @@ impl<'a> Emitter<'a> {
                 let base = self.types.deref(ty).unwrap_or(TypeId(0));
                 let bt = self.c_type(base);
                 let desc = self.descriptor_name(base);
-                let _ = writeln!(out, "    {p} = malloc(sizeof({bt}));");
+                // The allocation goes through the runtime so that the object's
+                // own descriptor is stored at its head, as the guard and the
+                // type CASE read it, and so that the failure the report
+                // specifies (§6.4: the pointer becomes NIL) is the runtime's
+                // single answer — including the heap-exhaustion hook the trap
+                // matrix uses, which no other route to `malloc` would see.
+                let _ = writeln!(out, "    {p} = rt_new(sizeof({bt}), {desc});");
                 let _ = writeln!(out, "    if ({p} != NULL) {{");
-                // The new object's descriptor is its static type's, and any
-                // records inside it get theirs.
-                let _ = desc;
+                // Records *inside* the new object get their descriptors too.
                 self.desc_init(base, &format!("(*{p})"), out, "        ");
                 let _ = writeln!(out, "    }}");
             }

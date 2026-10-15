@@ -675,6 +675,22 @@ arm), but the decision should be written down in DESIGN §5.
 
 ---
 
+**W6.6 the generator's three standing failures** — **open**
+
+`fuzz` reports three seeds failing (7, 9, 17 of 25), each as a program whose own
+self-check traps — a *value* the module computed differently from the value the
+generator says it must hold — at `fail[1] := 0`, the deliberate out-of-range index
+each check uses to fail loudly. None of the three uses an open array or `NEW`, so
+they are not from W7.4's fixes; the arithmetic they do is the shortcut family
+(`F0`, `LSL`, `ASR`, `DIV`, `ABS`) that R22 touched, which makes the model rather
+than the code the first thing to check: the generator must model `LSL(x,n)=x*2^n`
+for a count at or beyond the word size, and if it models the mask instead, its
+expectation is wrong, not the program's value.
+
+Done when: each seed is either fixed in the compiler or its expectation corrected
+in the generator, with the reason recorded — and the seeds are in the gate, not
+merely reproducible by hand.
+
 ## W7 — memory safety: evaluate it, then test it
 
 Why: the design's promise is that a memory access in emitted code is either
@@ -805,6 +821,23 @@ Done when: a few hundred seeds are ASan/UBSan-clean, and the adversarial mode's
 traps all report their expected offsets.
 
 ---
+
+**W7.6 the narrowing must not cast the designator** — **open**
+
+A designator narrowed by a guard or by a type-`CASE` arm is spelled with the
+narrowed C type, so it is no longer an lvalue and `p := NIL` inside
+`CASE p OF PS: … END` does not compile (DESIGN R29, found by W7.4). The row in the
+matrix has an empty arm to avoid it, which is exactly the kind of accommodation the
+matrix exists to remove.
+
+Plan: the binding keeps the *plain* spelling and narrows only the type, so
+`field_path` bridges from the declared record to the derived field — which also
+drops R15's unnecessary cast, since the access stays inside the base object. The
+value sites (a narrowed pointer assigned to a derived pointer formal or variable)
+then need the cast the spelling used to carry, so `coerce` has to emit it for
+*pointer* types. Rows to keep the fix honest: an assignment to the narrowed
+designator, a field write and a field read through each spelling, and a narrowed
+pointer passed to a `Q`-typed parameter.
 
 ## W8 — what production Oberon compilers add, and what to adopt
 
