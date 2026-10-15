@@ -1999,7 +1999,14 @@ impl<'a> Backend<'a> {
                 local_tys.insert(lname.clone(), *ty);
                 if let (Some(addr), Some(fr)) = (frame_addr, &frame) {
                     let (off, _) = fr.locals[lname];
-                    slots.insert(lname.clone(), bcx.ins().iadd_imm_s(addr, off as i64));
+                    let here = bcx.ins().iadd_imm_s(addr, off as i64);
+                    slots.insert(lname.clone(), here);
+                    // A record in a frame carries its descriptor like any other
+                    // local: the walk that gives every nested record its own word
+                    // runs over these too.
+                    if self.contains_record(*ty) {
+                        regions.push((*ty, here));
+                    }
                     continue;
                 }
                 if self.value_type(*ty).is_none() || taken.contains(lname) {

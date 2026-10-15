@@ -2517,16 +2517,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
 
@@ -2547,16 +2551,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Nested procedures, static links, and the rest of the scope machinery **[in part; `PLAN.md` W9.2d]**
 
@@ -2615,16 +2623,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
 
@@ -2645,16 +2657,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Imported descriptors, procedure values, and what is left **[in part; `PLAN.md` W9.2d]**
 
@@ -2740,16 +2756,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
 
@@ -2770,16 +2790,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Nested procedures, static links, and the rest of the scope machinery **[in part; `PLAN.md` W9.2d]**
 
@@ -2838,16 +2862,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### report §11.1's SYSTEM, and the one row left **[implemented; `PLAN.md` W9.2d]**
 
@@ -2868,16 +2896,20 @@ has one: two values compared or added are brought to the wider of their *actual*
 types, and a store narrows to the destination's — which is exactly what an
 `intptr_t` address compared with an `INTEGER` needs.
 
-**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **125 checks pass, 1 fails** —
-`regressions-all-hold`, and the diagnosis is in hand: `Regress.Run`'s nested
-`localRecord` calls its nested `which`, and `which` reads an enclosing local
-through a *zero* static link (ASan: `SEGV on address 0x8` in
-`Regress__localRecord__which`), so a link is not being passed or not being
-received for that shape. `Torture.mod`'s three-level nest passes, so it is a shape
-specific to `Regress` (a nested procedure inside a procedure that is itself nested
-*and* uses a local record). It is a crash rather than a refusal, which is the one
-thing this back end's stance does not allow — the next run must either fix it or
-refuse that shape by name, and it is the only row left.
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **126 checks pass, 0 fail** —
+every row the C path passes, on the second back end.
+
+The last row was a *local record in a frame*. `Regress.Run`'s nested
+`localRecord` passes a local record to its own nested `which`, whose type-`CASE`
+reads the record's descriptor — and the record's descriptor word was **NULL**
+(ASan: `SEGV on address 0x8` in `Regress__localRecord__which`, one word past the
+object's start). The cause was narrow: a procedure that owns a frame puts its
+locals *in* the frame, and the walk that gives every local record its descriptor
+was collecting only the locals that live in their own slot, so a record inside a
+frame was never initialised. Both the level bookkeeping and the link passing were
+right — the declaration and the lowering agree on every level, which was worth
+measuring rather than assuming — and the fix is to hand the frame's record locals
+to the same walk.
 
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the
