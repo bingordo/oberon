@@ -48,6 +48,9 @@ Everything marked **[design]** below is not yet implemented; everything marked
   tracing collector; the report does not promise one, and a collector is a
   project of its own. Program behaviour is unaffected; only long-running
   programs that allocate in a loop change character.
+* Extensions that production Oberon compilers add beyond this report — which
+  ones are worth adopting, and why most are not — are surveyed with sources in
+  `PLAN.md` W8; nothing there is adopted until it appears in this section.
 * **Oberon-2** and later dialects (`WITH`, `LOOP`, `EXIT`, type-bound
   procedures, `LEN(v, dim)`, multi-dimensional open arrays). Report §10.2 lists
   `LEN(v)` with one argument; we implement exactly that.

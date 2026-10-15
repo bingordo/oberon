@@ -462,6 +462,54 @@ traps all report their expected offsets.
 
 ---
 
+## W8 — what production Oberon compilers add, and what to adopt
+
+Surveyed: Wirth's own compilers (Project Oberon 2013's RISC compiler `ORP`/`ORB`, and `OP2`), **VOC** (Vishap Oberon), **Oberon+** (`obx`/`obc`), the small-target compilers (AntKrotov's Oberon-07 for MSP430 and STM32, and Oberon-07 for CH32V003/RP2040), and the dialects that stayed in production (Oberon-2, Component Pascal, Active Oberon, Zonnon). Each was asked the same question: what does it offer beyond report §10.2, is it *additive* (a report program still compiles and means the same), and where is the primary source. Nothing here is adopted yet: each item is a proposal with a cost.
+
+Two load-bearing claims were re-verified here rather than trusted, because one survey row had one of them backwards:
+
+* the report's grammar has **no `ELSE`** in a case statement — `CaseStatement = CASE expression OF case {"|" case} END`, `case = [CaseLabelList ":" StatementSequence]` (report, appendix), and our parser rejects `ELSE` **[verified]**;
+* adding `ELSE` as a final clause is **conflict-free** in our LALRPOP grammar and reuses the default arm we already have (`labels: None`) **[verified by experiment: 0 conflicts, and probes with and without `ELSE` both check clean]**.
+
+**W8.1 `CASE … ELSE`** — *recommend, and it fixes something*
+Every dialect surveyed has it (Oberon-2 §9, Component Pascal §9.11, Oberon+ §Case statements, Zonnon; AntKrotov lists it under its documented differences from the original), and it closes **W6.4**: the report's own default arm — an empty label list followed by a statement sequence, `| S` — cannot be expressed in LALR(1) because a statement and a label share a first set, while `ELSE` can. It also adds **no new keyword** (`ELSE` is already a report keyword, used by `IF`), which is not true of anything else in this wave.
+Cost: one grammar clause, one arm with no labels (already in the AST and handled by the checker and emitter as the default), tests. Blast radius: none.
+
+**W8.2 `MIN(T)` / `MAX(T)`** — *recommend*
+Not in report §10.2 **[verified in the report's own table]**, yet the language needs a way to name an extreme: our folder and generator had to spell `-2147483648` as `(0 - 2147483647 - 1)`, and DESIGN's prose *assumed* `MAX(INTEGER)` in three places until R20's round of corrections. AntKrotov's compiler lists `MIN`/`MAX` among its additional standard procedures.
+Cost: two entries in the predefine table, one *type* argument (the same mechanism as a type guard, §5 D2), and folding. Blast radius: none — a program that declares its own `MIN` shadows the predeclared one, which our scoping already does.
+
+**W8.3 per-check granularity for the runtime checks** — *recommend*
+AntKrotov's `-nochk` disables pointer/guard/index/`INTEGER`→`BYTE`/`CHR`-range/stack-overflow checks *individually*; our plan (W3.1) only has an all-or-nothing `-Ochecks`. The finer switch is what the memory-safety work (W7.4) wants to vary per row, and it costs a flag.
+Blast radius: none (compiler surface).
+
+**W8.4 early `RETURN`** — *recommend; this revisits one of our own decisions*
+VOC, Oberon-2 §10.1, Component Pascal §10, Oberon+ and Zonnon §7.9 all allow `RETURN` as a statement rather than only at the end of a body, which is what our D6 chose from the report. The stated benefit of that choice — the emitter never needs multiple result-assignment sites — is weak in C, where an early return is `return expr;`, while the usability cost is real: today a procedure cannot return from inside a `CASE`. Proposal: accept `RETURN` as a statement, keep the accumulator shape for the report's spelling, and decide separately whether to relax the single-exit guarantee that D6 documented.
+
+**W8.5 `EXIT` for loops** — *recommend, with the counter-argument recorded*
+`LOOP`/`EXIT` exist in Oberon-2, Component Pascal, Oberon+ and Zonnon. `EXIT` alone (no `LOOP`) removes the flag-variable dance from `WHILE`/`REPEAT`/`FOR` bodies and maps to C's `break`. Against it, from Wirth himself: the 2007 revision removed features "judged duplicative or non-essential" for "regularity, simplicity, completeness, and well-structuredness" — which is why `LOOP` (redundant with `WHILE TRUE`) is *not* proposed, and why `EXIT` should be weighed rather than assumed. Note the keyword cost: `EXIT` is a new reserved word, so an identifier spelled `EXIT` in upper case would collide (Oberon is case-sensitive, so lower case is safe) — the same caveat Oberon+ documents for `WITH` and `LOOP`.
+
+**W8.6 `LONGINT` / `LONGREAL` as real 64-bit types** — *defer, with the blast radius stated*
+Oberon-2 §6.1, Component Pascal §6.1, VOC and Oberon+ (which goes further with `INT8`…`INT64`) all have wider numeric types. But Wirth's own Project Oberon compilers define `LONGINT`/`LONGREAL` as **synonyms** for `INTEGER`/`REAL`, with no widening — so a *real* 64-bit integer is not what a reference implementation means by the name. A C back end gets them cheaply (`int64_t`, `double`), but they touch the type algebra, the folder, the emitter, the `.sym` format and the generator's mirror. Defer until something needs them.
+
+**W8.7 the escape hatch's scope** — *feeds W4.1*
+Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`, `COND`, `REG`, `LDREG`, `LDPSR`, `LED`, `ADC`, `SBC`, `UML`; VOC adds `INT8`…`INT64`, `SET32`/`SET64`, `ADDRESS`; AntKrotov adds `GET8/16/32`, `PUT8/16/32`, `SADR`, `WSADR`, `MOVE`, `TYPEID`, `CODE` and, on STM32, `WCHAR`/`WCHR`. Decision to take in W4.1: the report's portable five, plus the *sized* accessors (`GET8/16/32`, `PUT8/16/32`) because a byte-address model needs them, while register/PSR/`LED`/`CODE`/`WCHAR` are target-specific and stay refused by name.
+
+**W8.8 what the survey says to reject** — recorded so the question does not come back
+* syntax conveniences: `_` in identifiers, `//` comments, lower-case keywords, optional end names, single-quoted strings, conditional compilation (AntKrotov, Oberon+) — each makes a program non-portable to a report compiler, and our value is strict conformance;
+* type-width *models* (VOC's `-O2`/`-OC`/`-OV`, Oberon+'s fixed-width set) — a dialect matrix multiplies the type algebra; the report fixes `INTEGER` = 32 bits and `REAL` = 32 bits;
+* `WITH` — superseded by guards, `IS` and type-`CASE`, and Wirth removed it;
+* type-bound procedures/methods (all four dialects) — the report's `IS`/guards/type-`CASE`/procedure variables already cover dynamic dispatch without a vtable model;
+* dynamic and multi-dimensional open arrays, `NEW(v, n)`, `LEN(v, dim)` (all four) — they interact with descriptors and, in the systems that have them, with a tracing collector;
+* tracing garbage collection and finalizers (VOC, Oberon-2 systems) — out of scope with R3; `rt_new` stays the door.
+
+**W8.9 a lesson that is not an extension: our overflow stance is ahead of production**
+VOC's C back end does not establish `-fwrapv`, so signed overflow there is undefined C. Our design fixes it deliberately (R4) and R20 is about making that choice *warning-clean* — not about giving it up.
+
+Done when: each recommended item has either landed with tests or been declined in DESIGN §13, and DESIGN §1 points here so a reader knows the extension question has been asked and answered.
+
+---
+
 ## Ideas not yet in the design (adopt or drop)
 
 - Fuzz the *lexer* with random bytes and random token streams: assert no panic
