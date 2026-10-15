@@ -52,6 +52,11 @@ struct Sym {
     level: usize,
     /// A `VAR` parameter is a C pointer, so every use needs a deref.
     by_var: bool,
+    /// The narrowed spelling of a symbol whose `cname` is a cast. A type-`CASE`
+    /// arm's variable keeps the cast for *field* access, because the cast is what
+    /// gives a derived field its layout, but an assignment target or a `VAR`
+    /// argument needs the plain designator: a cast is not an lvalue (DESIGN R29).
+    plain: Option<String>,
     /// A *declared* procedure (as opposed to a procedure-valued variable or
     /// parameter): only the former takes a static link.
     decl_proc: bool,
@@ -96,9 +101,6 @@ pub struct Emitter<'a> {
     /// for structured value parameters). Flushed exactly where the construct is
     /// evaluated once — never out of a loop.
     prelude: String,
-    /// Set while rendering an assignment's target: a guard there has to be
-    /// hoisted, because its comma form is not an lvalue.
-    hoist_guards: bool,
     anon: usize,
 }
 
@@ -126,7 +128,6 @@ impl<'a> Emitter<'a> {
             scopes: vec![HashMap::new()],
             frames: Vec::new(),
             prelude: String::new(),
-            hoist_guards: false,
             anon: 0,
         }
     }
@@ -150,7 +151,7 @@ impl<'a> Emitter<'a> {
         for t in &module.decls.types {
             let ty = self.decl_type(&t.ty);
             let cname = self.type_c_name(ty).unwrap_or_default();
-            self.declare(&t.name, Sym { cname, ty, level: 0, by_var: false, decl_proc: false });
+            self.declare(&t.name, Sym { cname, ty, level: 0, by_var: false, plain: None, decl_proc: false });
         }
         // Imported types: `M.T` resolves through the other module's header.
         for imp in &module.imports {
@@ -163,7 +164,7 @@ impl<'a> Emitter<'a> {
                             cname: format!("{}__{}", mangle(&imp.module), mangle(&name)),
                             ty,
                             level: 0,
-                            by_var: false,
+                            by_var: false, plain: None,
                             decl_proc: false,
                         },
                     );
@@ -181,7 +182,7 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(self.header, "#define {} {}", self.cname(&c.name), value);
             self.declare(
                 &c.name,
-                Sym { cname: self.cname(&c.name), ty, level: 0, by_var: false, decl_proc: false },
+                Sym { cname: self.cname(&c.name), ty, level: 0, by_var: false, plain: None, decl_proc: false },
             );
         }
         // 3. Globals: exported ones have external linkage, the rest are static.
@@ -196,7 +197,7 @@ impl<'a> Emitter<'a> {
                 } else {
                     let _ = writeln!(self.globals, "static {decl};");
                 }
-                self.declare(name, Sym { cname, ty, level: 0, by_var: false, decl_proc: false });
+                self.declare(name, Sym { cname, ty, level: 0, by_var: false, plain: None, decl_proc: false });
             }
         }
 
@@ -573,7 +574,7 @@ impl<'a> Emitter<'a> {
         // Declare it before the body, so recursion and later calls resolve.
         self.declare(
             &p.name,
-            Sym { cname: cname.clone(), ty: pty, level, by_var: false, decl_proc: true },
+            Sym { cname: cname.clone(), ty: pty, level, by_var: false, plain: None, decl_proc: true },
         );
 
         let ret = match result {
@@ -688,6 +689,7 @@ impl<'a> Emitter<'a> {
                     ty: pm.ty,
                     level,
                     by_var: self.param_is_pointer(pm),
+                    plain: None,
                     decl_proc: false,
                 },
             );
@@ -706,7 +708,7 @@ impl<'a> Emitter<'a> {
             let maybe = self.decl_type(&t.ty);
             let cname = self.type_c_name(maybe).unwrap_or_default();
             self.oberon_names.insert(maybe, t.name.clone());
-            self.declare(&t.name, Sym { cname, ty: maybe, level, by_var: false, decl_proc: false });
+            self.declare(&t.name, Sym { cname, ty: maybe, level, by_var: false, plain: None, decl_proc: false });
         }
         for c in &p.decls.consts {
             let (value, ty) = match self.sema.const_of(c.span) {
@@ -716,7 +718,7 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(out, "    static const {} {} = {value};", self.c_type(ty), mangle(&c.name));
             self.declare(
                 &c.name,
-                Sym { cname: mangle(&c.name), ty, level, by_var: false, decl_proc: false },
+                Sym { cname: mangle(&c.name), ty, level, by_var: false, plain: None, decl_proc: false },
             );
         }
         for v in &p.decls.vars {
@@ -742,7 +744,7 @@ impl<'a> Emitter<'a> {
                         cname: if has_nested { format!("f.{local}") } else { local },
                         ty,
                         level,
-                        by_var: false,
+                        by_var: false, plain: None,
                         decl_proc: false,
                     },
                 );
@@ -794,9 +796,7 @@ impl<'a> Emitter<'a> {
     fn stmt(&mut self, s: &Stmt, out: &mut String, level: usize) {
         match &s.kind {
             StmtKind::Assign { target, value } => {
-                self.hoist_guards = true;
-                let dst = self.designator(target, level);
-                self.hoist_guards = false;
+                let dst = self.designator(target, level, true);
                 let dst_ty0 = self.sema.type_at(target.span, self.types);
                 let src_ty0 = self.sema.type_at(value.span, self.types);
                 let pre = self.take_prelude();
@@ -990,7 +990,14 @@ impl<'a> Emitter<'a> {
                     };
                     self.declare(
                         &d.base[0],
-                        Sym { cname: narrowed, ty, level, by_var: false, decl_proc: false },
+                        Sym {
+                            cname: narrowed,
+                            ty,
+                            level,
+                            by_var: false,
+                            plain: Some(subj.clone()),
+                            decl_proc: false,
+                        },
                     );
                 }
                 for s in &arm.body {
@@ -1136,7 +1143,7 @@ impl<'a> Emitter<'a> {
                 if matches!(d.sels.last(), Some(Selector::Call(_))) {
                     return self.call_value(d, self.current_level());
                 }
-                self.designator(d, self.current_level())
+                self.designator(d, self.current_level(), false)
             }
             ExprKind::Unary(op, x) => {
                 let ty = self.sema.type_at(e.span, self.types).unwrap_or(TypeId(0));
@@ -1529,7 +1536,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn designator(&mut self, d: &ast::Designator, level: usize) -> String {
+    /// `lvalue` renders a designator where it has to be assignable: a narrowed
+    /// name keeps its plain spelling (a cast is not an lvalue) and a guard's
+    /// check becomes a statement in the prelude, which every lvalue caller
+    /// flushes before it writes (DESIGN R29).
+    fn designator(&mut self, d: &ast::Designator, level: usize, lvalue: bool) -> String {
         let base_sym = self.lookup(&d.base[0]);
         // A module-qualified base resolves to the other module's C name; its
         // remaining selectors apply exactly as for a local one (`M.r.f`).
@@ -1538,8 +1549,18 @@ impl<'a> Emitter<'a> {
             (Some(_), Some(t)) => t,
             _ => base_sym.as_ref().map(|s| s.ty).unwrap_or(TypeId(0)),
         };
+        // A narrowed name rendered as an lvalue uses its plain spelling, because
+        // the cast that gives a *field* its layout is not itself an lvalue. It is
+        // only usable when the name is the whole designator: with a selector
+        // after it the cast has to stay, since the field offset belongs to the
+        // narrowed record (DESIGN R29).
+        let plain_base =
+            lvalue && d.sels.is_empty() && base_sym.as_ref().and_then(|s| s.plain.as_ref()).is_some();
         let mut text = match (&qualified, &base_sym) {
             (Some(c), _) => c.clone(),
+            (None, Some(s)) if plain_base => {
+                s.plain.clone().unwrap_or_else(|| self.access(s, level))
+            }
             (None, Some(s)) => self.access(s, level),
             (None, None) => mangle(&d.base[0]),
         };
@@ -1556,7 +1577,9 @@ impl<'a> Emitter<'a> {
             .as_ref()
             .filter(|s| matches!(self.types.get(s.ty), Type::OpenArray { .. }))
             .map(|s| self.access_len(s, level));
-        for sel in &d.sels {
+        for (si, sel) in d.sels.iter().enumerate() {
+            // The last selector is the one whose view may have to be assignable.
+            let last = si + 1 == d.sels.len();
             match sel {
                 Selector::Field(f) => {
                     let rec = if is_pointer {
@@ -1645,13 +1668,19 @@ impl<'a> Emitter<'a> {
                         );
                         let view = format!("(({}){text})", self.c_type(t));
                         let test = format!("rt_guard_is({dyn_test}, \"type guard failed at byte {}\")", d.span.lo);
-                        text = if self.hoist_guards {
+                        text = if lvalue {
                             // An assignment's target has to be an *lvalue*, and a
-                            // comma expression is not one, so the check is hoisted
-                            // to a statement before the assignment — which the
-                            // assignment emitter already flushes.
+                            // comma expression is not one, so the check becomes a
+                            // statement before whatever writes through it — which
+                            // every lvalue caller flushes. The cast stays unless
+                            // the guard is the whole designator, because a field's
+                            // offset belongs to the narrowed record (DESIGN R29).
                             let _ = writeln!(self.prelude, "    {test};");
-                            view
+                            if last {
+                                text.clone()
+                            } else {
+                                view
+                            }
                         } else {
                             format!("(({test}, {view}))")
                         };
@@ -1675,9 +1704,13 @@ impl<'a> Emitter<'a> {
                             "rt_guard_is(rt_is({dyn_test}, {desc}), \"type guard failed at byte {}\")",
                             d.span.lo
                         );
-                        text = if self.hoist_guards {
+                        text = if lvalue {
                             let _ = writeln!(self.prelude, "    {test};");
-                            view
+                            if last {
+                                sub
+                            } else {
+                                view
+                            }
                         } else {
                             format!("(({test}, {view}))")
                         };
@@ -1759,7 +1792,7 @@ impl<'a> Emitter<'a> {
                 span: d.span,
             };
             let ty = self.sema.type_at(d.span, self.types).unwrap_or(TypeId(0));
-            (self.designator(&head, level), ty, level, false)
+            (self.designator(&head, level, false), ty, level, false)
         };
         let callee_ty = match self.sema.call_types.get(&crate::sema::span_key(d.span)) {
             Some(t) => *t,
@@ -1864,9 +1897,18 @@ impl<'a> Emitter<'a> {
         pm.by_var || self.types.is_record(pm.ty)
     }
 
+    /// The designator form of an expression where it has to be assignable: the
+    /// builtins that take a `VAR` argument (`NEW`, `INC`, `PACK`, …).
+    fn designator_of_mut(&mut self, e: &Expr, level: usize) -> String {
+        match &e.kind {
+            ExprKind::Designator(d) => self.designator(d, level, true),
+            _ => self.designator_of(e, level),
+        }
+    }
+
     fn designator_of(&mut self, e: &Expr, level: usize) -> String {
         match &e.kind {
-            ExprKind::Designator(d) => self.designator(d, level),
+            ExprKind::Designator(d) => self.designator(d, level, false),
             _ => self.expr(e, None),
         }
     }
@@ -1902,7 +1944,7 @@ impl<'a> Emitter<'a> {
         };
         match name {
             "INC" | "DEC" => {
-                let v = self.designator_of(&args[0], level);
+                let v = self.designator_of_mut(&args[0], level);
                 let n = match args.get(1) {
                     Some(a) => self.expr(a, None),
                     None => "1".into(),
@@ -1913,7 +1955,7 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(out, "    {v} {op} {n};");
             }
             "INCL" | "EXCL" => {
-                let v = self.designator_of(&args[0], level);
+                let v = self.designator_of_mut(&args[0], level);
                 let x = self.expr(&args[1], None);
                 let pre = self.take_prelude();
                 out.push_str(&pre);
@@ -1930,7 +1972,9 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(out, "    rt_guard({b}, \"assertion failed\");");
             }
             "NEW" => {
-                let p = self.designator_of(&args[0], level);
+                let p = self.designator_of_mut(&args[0], level);
+                let pre = self.take_prelude();
+                out.push_str(&pre);
                 let ty = self.sema.type_at(args[0].span, self.types).unwrap_or(TypeId(0));
                 let base = self.types.deref(ty).unwrap_or(TypeId(0));
                 let bt = self.c_type(base);
@@ -1949,14 +1993,18 @@ impl<'a> Emitter<'a> {
             }
             "PACK" => {
                 // report §10.2: PACK scales x by 2^n, so n is a value.
-                let x = self.designator_of(&args[0], level);
+                let x = self.designator_of_mut(&args[0], level);
                 let n = self.expr(&args[1], None);
+                let pre = self.take_prelude();
+                out.push_str(&pre);
                 let _ = writeln!(out, "    rt_pack(&({x}), {n});");
             }
             "UNPK" => {
                 // UNPK writes both the mantissa and the exponent.
-                let x = self.designator_of(&args[0], level);
-                let n = self.designator_of(&args[1], level);
+                let x = self.designator_of_mut(&args[0], level);
+                let n = self.designator_of_mut(&args[1], level);
+                let pre = self.take_prelude();
+                out.push_str(&pre);
                 let _ = writeln!(out, "    rt_unpk(&({x}), &({n}));");
             }
             _ => {}

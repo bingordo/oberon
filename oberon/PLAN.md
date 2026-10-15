@@ -834,7 +834,7 @@ traps all report their expected offsets.
 
 ---
 
-**W7.6 the narrowing must not cast the designator** — **open**
+**W7.6 the narrowing must not cast the designator** — **done**
 
 A designator narrowed by a guard or by a type-`CASE` arm is spelled with the
 narrowed C type, so it is no longer an lvalue and `p := NIL` inside
@@ -842,14 +842,17 @@ narrowed C type, so it is no longer an lvalue and `p := NIL` inside
 matrix has an empty arm to avoid it, which is exactly the kind of accommodation the
 matrix exists to remove.
 
-Plan: the binding keeps the *plain* spelling and narrows only the type, so
-`field_path` bridges from the declared record to the derived field — which also
-drops R15's unnecessary cast, since the access stays inside the base object. The
-value sites (a narrowed pointer assigned to a derived pointer formal or variable)
-then need the cast the spelling used to carry, so `coerce` has to emit it for
-*pointer* types. Rows to keep the fix honest: an assignment to the narrowed
-designator, a field write and a field read through each spelling, and a narrowed
-pointer passed to a `Q`-typed parameter.
+Done: the plain spelling is used where a store is needed, and only where the
+narrowed name is the *whole* designator — `field_path` walks *down* the base chain
+and is called with the *derived* record, so with a selector after the name the cast
+has to stay for the field's offset to be right. That is smaller than the plan above
+and needs no coercion change. The guard's check is hoisted to a statement in lvalue
+position, which the assignment emitter and the builtins taking a `VAR` argument
+flush; a guard that is the whole designator also drops its cast. Rows, all green:
+`narrow-assign-to-narrowed` (an assignment to the arm's variable), 
+`narrow-field-through-narrowed` (a field write and a field read through the arm's
+variable), `narrow-guard-as-target` (a store through both guard spellings, a record
+copy from a guarded view, and a narrowed pointer passed to a `PS` parameter).
 
 ## W8 — what production Oberon compilers add, and what to adopt
 
@@ -1041,6 +1044,15 @@ Done when: the research questions are answered with their sources in DESIGN; a
 prototype builds and runs the `e2e` modules with every row passing; `fuzz`'s seeds
 pass against it; and DESIGN records the ABI decision (runtime in C versus lowered)
 with the reason it was taken.
+
+**W7.7 a byte for every trap, not only the memory ones** — **open**
+
+The matrix asserts an exact source offset for the index and guard traps, because
+those messages carry one. `DIV by zero`, `MOD By zero`, `assertion failed` and
+`CASE: no matching type` carry none (DESIGN §9.4's table gives them their message
+only), so a user who trips one has no location — the runtime has the offset in hand
+at every one of those sites already, since each is emitted as a call. Adopt the
+same `(at byte N of the source)` suffix, then extend the matrix's expectations.
 
 ## Ideas not yet in the design (adopt or drop)
 

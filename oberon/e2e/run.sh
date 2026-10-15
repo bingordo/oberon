@@ -190,15 +190,20 @@ check "a-refused-interface-that-is-needed-is-explained" "1" \
 # The trap matrix: one deliberate violation per kind, each in its own module (the
 # first trap aborts the process), each asserting the message and the offset rather
 # than merely that something went wrong (PLAN.md W7.4).
-trap_case() { # name source expected-message
+trap_case() { # name source expected-line
     printf '%s' "$2" > "$DRV/$1.mod"
     "$OBC" build "$DRV/$1.mod" --out "$DRV" -o "$DRV/$1" >/dev/null 2>&1 || {
         echo "FAIL trap-$1: did not build"
         fail=$((fail + 1))
         return
     }
-    sh -c '"$0" >/dev/null 2>"$1"' "$DRV/$1" "$DRV/$1.err" || true
-    check "trap-$1" "1" "$(grep -c "$3" "$DRV/$1.err")"
+    status=0
+    sh -c '"$0" >/dev/null 2>"$1"' "$DRV/$1" "$DRV/$1.err" || status=$?
+    # The expected line is exact, source offset included, so a row fails if the
+    # check disappears, moves, or reports the wrong place; and a trap is an
+    # abort, so the status is asserted rather than the message alone.
+    check "trap-$1" "1" "$(grep -cF -- "$3" "$DRV/$1.err")"
+    check "trap-$1-aborts" "134" "$status"
 }
 
 trap_case index-below-zero 'MODULE T1;
@@ -207,13 +212,13 @@ BEGIN
   i := (-1);
   a[i] := 1
 END T1.
-' 'index out of range (at byte'
+' 'oberon: trap: index out of range (at byte 73 of the source)'
 trap_case index-at-len 'MODULE T2;
   VAR a: ARRAY 4 OF INTEGER;
 BEGIN
   a[4] := 1
 END T2.
-' 'index out of range (at byte'
+' 'oberon: trap: index out of range (at byte 48 of the source)'
 trap_case index-in-open-array 'MODULE T3;
   VAR a: ARRAY 4 OF INTEGER;
   PROCEDURE Fill(VAR v: ARRAY OF INTEGER);
@@ -223,7 +228,7 @@ trap_case index-in-open-array 'MODULE T3;
 BEGIN
   Fill(a)
 END T3.
-' 'index out of range (at byte'
+' 'oberon: trap: index out of range (at byte 95 of the source)'
 # A failed guard traps. The *record* spelling is covered here through a record
 # copy from the guarded view — reading a derived *field* through the view is the
 # static-analysis problem R15 records, where gcc sees the read is out of the
@@ -236,7 +241,7 @@ BEGIN
   NEW(p);
   s := p(S)
 END T4.
-' 'type guard failed at byte'
+' 'oberon: trap: type guard failed at byte 124'
 trap_case case-no-match 'MODULE T6;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P;
@@ -244,26 +249,26 @@ BEGIN
   NEW(p);
   CASE p OF PS: END
 END T6.
-' 'no matching type'
+' 'oberon: trap: CASE: no matching type'
 trap_case div-by-zero 'MODULE T7;
   VAR i, j: INTEGER;
 BEGIN
   j := 0;
   i := 7 DIV j
 END T7.
-' 'DIV by zero'
+' 'oberon: trap: DIV by zero'
 trap_case mod-by-zero 'MODULE T8;
   VAR i, j: INTEGER;
 BEGIN
   j := 0;
   i := 7 MOD j
 END T8.
-' 'MOD by zero'
+' 'oberon: trap: MOD by zero'
 trap_case failing-assert 'MODULE T9;
 BEGIN
   ASSERT(1 = 2)
 END T9.
-' 'assertion failed'
+' 'oberon: trap: assertion failed'
 
 # `NEW` failing is *specified* to yield NIL (report §6.4), so the hook makes it
 # observable: the program traps itself if the allocation did not fail.
@@ -276,8 +281,9 @@ BEGIN
 END T10.
 ' > "$DRV/T10.mod"
 "$OBC" build "$DRV/T10.mod" --out "$DRV" -o "$DRV/T10" >/dev/null 2>&1 || true
-OB_ALLOC_FAIL_AT=1 sh -c '"$0" >/dev/null 2>&1' "$DRV/T10"
-check "a-failing-new-yields-nil" "0" "$?"
+status=0
+OB_ALLOC_FAIL_AT=1 sh -c '"$0" >/dev/null 2>&1' "$DRV/T10" || status=$?
+check "a-failing-new-yields-nil" "0" "$status"
 
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
@@ -357,6 +363,51 @@ fi
 sh -c '"$0" >/dev/null 2>"$1"' "$DRV/guard" "$DRV/guard.err" || true
 check "failed-guard-traps" "1" "$(grep -c 'type guard failed at byte' "$DRV/guard.err")"
 
+# A designator narrowed by a type-CASE arm or by a guard stays *assignable*. The
+# cast that gives a derived field its layout is not itself an lvalue, so the plain
+# spelling is used wherever a store is needed, and only where the narrowed name is
+# the whole designator (DESIGN R29, PLAN.md W7.6).
+narrow_case() { # name source
+    printf '%s' "$2" > "$DRV/$1.mod"
+    "$OBC" build "$DRV/$1.mod" --out "$DRV" -o "$DRV/$1" >/dev/null 2>&1 || {
+        echo "FAIL narrow-$1: did not build"
+        fail=$((fail + 1))
+        return
+    }
+    status=0
+    "$DRV/$1" || status=$?
+    check "narrow-$1" "0" "$status"
+}
+narrow_case assign-to-narrowed 'MODULE N1;
+  TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
+  VAR p: P; ps: PS; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  NEW(ps); p := ps;
+  CASE p OF PS: p := NIL | : ok[1] := 0 END;
+  IF p # NIL THEN ok[1] := 0 END
+END N1.
+'
+narrow_case field-through-narrowed 'MODULE N2;
+  TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
+  VAR p: P; ps: PS; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  NEW(ps); p := ps;
+  CASE p OF PS: p.f := 7 | : ok[1] := 0 END;
+  CASE p OF PS: IF p.f # 7 THEN ok[1] := 0 END | : ok[1] := 0 END
+END N2.
+'
+narrow_case guard-as-target 'MODULE N3;
+  TYPE R = RECORD f: INTEGER END; S = RECORD (R) g: INTEGER END;
+       P = POINTER TO R; PS = POINTER TO S;
+  VAR p: P; ps: PS; s: S; ok: ARRAY 1 OF INTEGER;
+  PROCEDURE take(q: PS); BEGIN IF q.g # 7 THEN ok[1] := 0 END END take;
+BEGIN
+  NEW(ps); ps.f := 1; ps.g := 7; p := ps;
+  p(PS).g := 7;
+  s := p(S); IF s.g # 7 THEN ok[1] := 0 END;
+  take(p(PS))
+END N3.
+'
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

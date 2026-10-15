@@ -195,14 +195,17 @@ static inline int32_t rt_is(const ObDesc *d, const ObDesc *target) {
 /* `OB_ALLOC_FAIL_AT=n` makes the n-th allocation fail, so that `NEW`'s specified
  * failure (report §6.4: the pointer becomes NIL) is testable at all — otherwise
  * it needs an exhausted heap, which no suite should arrange (PLAN.md W7.4). */
-static inline void *rt_new(int32_t size, const ObDesc *d) {
+static inline void *rt_new(size_t size, const ObDesc *d) {
     void *p;
     static int32_t allocations = 0;
     const char *fail_at = getenv("OB_ALLOC_FAIL_AT");
     allocations += 1;
     if (fail_at != NULL && atoi(fail_at) == allocations) return NULL;
-    if (size < (int32_t)sizeof(const ObDesc *)) size = (int32_t)sizeof(const ObDesc *);
-    p = malloc((size_t)size);
+    // A record may be larger than any 32-bit extent, and `NEW` passes
+    // `sizeof(T)`: the size has to survive the call, so it is `size_t` here
+    // rather than narrowed to the word the descriptor records.
+    if (size < sizeof(const ObDesc *)) size = sizeof(const ObDesc *);
+    p = malloc(size);
     if (p == NULL) return NULL;
     *(const ObDesc **)p = d;
     return p;
