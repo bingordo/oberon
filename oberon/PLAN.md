@@ -691,6 +691,67 @@ Cost and risk: the collision surface is "every identifier whose spelling matches
 Tests: the existing near-miss table extended with a lower/mixed-case spelling per keyword; a negative test that the default dialect still rejects `begin`; a test that identifiers are not folded; a test that a module declaring its own `integer` or `nil` still compiles with the aliases in place; an `e2e/Lower.mod` built and run through the driver with the flag; and the generator gains a lower-case rendering mode, so the fuzzer covers the dialect end to end.
 Done when: the flag reaches both CLIs, the default is provably unchanged (the suites are the proof), those tests pass, the collision diagnostic names the dialect, the dialect is recorded in the interface header (with the version line of W3.2), and DESIGN §3 documents it.
 
+**W8.11 Oberon-2 support: consider it as a dialect, not as dribbled extensions** — *consideration, with a recommendation*
+Why: everything in this wave is a piece of Oberon-2, so the honest question is
+not "should we add `WITH`?" but "are we becoming an Oberon-2 compiler?". The
+delta is now known from Oberon-2's own report (not from summaries):
+
+| Oberon-2 has, Oberon-07 does not | where | already planned here |
+|---|---|---|
+| `CASE … ELSE` | `CaseStatement = CASE Expression OF Case {"|" Case} [ELSE StatementSequence] END` (§9.5) | **W8.1, recommended** |
+| `EXIT`, `LOOP` | statement list (§9) | **W8.5, `EXIT` recommended** |
+| `RETURN [Expression]` as a statement | statement list (§9) | **W8.4, recommended** |
+| `SHORTINT`, `LONGINT`, `LONGREAL`, `MIN`/`MAX` | §6.1, §10.2 | **W8.6 deferred, W8.2 recommended** |
+| `LEN(v, n)`, `HALT` | §10.2 | not planned |
+| `NEW(v, x0…xn)`, open arrays beyond formal parameters (pointer bases, element types) | §6.4, §10.3 | W8.8 rejected |
+| type-bound procedures: receivers, override on extension, forward declarations | §10.3 | W8.8 rejected |
+| type **inclusion** between numeric types (`LONGREAL ⊇ REAL ⊇ LONGINT ⊇ INTEGER ⊇ SHORTINT`), i.e. implicit widening | §6.1 | W8.8 rejected (it contradicts our own rule) |
+| `WITH v: T DO … | v: U DO … ELSE … END` | §9.5 | W8.8 rejected |
+
+Two things that table makes obvious, and that shape the decision:
+
+1. **Half of Oberon-2 is already recommended, item by item** (W8.1, W8.2, W8.4,
+   W8.5). Each of those was justified on its own merits, and each is additive;
+   adopting them is *not* a commitment to a dialect.
+2. **The expensive half is not the syntax.** `WITH` is the giveaway: its form is
+   literally `WITH v: T1 DO S1 | v: T2 DO S2 ELSE S3 END`, and inside a branch
+   `v` is the guarded view — which is precisely what our type-`CASE` already does
+   with a type label and a narrowed designator (§8.1, §9.5). It is Oberon-2's
+   *spelling* of machinery we have. The genuinely expensive parts are (a) numeric
+   *inclusion*, which replaces our explicit "no implicit conversion" rule with
+   widening and therefore touches the type algebra, the folder and every
+   compatibility check, (b) type-bound procedures, which need a method table per
+   descriptor (our `ObDesc` is already per type, so that is its natural home) plus
+   override rules and super calls, and (c) heap and nested open arrays, which
+   interact with the collector study (W4.5).
+
+The mechanism matters more than the feature list, and it should be decided even
+if nothing is adopted: LALRPOP cannot switch alternatives at run time, so a
+dialect means *either* two grammars (double the parser maintenance) *or* one
+permissive grammar with the checker gating what the dialect allows. The second is
+the right choice for us — the checker already owns semantics, and it gives a
+diagnostic that names the problem: ``WITH is an Oberon-2 construct; this module
+is compiled as Oberon-07 (see --dialect)``. It also means the interface file needs
+a dialect field (W3.2) so that a client knows what it is importing.
+
+Scope boundary, stated so it cannot drift: this item is about the *language*.
+Eth Oberon's Oberon-2 *library and system modules* are a separate port, and VOC
+already occupies that space; our reason to do this would have to be something
+else (a particular program to compile, or teaching/analysis uses).
+
+Recommendation: **do not adopt Oberon-2 wholesale now.** (1) take the additive
+pieces through their own items as recommended; (2) record the mechanism decision
+above in DESIGN, so that a future dialect is a checker-and-emitter job rather
+than a parser rewrite; (3) re-open this item against a named trigger — a
+specific Oberon-2 program or library we actually want to compile — rather than
+against the abstract possibility; (4) leave `WITH`, methods, inclusion and heap
+arrays declined (W8.8) until then, since `WITH`'s only advantage over our
+type-`CASE` is its spelling and its cost is a new reserved word.
+
+Done when: the decision and the mechanism are recorded (DESIGN §5's dialect note
+and §13), the overlapping items stay individually justified, and this item names
+the trigger that would change the answer.
+
 Done when: each item above has either landed with tests or been declined in DESIGN §13, and DESIGN §1 points here so a reader knows the extension question has been asked and answered.
 
 ---
