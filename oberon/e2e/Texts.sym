@@ -1,4 +1,5 @@
 MODULE Texts
+VERSION 1
 TYPE Buffer = ARRAY 256 OF CHAR
 TYPE Writer = RECORD buf*: Buffer END
 PROC OpenWriter(VAR w: Writer)

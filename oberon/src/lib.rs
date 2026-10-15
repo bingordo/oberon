@@ -850,7 +850,7 @@ END M.
     fn an_inherited_private_field_and_a_qualified_label_behave() {
         // Three defects found by review of the visibility rule, all in one place.
         let iface = sym::parse(
-            "MODULE M\nTYPE Base = RECORD secret: INTEGER END\nTYPE Node = RECORD child*: RECORD hidden: INTEGER END; next*: POINTER TO Node END\nTYPE DerivedPtr = POINTER TO Derived\nTYPE Derived = RECORD (Base) extra*: INTEGER END\n",
+            "MODULE M\nVERSION 1\nTYPE Base = RECORD secret: INTEGER END\nTYPE Node = RECORD child*: RECORD hidden: INTEGER END; next*: POINTER TO Node END\nTYPE DerivedPtr = POINTER TO Derived\nTYPE Derived = RECORD (Base) extra*: INTEGER END\n",
         )
         .unwrap();
 
@@ -894,7 +894,7 @@ END M.
         // report's `*` is private to its module (report §6.3), and the mark
         // travels through the interface.
         let iface = sym::parse(
-            "MODULE Texts\nTYPE Buffer = ARRAY 64 OF CHAR\nTYPE Writer = RECORD buf: Buffer; pos*: INTEGER END\n",
+            "MODULE Texts\nVERSION 1\nTYPE Buffer = ARRAY 64 OF CHAR\nTYPE Writer = RECORD buf: Buffer; pos*: INTEGER END\n",
         )
         .unwrap();
 
@@ -1357,7 +1357,7 @@ BEGIN Outer END M.\n";
     fn a_warning_is_rendered_as_a_warning() {
         // The import has to resolve for the unused-import *warning* to be the
         // only thing said about it.
-        let iface = sym::parse("MODULE Texts\nPROC Write(ch: CHAR)\n").unwrap();
+        let iface = sym::parse("MODULE Texts\nVERSION 1\nPROC Write(ch: CHAR)\n").unwrap();
         let src = "MODULE M;\n  IMPORT Texts;\nBEGIN\nEND M.\n";
         let (_, diags) = check_module_recovering(src, &[iface]);
         let text = render_diagnostics("M.mod", src, &diags);
@@ -1380,8 +1380,16 @@ mod check_tests {
     use super::*;
     use crate::sym::Interface;
 
+    /// A fixture interface. The version line is part of the format but not part
+    /// of what these fixtures are about, so it is supplied here (PLAN.md W3.2).
     fn iface(text: &str) -> Interface {
-        sym::parse(text).unwrap_or_else(|e| panic!("fixture interface: {e}"))
+        let text = match text.split_once('\n') {
+            Some((first, rest)) if first.starts_with("MODULE ") => {
+                format!("{first}\nVERSION {}\n{rest}", sym::FORMAT_VERSION)
+            }
+            _ => text.to_string(),
+        };
+        sym::parse(&text).unwrap_or_else(|e| panic!("fixture interface: {e}"))
     }
 
     /// The interfaces the report's own example modules need. `Texts.Writer` is
@@ -1422,6 +1430,21 @@ PROC Append(p: Writer; b: Buffer)\n"),
             .filter(|d| !d.is_error())
             .map(|d| d.message)
             .collect()
+    }
+
+    #[test]
+    fn a_later_sibling_procedure_does_not_shadow_a_type() {
+        // Report §4: a declaration is visible from where it stands. Inside `Use`,
+        // the module type `T` is still the type, even though a *later* sibling
+        // procedure is named `T` — classifying that as a call would reject a legal
+        // guard.
+        let src = "MODULE M;\n  TYPE R = RECORD a: INTEGER END;\n       T = RECORD (R) f: INTEGER END;\n\
+  VAR p: POINTER TO R;\n\
+  PROCEDURE Outer;\n    PROCEDURE Use;\n    BEGIN\n      p(T).f := 1\n    END Use;\n\
+    PROCEDURE T;\n    BEGIN\n    END T;\n  BEGIN Use END Outer;\n\
+BEGIN Outer END M.\n";
+        let e = errors(src, &[]);
+        assert!(e.is_empty(), "`T` is still the type inside `Use`: {e:#?}");
     }
 
     #[test]

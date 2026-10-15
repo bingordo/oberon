@@ -1,3 +1,4 @@
 MODULE Oberon
+VERSION 1
 IMPORT Texts
 VAR Log: Texts.Writer

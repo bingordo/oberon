@@ -32,7 +32,8 @@ trap 'rm -rf "$OUT" "$DRV"' EXIT
 cp Texts.sym Oberon.sym Texts.h Texts.c Oberon.h Oberon.c "$OUT"/
 "$OB" Out.mod --emit-c "$OUT" -I "$OUT" >/dev/null
 check "compiler-writes-an-interface" "MODULE Out" "$(head -1 "$OUT/Out.sym")"
-check "interface-records-its-imports" "IMPORT Texts, Oberon" "$(sed -n '2p' "$OUT/Out.sym")"
+check "interface-records-its-imports" "IMPORT Texts, Oberon" "$(sed -n '3p' "$OUT/Out.sym")"
+check "interface-records-its-version" "VERSION 1" "$(sed -n '2p' "$OUT/Out.sym")"
 check "interface-lists-the-exported-procedures" "1" \
     "$(grep -c '^PROC \(Write\|WriteInt\|WriteLn\)$' "$OUT/Out.sym")"
 

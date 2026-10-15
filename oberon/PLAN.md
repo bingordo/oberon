@@ -201,12 +201,18 @@ Done when: a bounds violation traps by default and runs without the check under
 `-Ochecks=n`, both covered by suite checks; R6's `FOR`-at-`MAX(INTEGER)` note is
 resolved in the same pass (the trap is one of the checks the flag turns off).
 
-**W3.2 interface-file versioning** (§7, "prototype codec")
+**W3.2 interface-file versioning** (§7, "prototype codec") — **done**
 Why: the format starts at `MODULE <name>` with no version, so a stale interface
 from an older compiler is indistinguishable from a current one.
 Files: `src/sym.rs` (both directions), `src/sema.rs` (the error).
 Done when: a version line is written and checked, a wrong-version interface is
-refused with a located message, and the round-trip tests cover it.
+refused with a located message, and the round-trip tests cover it. **Done**:
+`sym::FORMAT_VERSION` is written as the second line (so a reader knows what it is
+reading before any declaration) and checked on every parse; a differing version or
+a missing line is refused with a message that says to recompile, pinned by
+`sym::tests::refuses_an_interface_from_a_different_version`. The two hand-written
+e2e interfaces and the fixtures carry the line; in the checker's own fixtures it is
+supplied by the helper, since those fixtures are about the language.
 
 **W3.3 continuous integration**
 Why: there is no `.github/` and no CI; the gate is currently a human habit.

@@ -107,9 +107,6 @@ fn decl_bindings(d: &Decls, scope: &mut HashMap<String, Kind>) {
             scope.insert(name.clone(), Kind::Other);
         }
     }
-    for p in &d.procs {
-        scope.insert(p.name.clone(), Kind::Other);
-    }
 }
 
 /// Rewrites `Selector::Args` into `Selector::Call` or `Selector::Guard`, and
@@ -157,7 +154,15 @@ fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyErro
         reclassify_type_expr(&mut t.ty, names)?;
     }
     for q in &mut p.decls.procs {
+        // Report §4: a declaration is visible from where it stands, so a
+        // procedure sees the siblings declared *before* it and not the ones
+        // after — and a later sibling of the same name as a type must not shadow
+        // that type for an earlier body.
+        let entry: HashMap<String, Kind> =
+            std::iter::once((q.name.clone(), Kind::Other)).collect();
+        names.push(entry);
         reclassify_proc(q, names)?;
+        names.pop();
     }
     names.pop();
     Ok(())

@@ -395,7 +395,7 @@ impl<'a> Sema<'a> {
     /// The type a qualified name denotes, resolved *without* reporting: the
     /// type-`CASE` arm view asks this question and the label check is what
     /// reports, so asking twice must not say the same thing twice.
-    fn type_of_qual_silent(&mut self, q: &QIdent) -> Option<TypeId> {
+    fn type_of_qual_silent(&mut self, q: &QIdent, span: Span) -> Option<TypeId> {
         if q.len() == 1 {
             return match self.lookup(&q[0]) {
                 Some(Sym::Type(t)) => Some(t),
@@ -409,7 +409,9 @@ impl<'a> Sema<'a> {
             Some(Sym::Module(i)) => i,
             _ => return None,
         };
-        let env = self.interface_env(idx, Span::default());
+        // Loading the interface can report (a declared type it cannot read), and
+        // that report has to point at the label, not at byte zero.
+        let env = self.interface_env(idx, span);
         env.get(&q[1]).copied()
     }
 
@@ -2304,7 +2306,7 @@ impl<'a> Sema<'a> {
                 labels.iter().find_map(|l| match &l.lo {
                     // Silent on purpose: `lookup_qual` reports an undeclared
                     // name, and the label check below is the place that does.
-                    CaseLabel::Named(q) => self.type_of_qual_silent(q),
+                    CaseLabel::Named(q) => self.type_of_qual_silent(q, arm.span),
                     _ => None,
                 })
             });

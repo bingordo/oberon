@@ -11,6 +11,7 @@
 //!
 //! ```text
 //! MODULE <name>
+//! VERSION <n>
 //! IMPORT <module> {"," <module>}
 //! CONST <name> = <value>
 //! TYPE <name> = <rendered type>
@@ -53,6 +54,7 @@ pub struct Interface {
 pub fn render(i: &Interface) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "MODULE {}", i.module);
+    let _ = writeln!(s, "VERSION {FORMAT_VERSION}");
     if !i.imports.is_empty() {
         let _ = writeln!(s, "IMPORT {}", i.imports.join(", "));
     }
@@ -92,9 +94,16 @@ pub fn render(i: &Interface) -> String {
     s
 }
 
+/// The interface format's version. It exists so that an interface from a
+/// different compiler is *refused* rather than misread: the format is ours, and a
+/// stale file is indistinguishable from a current one without it (PLAN.md W3.2).
+/// Bump this whenever a reader would misinterpret an older writer's output.
+pub const FORMAT_VERSION: u32 = 1;
+
 pub fn parse(text: &str) -> Result<Interface, String> {
     let mut it = Interface::default();
     let mut seen_module = false;
+    let mut seen_version = false;
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() {
@@ -114,6 +123,23 @@ pub fn parse(text: &str) -> Result<Interface, String> {
         }
         if !seen_module {
             return Err(format!("line {lineno}: declaration before MODULE line"));
+        }
+        if let Some(rest) = line.strip_prefix("VERSION ") {
+            if seen_version {
+                return Err(format!("line {lineno}: duplicate VERSION line"));
+            }
+            let found: u32 = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("line {lineno}: malformed version: {rest:?}"))?;
+            if found != FORMAT_VERSION {
+                return Err(format!(
+                    "line {lineno}: this interface says version {found}, but this compiler writes \
+                     and reads version {FORMAT_VERSION}: recompile the module"
+                ));
+            }
+            seen_version = true;
+            continue;
         }
         if let Some(rest) = line.strip_prefix("IMPORT ") {
             for m in rest.split(',') {
@@ -207,6 +233,12 @@ pub fn parse(text: &str) -> Result<Interface, String> {
     if !seen_module {
         return Err("no MODULE line".to_string());
     }
+    if !seen_version {
+        return Err(format!(
+            "no VERSION line: this interface was written by a compiler that predates version \
+             {FORMAT_VERSION}, so recompile the module"
+        ));
+    }
     Ok(it)
 }
 
@@ -217,6 +249,7 @@ mod tests {
     /// The exact example written out in DESIGN.md §7.
     const OUT_SYM: &str = "\
 MODULE Out
+VERSION 1
 IMPORT Texts, Oberon
 PROC Write(ch: CHAR)
 PROC WriteInt(x: INTEGER; n: INTEGER)
@@ -315,25 +348,40 @@ TYPE Node = RECORD key: INTEGER; left, right: Tree END
     }
 
     #[test]
+    fn refuses_an_interface_from_a_different_version() {
+        // An interface the compiler could misread must be refused with a clear
+        // message rather than silently misread (PLAN.md W3.2).
+        let err = parse("MODULE A\nVERSION 99\nTYPE T = INTEGER\n").unwrap_err();
+        assert!(err.contains("version 99"), "{err}");
+        assert!(err.contains("recompile"), "{err}");
+
+        let err = parse("MODULE A\nTYPE T = INTEGER\n").unwrap_err();
+        assert!(err.contains("no VERSION line"), "{err}");
+
+        let err = parse("MODULE A\nVERSION 1\nVERSION 1\n").unwrap_err();
+        assert!(err.contains("duplicate VERSION"), "{err}");
+    }
+
+    #[test]
     fn rejects_malformed_lines() {
         assert!(parse("CONST N = 1").unwrap_err().contains("before MODULE"));
-        assert!(parse("MODULE A\nMODULE B").unwrap_err().contains("duplicate"));
-        assert!(parse("MODULE A\nCONST N 1")
+        assert!(parse("MODULE A\nVERSION 1\nMODULE B").unwrap_err().contains("duplicate"));
+        assert!(parse("MODULE A\nVERSION 1\nCONST N 1")
             .unwrap_err()
             .contains("CONST without"));
-        assert!(parse("MODULE A\nPROC f(x: INTEGER")
+        assert!(parse("MODULE A\nVERSION 1\nPROC f(x: INTEGER")
             .unwrap_err()
             .contains("PROC without `)`"));
         // report 10.1: a formal type is `{ARRAY OF} qualident`, never an
         // inline `PROCEDURE (...)`; the format refuses to be ambiguous about
         // where the parameter list ends.
-        assert!(parse("MODULE A\nPROC f(p: PROCEDURE (x: INTEGER))")
+        assert!(parse("MODULE A\nVERSION 1\nPROC f(p: PROCEDURE (x: INTEGER))")
             .unwrap_err()
             .contains("no parentheses are allowed"));
-        assert!(parse("MODULE A\nPROC WriteLn: INTEGER")
+        assert!(parse("MODULE A\nVERSION 1\nPROC WriteLn: INTEGER")
             .unwrap_err()
             .contains("malformed PROC"));
-        assert!(parse("MODULE A\nVAR x").unwrap_err().contains("VAR without"));
-        assert!(parse("MODULE A\nFOO x").unwrap_err().contains("unknown"));
+        assert!(parse("MODULE A\nVERSION 1\nVAR x").unwrap_err().contains("VAR without"));
+        assert!(parse("MODULE A\nVERSION 1\nFOO x").unwrap_err().contains("unknown"));
     }
 }

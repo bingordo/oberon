@@ -572,6 +572,7 @@ the emitter companion and read by the resolver:
 
 ```
 MODULE Out
+VERSION 1
 IMPORT Texts, Oberon
 PROC Write(ch: CHAR)
 PROC WriteInt(x: INTEGER; n: INTEGER)
