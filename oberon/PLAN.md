@@ -274,8 +274,8 @@ to W6.2 for the fuzzer's state.
 
 ## W4 — designed with an escape hatch, not built
 
-**W4.1 `SYSTEM`** (R5, report §11.1)
-Why: `src/sema.rs` rejects `IMPORT SYSTEM` outright ("module SYSTEM is not
+**W4.1 `SYSTEM`** (R5, report §11.1) — **done**
+Why: `src/sema.rs` used to reject `IMPORT SYSTEM` outright ("module SYSTEM is not
 available in this implementation (report 11.1)"). Report §11.1 defines five
 portable entries and one proper procedure, all of them deliberately outside the
 type rules:
@@ -309,12 +309,16 @@ words. All of them are unsafe by design: no bounds check, no type check, and
 careful.
 
 Step 3 — codegen, inlined (the `ob_sys_` prefix stays reserved for the runtime):
-`ADR(v)` → `(int32_t)(uintptr_t)&v`; `SIZE(T)` → a constant from the layout the
-record descriptors already compute, which the folder can fold; `BIT(a, n)` →
-`(*(uint32_t *)(uintptr_t)a >> n) & 1`; `GET`/`PUT` → a word load/store through
-`(uint32_t *)(uintptr_t)a`, masked to the variable's width; `COPY` →
-`memcpy(dst, src, (size_t)n * 4)`; `VAL(T, n)` → a bit-pattern-preserving copy
-for same-size scalars.
+`ADR(v)` → `(intptr_t)(uintptr_t)&v` — *not* the `(int32_t)` first written here:
+that truncates a stack address and the word access sign-extends the truncation, so
+the round trip faults on a 64-bit host (measured; R31, DESIGN §9.10); `SIZE(T)` →
+`(int32_t)sizeof(<C type of T>)`, the layout the record descriptors are built
+beside, which the C compiler folds; `BIT(a, n)` →
+`((*(const uint32_t *)(uintptr_t)a >> ((uint32_t)n & 31u)) & 1u) != 0`;
+`GET`/`PUT` → a word load/store through `(uint32_t *)(uintptr_t)a`, narrowed to
+the *typed* operand's width (`GET`'s variable, `PUT`'s value — the report names no
+other type); `COPY` → `memcpy(dst, src, (size_t)n * 4u)`. `VAL` is **not** lowered:
+with the other RISC extras it is refused by name, which is what step 2 says.
 
 Step 4 — decisions to record (the report is silent, so DESIGN §13 grows):
 * the address model. Report §11.1's `mem[a]` is a *word* array; we define an
@@ -324,18 +328,39 @@ Step 4 — decisions to record (the report is silent, so DESIGN §13 grows):
 * a module that imports SYSTEM is not portable, and its interface file records
   the import, so a client can see it.
 
-Step 5 — tests. A new `e2e/Sys.mod` uses every entry and prints results against a
-hand-computed expectation: `SIZE` of a record and of an array, an
-`ADR`→`PUT`→`GET` round trip, `BIT` on a word written that way, `COPY` between
-two arrays. `csmoke` covers the emitted snippets (address round trip, `COPY`'s
-word count, `GET`/`PUT` truncation width). Negative cases: `SYSTEM.ADC` refused
-by name; `GET(a, record)` and `SIZE(expr)` rejected; `SYSTEM.x` without `IMPORT
-SYSTEM`; `PUT` into a read-only entity.
+Step 5 — tests, as built. `e2e/Sys.mod` uses every entry and asserts each result
+against a hand-computed expectation (`SIZE` of the basic types, an array and a
+*stride* that ties `SIZE(R)` to the padded extent, an `ADR`→`PUT`→`GET` round trip
+both on module statics and on *locals* — the stack address R31 is about — `BIT` on
+a word written that way including the masked count, and `COPY`'s word count with
+the words around the moved ones checked unchanged). `csmoke` executes the emitted
+snippets (address round trip, `BIT`, `GET`/`PUT` truncation and mask width, the
+word count and the `SIZE` extent). The e2e block also runs the located negatives:
+the RISC extras refused by name, `GET(a, record)`, `PUT(a, array)`, `SIZE(expr)`,
+`ADR(1)`, `GET(a, constant)`, an argument count, and `SYSTEM.x` without `IMPORT
+SYSTEM`; plus the shadowing of a `SYSTEM.mod`/`SYSTEM.sym` pair on the search path
+and the byte-identical C under `-Ochecks=n`.
 
-Done when: those tests pass, DESIGN §13 carries the address model, §1's
-out-of-scope bullet is replaced by a pointer here, R5 becomes "implemented, and
-the RISC extras still refused by name", and the generator (W6) has a SYSTEM
-fragment whose `PUT`/`GET` round trips and `SIZE` calls the mirror can predict.
+**Done** — the tests above pass, and every claim below was executed:
+
+* `DESIGN` §9.10 documents the lowering and the address model (one sentence of it
+  in §9.4, the decision in §13's list, the deviation as R31); §8.4 states that
+  `SYSTEM` is not a predeclared identifier; §1's out-of-scope bullet is gone, with
+  SYSTEM in the in-scope list; §8.5's row 53 is the by-name refusal and rows 55-60
+  carry the entries' rules; R5 is "implemented, and the RISC extras still refused
+  by name".
+* The gate: `e2e` (its `system-*` rows), `golden`, `csmoke` (its `system-*`
+  cases), `cargo test` (the catalogue rows and the four new `check_tests`, the
+  `SYSTEM.SIZE` reclassification case) and `cargo clippy -D warnings` all pass.
+* **Not in this item**: the generator's SYSTEM fragment. `W6`'s own text asks for
+  one, and the fuzzer's mirror lives in `src/bin/obgen.rs`; W4.1's half is the
+  compiler's. **The sized accessors** W8.7 proposes (`GET8`…`PUT32`) are
+  deliberately not taken (§9.10): the report's table has none, and the address
+  keeps the host's width instead, so a byte access needs no separate entry.
+* **One deviation from this item's own step 3**, found while writing its test and
+  recorded as R31: the address is `intptr_t` in the expression, not the
+  `(int32_t)` first prescribed, because the `INTEGER` spelling faults on a stack
+  address on a 64-bit host.
 
 **W4.2 garbage collection** (R3) — *superseded in form by W10.1, which carries the
 same study and states the variables the decision turns on; kept here as the
@@ -363,7 +388,8 @@ timestamps), so every module of the import graph is re-checked on each run. A
 timestamped interface would skip the front end for unchanged modules.
 Only worth doing if build times become a complaint.
 
-**W4.5 the collector's design: a study, before any code** — **research**
+**W4.5 the collector's design: a study, before any code** — **research, recorded as
+DESIGN §15; the implementation is W10.2**
 Why: GC is the one item in W4 whose *interface* decides its cost. A collector
 needs two things from the compiler that we do not have yet, and getting them
 wrong is expensive to undo, so the question is a design question first — and the
@@ -1149,7 +1175,8 @@ fixtures call them directly and have no offset to pass.
 
 ## W10 — a garbage collector
 
-**W10.1 the collector, and what it costs the emitter** — **open**
+**W10.1 the collector: the decision, and what it costs the emitter** — **done**
+(the design is DESIGN §15; the implementation is W10.2)
 
 Why: Oberon-07 has `NEW` and no `DISPOSE` — the report's §6.4 defines allocation and
 says nothing about freeing — so every program this compiler builds leaks by
@@ -1199,7 +1226,31 @@ the tests can force — `OB_GC_STRESS=1`, the shape `OB_ALLOC_FAIL_AT` already h
 
 Done when: a program that allocates in a loop runs in a bounded heap; the fuzzer's
 seeds pass with the collector forced on every allocation; and the design states the
-root set and the mark/precision decision, with the reason it was taken.
+root set and the mark/precision decision, with the reason it was taken. **The
+decision half is done and recorded as DESIGN §15**, decided from Wirth's §14.2 (the
+three facts a collector needs, and the descriptor that carries two of them),
+Mogensen's §12.2 (the root set, which is why a conservative stack walk is needed
+where there are no stack maps) and the *Compiler Design Handbook*'s chapter 6 (the
+method taxonomy, which rules out the moving collectors for a back end that addresses
+objects through raw pointers): mark-sweep, a precise mark driven by a descriptor
+that gains the pointer-field offsets, a conservative stack walk now and a precise
+one when W9's back end can supply stack maps, and collection before `NEW` gives up.
+The implementation is W10.2.
+
+**W10.2 the collector itself** — **open**
+
+Implement DESIGN §15: extend `ObDesc` with the pointer-field offsets the emitter
+already knows (`desc_init`'s walk), add the mark stack, the sweep over the allocation
+list and the `rt_new` hook to the runtime, register each module's pointer variables as
+roots, and add `OB_GC_STRESS=1` so the tests can force a collection per allocation.
+Settle the three open questions §15 lists — the allocation list's shape (a header
+before the payload, or a table), the trigger besides a failing allocation, and how
+the stress mode avoids changing a program's answers.
+
+Done when: a program that allocates in a loop runs in a bounded heap; `fuzz` passes
+with the stress mode on (its self-checks are the "no live object was freed" oracle);
+and the standard suite is green with it off, so the collector costs nothing when it
+is idle.
 
 ## Ideas not yet in the design (adopt or drop)
 

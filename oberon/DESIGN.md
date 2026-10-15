@@ -37,11 +37,12 @@ Everything marked **[design]** below is not yet implemented; everything marked
   `Foo.c` + `Foo.h` + `Foo.sym`. The *driver* (§9.9) resolves a whole program's
   import graph on top of that and runs the C compiler.
 * Diagnostics with byte spans, resolved to line/column at print time.
+* Module `SYSTEM` (report §11.1, explicitly optional): the six portable entries
+  of its table are lowered in place and the implementation-specific extras are
+  refused by name (§9.10, `PLAN.md` W4.1).
 
 **Out of scope (deliberate)**
 
-* Module `SYSTEM` (report §11.1 is explicitly optional). Importing it is a hard
-  error with a message that says so. See §13 risk R5 for the escape hatch.
 * Optimisation of any kind. The C compiler does it. Our job is to emit boring,
   obviously-correct C.
 * Garbage collection. `NEW` maps to `malloc` (§8.6). Oberon systems do have a
@@ -762,6 +763,11 @@ Inserted into the outermost scope before anything else, as report §10.2 defines
 `LEN` needs care: for a fixed-size array it folds to the declared length; for an
 open array parameter it becomes the hidden length parameter (§8.7).
 
+Report §11.1's `SYSTEM` is *not* in this table: it is a module, imported like one
+(§11), and its entries are dispatched by name in the checker — `ADR`, `GET` and
+`PUT` take a variable and `SIZE` takes a type, so there are no five signatures to
+declare here (§9.10, `PLAN.md` W4.1).
+
 ### 8.5 Type and semantic checks — catalogue
 
 Each row is one diagnostic with one span. `E` = error, `W` = warning.
@@ -804,7 +810,7 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 | 33 | `FOR` bounds not `INTEGER` | §9.8 | E |
 | 34 | `BY` increment not a constant, or equal to zero, or not an integer constant | §9.8 | E |
 
-**Status.** Rows 1-5 are the resolver's and 6-54 the checker's; both are
+**Status.** Rows 1-5 are the resolver's and 6-60 the checker's; both are
 implemented in `src/sema.rs` and driven by
 `check_tests::catalogue_rows_report_what_they_should`, which has a case per row
 (each naming the row number, so a failure points at the rule; rows with two
@@ -820,10 +826,15 @@ designator resolves to a procedure (so a call, a use as a value and an exported
 procedure all count), and a self-recursive one counting as used, which is the
 one imprecision.
 
-Rows 1-5 are the resolver's; 6-54 are the checker's. The two *predicates* they
+Rows 1-5 are the resolver's; 6-60 are the checker's. The two *predicates* they
 are built from — the type algebra above and the constant folder below — are
 already implemented and tested, so the checker's remaining work is bookkeeping
-around them rather than new rule invention.
+around them rather than new rule invention. Rows 55-60 are report §11.1's module
+and belong to the escape hatch's item, `PLAN.md` W4.1: the argument rules are
+`check_tests::catalogue_rows_report_what_they_should`'s cases, the by-name
+refusals and the located messages are `e2e`'s `system-*` rows, and the "nothing
+is added or removed by `-Ochecks`" half of row 60 is `csmoke`'s
+`system-*` assertions plus `e2e`'s `system-emits-the-same-c-under--Ochecks=n`.
 | 35 | `CASE` label type does not match the case expression's type | §9.5 | E |
 | 36 | duplicate `CASE` label, or overlapping ranges | §9.5 | E |
 | 37 | type-`CASE` label that does not extend the case variable's type | §9.5 | E |
@@ -842,8 +853,14 @@ around them rather than new rule invention.
 | 50 | local procedure assigned to / passed as a procedure variable | §6.5 | E |
 | 51 | predeclared procedure used as a value | §6.5, §10.1 | E |
 | 52 | `SET` element constant outside 0..31 | §10.2 | E |
-| 53 | `IMPORT SYSTEM` | §11.1 | E (see R5) |
+| 53 | `SYSTEM.<entry>` where the entry is not one the report's §11.1 table defines — its RISC-specific extras (`VAL`, `ADC`, `SBC`, `UML`, `COND`, `LED`) included — refused *by name*, never silently | §11.1 | E |
 | 54 | unused import / unused local procedure | — | W |
+| 55 | `SYSTEM.SIZE`'s argument is not a type name | §11.1 | E |
+| 56 | `SYSTEM.ADR`'s argument is not a designator whose address exists (a constant, a structured value parameter, a procedure) | §11.1 | E |
+| 57 | `SYSTEM.GET`'s variable, or `SYSTEM.PUT`'s value, is not of a basic type | §11.1 | E |
+| 58 | `SYSTEM.GET`'s variable is not writable — row 6's reasons, since `GET` writes it | §11.1, §9.1 | E |
+| 59 | a `SYSTEM` entry used with the wrong number of arguments (the entries have no formal parameter list for row 25 to check) | §11.1 | E |
+| 60 | not a check but a rule the lowering states: `SYSTEM.COPY`'s count is in *words* and `SIZE(T)` is the byte size including padding (§9.10), and no `-Ochecks` setting adds or removes anything for `SYSTEM` | §11.1 | — |
 
 ### 8.6 Storage and allocation
 
@@ -971,10 +988,16 @@ void *rt_new(int32_t size, ObDesc *d);   /* malloc header+payload; NIL on failur
 void  rt_trap(const char *);             /* bounds, NIL, case, ASSERT */
 ```
 
+**The address model** (report §11.1's `SYSTEM`, §9.10): the report's `mem[a]` is
+an array of *words*, and this implementation defines an address as a **byte**
+address held in an `INTEGER` — so `ADR(v)` is `&v` and `COPY`'s `n` counts words,
+`n * 4` bytes. The one expression that is not an `INTEGER` is an `ADR` call
+itself, which is as wide as the host's pointers (R31).
+
 **Every memory access, and why it is safe.** The design's promise is that a
 memory access in emitted code is either provably in bounds by the type system or
-guarded by something visible in the emitted C — with `SYSTEM` (W4.1, not built) as
-the only deliberate escape. This table is that promise, audited access by access
+guarded by something visible in the emitted C — with `SYSTEM` (§9.10) as the only
+deliberate escape. This table is that promise, audited access by access
 (PLAN.md W7.3); the last column names the test that executes the row.
 
 | access | safe because | test |
@@ -991,6 +1014,7 @@ the only deliberate escape. This table is that promise, audited access by access
 | `NEW` | `rt_new` allocates header plus payload and returns `NIL` on failure (report §6.4's failure case); it is the only route to the heap | `e2e`'s `a-failing-new-yields-nil`, which forces the failure with `OB_ALLOC_FAIL_AT` (the hook W7.4 added), and `fuzz` (which allocates through it) |
 | descriptor read (`p.desc`) | the descriptor is at offset 0 of every view of a record, by the layout rule of §9.3 | `csmoke` (type-`CASE` and `IS`), `e2e`'s three-level extension |
 | the trap report itself | writes to `stderr` and aborts; it reads no program data | `e2e`'s trap matrix: every row asserts the exact message *and* the source offset *and* that the process died by abort |
+| a `SYSTEM` access (`GET`, `PUT`, `BIT`, `COPY`) | **not checked, by design**: the address is whatever the program computed, and this row is the escape the others are named against (§9.10) | `e2e`'s `system-*` rows (which run every entry, and whose round trip fails on a faulting address) and `csmoke`'s `system-*` cases (the snippets, executed on a local) |
 
 Every check in the emitted code is locatable, not only the memory ones (W7.7):
 `DIV by zero`, `MOD by zero`, `assertion failed` and `CASE: no matching type`
@@ -1089,6 +1113,8 @@ consequences are worth stating: a `VAR` actual has to stay an address (it is not
 materialised), and a comparison whose operands are the *same* call-free, trap-free
 tree folds to a constant — structurally, and up to the commutativity of `+`, `*`,
 `&` and `|` — because gcc proves the tautology and rejects the C otherwise (R20).
+A `SYSTEM.ADR` operand is left in place too: it has no side effect, and its value
+is wider than the `INTEGER` a temporary of its type would be (§9.10, R31).
 
 ### 9.6 Statements
 
@@ -1198,6 +1224,87 @@ obc run   Foo.mod [-I DIR]... [--command M.P] [--keep]
   driver build is simultaneously the check that the emitted C is warning-free.
 * **Build directories.** Temporary by default (so `run` leaves nothing behind);
   `--out DIR` and `--keep` keep the generated C for inspection.
+
+### 9.10 Report §11.1's SYSTEM **[implemented in `src/cgen.rs`/`src/sema.rs`; `e2e`'s `system-*` rows run every entry, `csmoke`'s `system-*` cases execute the snippets]**
+
+`IMPORT SYSTEM;` resolves to a **builtin** module (R5, `PLAN.md` W4.1): the
+compiler supplies report §11.1's entries, so no `SYSTEM.sym` is read and no
+`SYSTEM.mod` is compiled, and one on the search path is therefore *shadowed* —
+a user supply would be a different language, while a module that names SYSTEM in
+its import list must get the report's entries. The driver skips the import when
+it walks the graph (`src/bin/obc.rs`) and the emitter emits no
+`#include "SYSTEM.h"`; the emitted `.sym` *does* keep the import, so a client can
+see that the module it depends on is not portable. `IMPORT S := SYSTEM` works
+like any alias. **[verified]** by `e2e`'s `system-on-the-search-path-is-shadowed`
+(a broken `SYSTEM.mod`/`SYSTEM.sym` pair on the search path changes nothing,
+and no `SYSTEM.*` is written by that build) and
+`check_tests::system_import_is_not_an_interface_lookup`.
+
+The six entries of the report's table are lowered **in place**, with the `ob_sys_`
+name space still the runtime's (there is no runtime helper here at all):
+
+| Oberon | emitted C |
+|---|---|
+| `ADR(v)` | `(intptr_t)(uintptr_t)&v` |
+| `SIZE(T)` | `(int32_t)sizeof(<C type of T>)` |
+| `BIT(a, n)` | `((*(const uint32_t *)(uintptr_t)a >> ((uint32_t)n & 31u)) & 1u) != 0` |
+| `GET(a, v)` | `v = <the word read through the address, in v's type>` |
+| `PUT(a, x)` | `<a word store through the address, masking x to its own width>` |
+| `COPY(src, dst, n)` | `memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)n * 4u)` |
+
+**The address model, and why it deviates from the report's.** Report §11.1's
+`mem[a]` is an array of *words* on a machine whose addresses are words; we define
+an address as a **byte address** whose byte count is an `INTEGER`'s, so `ADR(v)`
+is `&v` and `COPY`'s `n` counts words (`n * 4` bytes). `SIZE(T)` is the byte size
+*including padding*, which is exactly the extent the record descriptors are built
+beside — the same number `NEW` hands `rt_new`, so `SIZE(R) DIV 4` words are a
+record's whole image, descriptor word included. `COPY`'s `n` and the address `a`
+are `INTEGER`s; `SIZE` folds in C (it is a `sizeof`), it is not an Oberon
+constant, so `SIZE` cannot appear in a `CONST` declaration (row 40).
+
+The width of the *typed* operand is what a word access narrows to, and which
+operand that is follows from the report's own signatures: `GET(a, v)` names the
+variable it writes, so the load is narrowed to `v` (a `CHAR` keeps its low byte; a
+`REAL` is one word, so the load *is* its bit pattern); `PUT(a, x)` names only the
+value it stores, so the store is masked to `x`'s width (a `CHAR` contributes its
+low byte and zeroes the rest of the word, which is what a word store means). A
+mismatched pair (`PUT(ADR(r), i)`) stores the word the *value* occupies, which is
+what an unchecked `mem[a] := x` says.
+
+**`ADR` is as wide as the host's pointers, not as `INTEGER` (R31).** The
+report's `ADR` returns an `INTEGER` and its addresses are 32 bits, which is the
+whole model on the machine the report was written for; on a 64-bit host an
+`int32_t` cannot carry a stack or `mmap`ed address, and the round trip the
+lowering prescribes — an `int32_t` truncation, then `(uint32_t *)(uintptr_t)a` —
+sign-extends that truncation and dereferences a *different* address. So the
+expression keeps the host's width (`intptr_t`) and only narrows where the
+program's own `INTEGER` narrows it: an assignment to an `INTEGER`, an `INTEGER`
+parameter, or an arithmetic result the emitter fixes in a temporary. The one
+expression whose C type is therefore not its Oberon type is an `ADR` call, and
+the *only* thing the emitter does differently for it is to leave it out of the
+operand sequencing above — it has no side effect, and a temporary of its Oberon
+type would cut it in half, so the same expression would mean different things
+depending on whether a sibling operand happened to need sequencing. **[verified]**
+by `e2e/Sys.mod`, which takes the address of *locals* in a procedure (a stack
+address) and of module statics and rounds a word trip through each, and by
+`csmoke`'s `system-*` cases, which execute the snippets on a local. R31 records
+the measurement that found it: with the plan's `(int32_t)` spelling that program
+dies of SIGSEGV, and `(intptr_t)` round-trips `0x7ffff0686248` exactly.
+
+**Everything else is deliberately unchecked.** No bounds check, no type check,
+no alignment promise, and *no* dependence on `-Ochecks`: `SYSTEM` is the escape
+hatch (§9.4), so a build with the checks compiled out emits byte-identical C for
+it — **[verified]** by `e2e`'s `system-emits-the-same-c-under--Ochecks=n` (a
+module whose only memory accesses are SYSTEM's) and by `csmoke`. What the checker
+*does* enforce is what each entry takes (rows 55-59): `SIZE` a type name, `ADR` a
+variable whose address exists, `GET`/`PUT` a basic type, `GET` a writable
+variable, and the argument count of each. Entries the report lists as
+implementation-specific — `VAL`, `ADC`, `SBC`, `UML`, `COND`, `LED` — are refused
+*by name* (row 53: `SYSTEM.ADC is not implemented`), as is anything else the
+report's table does not define; the *sized* accessors a byte-address model
+invites (`GET8`…`PUT32`, `PLAN.md` W8.7) are **not** taken, because the report's
+table has none and the address keeps the host's width instead, so a byte access
+needs no separate entry.
 
 ---
 
@@ -1338,7 +1445,7 @@ section or risk each item comes from.
 | R2 | Type guard vs. call argument list is decided by a *semantic* rule. | Sound (types and variables share one namespace), pinned by tests. The residual case `f(x)(y)` is diagnosed rather than mis-parsed. |
 | R3 | No garbage collector. | Documented deviation (§1). `NEW` failures yield `NIL`, which is specified. A mark-sweep collector can replace `rt_new` without touching generated code. |
 | R4 | Signed overflow: C's UB vs. Oberon's unspecified wrap. | `-fwrapv` in the documented compile line **[verified]**; the emitted code never relies on the C compiler's optimiser reasoning about overflow. |
-| R5 | `SYSTEM` (§11.1) is not implemented. | Importing it is a hard error in v1. If needed later, `ADR`, `SIZE`, `VAL`, `BIT` are intrinsics and `GET`/`PUT`/`COPY` are `memcpy`-shaped; the design reserves the `ob_sys_` prefix for them. |
+| R5 | `SYSTEM` (§11.1) was not implemented. | **Implemented** (`PLAN.md` W4.1): the import resolves to a builtin module (§9.10), the report's six portable entries are lowered in place, and the RISC-specific extras (`VAL`, `ADC`, `SBC`, `UML`, `COND`, `LED`) are still refused *by name*. R31 records the one thing the report's model does not give on a 64-bit host. |
 | R6 | `FOR` loops that end at the largest `INTEGER`: `v += k` wraps and the guard is re-tested against a wrapped value. | **Resolved**: the report's own equivalence (§9.8) is `v := beg; WHILE v <= end DO S; v := v + inc END`, so the wrap and the re-test *are* the specified behaviour, and with `-fwrapv` it is defined C. No check is added, and W3.1's flag does not need one: a `FOR` loop cannot exceed its bound. |
 | R7 | Nested procedures need a static link. | Only emitted when the nested body actually references an enclosing local; procedure *variables* cannot hold local procedures (report §6.5), so the link is always valid where it is used. **Verified** in `csmoke` (three-level nest, chained frame pointers, plain-signature case). |
 | R8 | `CASE` exhaustiveness on records is only a warning. | The report does not require it; Wirth's compilers report it. We warn, and the emitter always emits a trap for the no-match case **[verified]**. |
@@ -1363,7 +1470,7 @@ section or risk each item comes from.
 | R30 | `rt_new` took its size as `int32_t`, so routing `NEW` through it (the fix for the matrix's `NEW` row) truncated a record larger than 2 GiB to its low word: the allocation was `sizeof(T)` no longer, and the default `-Werror` build rejected the conversion. | **Found by review** of the W7.4 commit pair, by source analysis rather than a run, with the input that shows it (`ARRAY 1073741824 OF INTEGER`, 4 GiB). Fixed: the parameter is `size_t`, as `malloc`'s is, so the size `NEW` computes survives the call; the compile of that record is the evidence. |
 | R28 | An assignment **through a guard** (`p(S).f := 1`) emitted the guard's comma expression in an lvalue position, so the program did not compile at all. | **Found by the trap matrix** while adding the guard row (W7.4). A comma expression is not an lvalue; the guard's check is now hoisted into the prelude — which the assignment emitter already flushes after rendering its target — and the view alone is the expression. The *static* problem the design already records as R15 (gcc sees a read out of the allocation's bounds when the guard *fails*) is untouched and still documented. |
 | R26 | `rt_nil` reads its operand twice, so an operand with a side effect — an index expression containing a call, as in `a[Next()].x` — would be evaluated twice and could check one pointer while dereferencing another. | **Found by review of R21's fix.** The check is therefore emitted only while the designator built so far is side-effect-free (`cgen::has_call`), which is sound: the case keeps the old fault rather than gaining a wrong check. Completing it needs the operand hoisted into a statement, which is the emitter's temporary machinery (R16) and is itemised in `PLAN.md` W7.1. |
-| R21 | A plain pointer dereference was not `NIL`-checked: `p := NIL; p.x := 1` emitted `p->x = 1` and died of SIGSEGV with no message, although the runtime header lists `NIL` among `rt_trap`'s reasons and the *guard* path tests `v != NULL` first. | **Found while auditing memory safety and fixed** (PLAN.md W7.1): `p.f` and `p^` now go through `rt_nil`, a macro rather than a helper because the result has to keep the operand's pointer type — and because `rt_nil(p, at)->f` must stay an lvalue, which is what keeps an assignment to a field of a pointer target compiling. The check carries the designator's offset, and the e2e matrix runs both spellings. |
+| R31 | The report's address is a 32-bit `INTEGER` (§11.1's `mem[a]`), and the lowering `PLAN.md` W4.1 first prescribed — `ADR(v)` → `(int32_t)(uintptr_t)&v`, then a word access through `(uint32_t *)(uintptr_t)a` — truncates it and sign-extends the truncation on the way back. | **Found while writing W4.1's own test**, and measured rather than argued: a stack address does not survive that round trip — `&v = 0x7ffff068624c` truncates to the `int32_t` `-261594548` (`0xf068624c`) and casts back to `0xfffffffff068624c`, so the store faults; the module built and the program died of SIGSEGV, while the `intptr_t` form returns `0x7ffff0686248` unchanged. **Fixed** by keeping the address as wide as the host's pointers in the *expression* (`ADR(v)` → `(intptr_t)(uintptr_t)&v`), narrowing it only where the program's own `INTEGER` does; the only other emitter change this needs is that an `ADR` operand is never fixed in a sequencing temporary, whose type would be that `INTEGER` (§9.10). `e2e/Sys.mod` takes the address of *locals* and `csmoke` executes the snippets on a local, so the defect cannot come back silently. What remains, documented rather than fixed: storing an address in an `INTEGER` — the report's own spelling — is lossless only while the host's addresses fit in 32 bits, which on this host is static data and not the stack. |
 
 Decisions taken during implementation, recorded because the report is silent
 or self-inconsistent and a compiler has to choose once and then be consistent:
@@ -1421,6 +1528,17 @@ or self-inconsistent and a compiler has to choose once and then be consistent:
    exit code, and the suites' clean modules import nothing unused.
 11. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
    and assignment per §9.1.2), but is not an integer operand.
+12. **The SYSTEM address model** (report §11.1, `PLAN.md` W4.1). The report's
+   `mem[a]` is an array of *words* on a machine whose addresses are words, and it
+   types `ADR` as `INTEGER`; this implementation defines an address as a **byte**
+   address, so `ADR(v)` is `&v` and `COPY`'s `n` counts words (`n * 4` bytes), and
+   it keeps that address as wide as the *host's* pointers in the expression rather
+   than in an `INTEGER` — because on a 64-bit host the report's own 32-bit
+   spelling truncates a stack address and dereferences the truncation (R31,
+   §9.10). `SIZE(T)` is the byte size including padding, consistent with the
+   descriptors, and the sized accessors W8.7 suggests are not taken. A module that
+   imports SYSTEM is not portable, and its interface file records the import so a
+   client can see it.
 
 ---
 
@@ -1657,3 +1775,68 @@ descriptor-`id` type `CASE` with a trapping `default`, and caller-side copying
 for `ARRAY` value parameters. 67 cases pass under
   `gcc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror`; the one FAIL line is the
   documented `ROR` spec bug (R11), not a mapping failure.
+
+## 15. Storage reclamation: what the research settles **[decided; the collector itself is PLAN.md W10.2]**
+
+Oberon-07 has `NEW` and no `DISPOSE` (report §6.4), so every program this compiler
+builds leaks until it dies of it. The language's own shape makes the fix cheap: a
+pointer must refer to a *record* (§6.4, enforced by the checker), every heap object
+begins with its `ObDesc` (§9.3), and `NEW`'s allocation goes through one runtime
+entry point (W7.4). What follows is decided from the sources, not assumed.
+
+*Wirth, Compiler Construction, §14.2 (pp. 86-87)* asks the compiler designer's
+question — which data the collector needs — and answers it with exactly three
+compile-time facts: the addresses of all declared pointer variables, the offsets of
+all pointer fields in dynamically allocated records, and the size of every allocated
+variable; `NEW` hands the second and third to the collector as a *type descriptor*
+attached to the block, and the object file carries the first as a list copied at
+load time. The same pages note the restriction this design already enforces: a
+pointer may only refer to a record, so descriptors are needed for records alone.
+
+*Mogensen, Introduction to Compiler Design, §12.2 (p. 261)* states the approximation
+and the root set: an object is reclaimed when it can no longer be *reached*, and the
+root set is "all variables allocated in registers, spilled on the stack, saved across
+procedure calls, or allocated globally".
+
+*Sanyal and Khedker, The Compiler Design Handbook, ch. 6* gives the method taxonomy
+(reference counting, mark-sweep, mark-compact, copying, generational, incremental
+and concurrent).
+
+From those three, the decisions:
+
+1. **Mark-sweep, non-moving.** The emitter addresses heap objects through raw
+   pointers — every `p.f`, every descriptor read — so a moving collector (copying,
+   mark-compact) would have to find and rewrite every pointer, including the ones in
+   the frames the C back end does not describe. A reclaimer is what the language
+   needs and what this back end can have.
+2. **The mark is precise, driven by the descriptor.** The descriptor gains the
+   pointer-field offsets Wirth's scheme requires. The emitter already walks exactly
+   those fields — `desc_init` installs the nested descriptors — so the map costs one
+   more thing to emit per record type, and objects whose type has no pointer fields
+   need no map at all.
+3. **The stack walk is conservative, for now.** The C back end cannot enumerate the
+   roots in registers and spilled slots (Mogensen's root set), and it has no stack
+   maps; a value that merely *looks* like a pointer is therefore treated as one. That
+   is safe in the only direction that matters: it can retain garbage, never free a
+   live object. Interior pointers are treated as pointing at their object. The
+   Cranelift back end (W9) *does* produce stack maps, so the same collector can take
+   a precise stack later without changing the heap.
+4. **The roots are stated.** Every module-level variable of pointer type (a list the
+   loader registers, as Wirth's object file does), the conservative stack and
+   register scan, and the live state of the command table. The hidden open-array
+   *length* is an `int32_t` that may look like a pointer — a false retention, not a
+   lost object.
+5. **Collection happens before `NEW` gives up**, so the report's
+   `NEW`-yields-`NIL` (§6.4) keeps its meaning with a bounded heap, and so that
+   `OB_ALLOC_FAIL_AT` stays a test hook rather than the only way an allocation can
+   fail. A collection that frees nothing ends the attempt rather than looping.
+6. **Two things it must never do**: free a live object — the generator's self-checks
+   are the oracle, and the corpus is what will say whether a reclaimer is correct —
+   and move one.
+
+The implementation questions this leaves open, for W10.2: whether the allocation
+list needs a header *before* the payload (which would keep the descriptor at offset
+0 of the object and give the sweep a size and a next-pointer, at the cost of
+allocating it) or a separate table; when a collection is triggered besides a failing
+allocation; and how `OB_GC_STRESS=1` forces one per allocation without changing the
+program's answers.
