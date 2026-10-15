@@ -491,7 +491,26 @@ Done when: the design states the root model, and a stress program runs under
 Why: §2 prescribes a split by phase; the prototype is one crate with `src/*.rs`.
 It is mechanical because the phase interfaces are three plain data types, and it
 pays off when a phase grows — `syntax` is the only crate that may know LALRPOP.
-Done when: the four crates exist with the same tests and suites green.
+Done when: the four crates exist with the same tests and suites green. **The mapping,
+so it is mechanical when someone does it** (the modules as they stand, 19k lines in
+one crate):
+
+* `crates/syntax` — `lexer.rs`, `ast.rs`, `oberon.lalrpop` and its `build.rs`. §2's
+  rule that this is the only crate which may know LALRPOP is the point of it.
+* `crates/sema` — `resolve.rs`, `sema.rs`, `types.rs`, `sym.rs`, `const_eval.rs`
+  (depends on `syntax`).
+* `crates/cgen` — `cgen.rs`, `layout.rs`, `clif.rs`, `oberon_h.inc`,
+  `oberon_runtime.inc` (depends on both). §2's names for these files (`emit.rs`,
+  `layout.rs`, `runtime.h`, `mangle.rs`) are its sketch of the same shape; ours are the
+  ones that exist, and the divergence is a naming one.
+* `crates/obc` — `bin/obc.rs` and `bin/obgen.rs` (the generator depends on nothing,
+  which is why it can sit here).
+
+`oberon/Cargo.toml` becomes the workspace manifest with those as members, so the
+binaries stay in `oberon/target/debug/` — which means **no suite path changes**, and
+the CI workflow's `--manifest-path oberon/Cargo.toml` keeps resolving. The tests move
+with their modules (they are unit tests in the same files), and the shell suites do
+not know any of this happened.
 
 **W4.4 a `.sym`-only fast path** — **deferred, measured** (the condition it waits for has not fired)
 Why: `obc build` has no up-to-date check (nothing in the driver looks at
@@ -1469,7 +1488,20 @@ written down):
   rows remain. Done when `BACKEND=clif bash e2e/run.sh`
   passes every row the C path does — 126 as of W9.2b, and the harness is there to
   say so.
-  **Two of the four are done.** An interface's record type now *imports* its `TD_`
+  **Three and a half of the four are done.** Nested procedures with static links
+  are in (a frame per nesting procedure, the hidden link parameter, link walking
+  for an enclosing local, links passed at nested calls, symbols keyed by lexical
+  path), with `PACK`/`UNPK`, a `CASE` over `CHAR`/`BYTE` and one block per `WHILE`
+  guard along the way. **`BACKEND=clif bash e2e/run.sh`: 119 pass, 7 fail** (the
+  earlier 67 was the harness stopping early; that row now reports). What is left:
+  a call through a procedure-valued *field* (`Regress.mod`, refused by name), and
+  **`SYSTEM`** (four rows: `ADR`/`SIZE`/`BIT`/`GET`/`PUT`/`COPY`, the builtin
+  import's interface line, and the search-path shadowing pair) plus one
+  cross-module anonymous-type name. The gate is green and the corpus passes on both
+  back ends.
+
+  *Superseded note.* The rest of this entry describes the two items landed in the
+  previous run of this slice. An interface's record type now *imports* its `TD_`
   rather than defining one, so `IS`, a guard and a type-`CASE` agree across a module
   boundary (`gc-roots-hold-their-objects` is the row that says so; the layout walk
   also had to follow a pointer to its base, and to record a pointer's own layout
