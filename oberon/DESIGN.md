@@ -411,7 +411,7 @@ rather than end with one, a proper procedure may not return a value, and a naked
 `RETURN` in a function is an error. The single-*exit* property is unchanged; what
 changed is that it is the emitter's doing rather than the grammar's.
 
-### D7 — error handling and recovery **[implemented; limits found by conflict]**
+### D7 — error handling and recovery **[implemented; limits found by conflict, closed at declaration level by W5.1]**
 
 Two properties are wanted, and they are independent:
 
@@ -477,6 +477,28 @@ A *fatal* error — a missing `END`, an unterminated comment, an illegal charact
 — is not absorbed by any recovery point, but it is still converted to a located
 diagnostic rather than printed as a `ParseError` **[verified]**, so a reader
 never sees a byte offset.
+
+#### Declarations recover outside the grammar **[implemented; PLAN.md W5.1]**
+
+The recovery above is *statement* level: the `!` token lets a body lose a statement
+and keep the rest. A declaration section cannot be given the same treatment,
+because the report lets every section be empty — four shapes were tried and each is
+rejected with a local ambiguity on the error token — so a missing `;` between two
+constants used to hide every error after it.
+
+What the grammar *can* do is expose each declaration as its own entry point
+(`ConstDecl`, `TypeDecl`, `VarDecl`), and what the driver can then do is read a
+broken section one chunk at a time: it lexes, cuts the sections into declarations at
+a `;` at nesting depth zero (so a `;` inside a `RECORD` or inside parentheses is not
+a separator), and asks each chunk's parser what it thinks. Chunks that are fine say
+nothing, so a module whose only mistake is a missing `;` gets one message per broken
+declaration rather than one in total. Two honest limits: it runs only when the
+module parse has already reported an error, so a clean parse cannot be
+second-guessed and pays nothing; and it reports *diagnostics*, not an AST — a missing
+`;` in a section is fatal to the *module* parse, so nothing is type-checked
+afterwards, which is the price of not writing a second declaration parser (the
+item's option 2). A chunk that ends early says so: "this declaration is incomplete",
+not "unexpected end of file", which would be a lie about a file that continues.
 
 ### D8 — the `CASE` default arm is spelled `ELSE S`, not `| S` **[decided; `ELSE` added in W8.1]**
 

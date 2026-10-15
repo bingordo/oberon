@@ -402,13 +402,139 @@ pub fn parse_with_diagnostics_dialect(
             .collect()
     };
     match oberon::CompilationUnitParser::new().parse(&mut errors, dialect.lexer(input)) {
-        Ok(module) => (Some(module), recovered(&errors)),
+        Ok(module) => {
+            let mut diags = recovered(&errors);
+            // The grammar recovers at statement level, so a broken *declaration*
+            // list still yields a module — and stops hiding the errors after the
+            // first one only if the declarations are read chunk by chunk
+            // (PLAN.md W5.1). Only when something already went wrong, so a clean
+            // parse pays nothing and cannot be second-guessed.
+            if diags.iter().any(Diagnostic::is_error) {
+                diags.extend(declaration_diagnostics(input, dialect));
+                sema::dedup_diagnostics(&mut diags);
+                diags.sort_by_key(|d| (d.span.lo, d.span.hi));
+            }
+            (Some(module), diags)
+        }
         Err(fatal) => {
             let mut diags = recovered(&errors);
             diags.push(diagnostic_for_parse_error(&fatal));
+            // The grammar cannot recover *inside* a declaration section — every
+            // section may be empty, so a recovery production would be ambiguous —
+            // but each declaration can be parsed on its own, so a missing `;` no
+            // longer hides every error after it (PLAN.md W5.1).
+            diags.extend(declaration_diagnostics(input, dialect));
+            sema::dedup_diagnostics(&mut diags);
+            diags.sort_by_key(|d| (d.span.lo, d.span.hi));
             (None, diags)
         }
     }
+}
+
+/// What each declaration of a broken declaration list says is wrong (PLAN.md
+/// W5.1). The module parse stops at the first declaration it cannot read, and the
+/// grammar cannot be given a recovery production there; the three entry points
+/// (`ConstDeclParser`, `TypeDeclParser`, `VarDeclParser`) can each read one
+/// declaration, so this walks the token stream, cuts the sections into
+/// `;`-separated chunks at nesting depth zero and asks each chunk's parser what it
+/// thinks. The chunks that are fine say nothing, which is why a module whose only
+/// mistake is a missing `;` gets one message rather than one per declaration.
+fn declaration_diagnostics(input: &str, dialect: Dialect) -> Vec<Diagnostic> {
+    let mut toks: Vec<(usize, Token<'_>, usize)> = Vec::new();
+    for next in dialect.lexer(input) {
+        match next {
+            Ok(t) => toks.push(t),
+            // A lexical error is the caller's to report; there is no point
+            // guessing at declarations after it.
+            Err(_) => return Vec::new(),
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let kind = match toks[i].1 {
+            Token::Const => 0,
+            Token::Type => 1,
+            Token::Var => 2,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        i += 1;
+        // One section: a declaration, then `;`, until the section ends at the next
+        // section keyword, the module's `BEGIN` or a `PROCEDURE`. A `;` inside a
+        // `RECORD` or inside parentheses does not separate declarations, so the
+        // scan keeps a depth.
+        loop {
+            let mut depth = 0i32;
+            let mut j = i;
+            let mut ended_by_semi = false;
+            while j < toks.len() {
+                match &toks[j].1 {
+                    Token::Record | Token::LParen | Token::LBrack => depth += 1,
+                    Token::RParen | Token::RBrack => depth -= 1,
+                    Token::End if depth > 0 => depth -= 1,
+                    Token::Semi if depth == 0 => {
+                        ended_by_semi = true;
+                        break;
+                    }
+                    Token::Const
+                    | Token::Type
+                    | Token::Var
+                    | Token::Begin
+                    | Token::Procedure
+                    | Token::End
+                        if depth == 0 =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j > i {
+                let chunk = &toks[i..j];
+                let mut sink = Vec::new();
+                // The three parsers produce three different (and here unwanted)
+                // types, so the error is what is asked for.
+                let failed = match kind {
+                    0 => oberon::ConstDeclParser::new()
+                        .parse(&mut sink, chunk.iter().cloned())
+                        .err(),
+                    1 => oberon::TypeDeclParser::new()
+                        .parse(&mut sink, chunk.iter().cloned())
+                        .err(),
+                    _ => oberon::VarDeclParser::new()
+                        .parse(&mut sink, chunk.iter().cloned())
+                        .err(),
+                };
+                if let Some(e) = failed {
+                    let mut d = diagnostic_for_parse_error(&e);
+                    // A chunk is not the whole file, so "unexpected end of file"
+                    // would be a lie: what ran out is the declaration.
+                    if matches!(e, lalrpop_util::ParseError::UnrecognizedEof { .. }) {
+                        d.message = "this declaration is incomplete: the parser ran out of it \
+                                    before the `;`"
+                            .to_string();
+                    }
+                    out.push(d);
+                }
+                let _ = sink;
+            }
+            if !ended_by_semi {
+                // The section ended without a `;`: the next token is either the
+                // next section's keyword or the body, and the outer loop takes it.
+                i = j;
+                break;
+            }
+            i = j + 1;
+            if i >= toks.len() {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Parse *and* check a module, reporting syntax errors and semantic errors in
@@ -1744,6 +1870,40 @@ END M.\n";
         assert!(e.is_empty(), "the report's SYSTEM entries must check: {e:#?}");
         let w = warnings(src, &[]);
         assert!(w.is_empty(), "every import is used, and so is P0: {w:#?}");
+    }
+
+    /// W5.1: a missing `;` in a declaration list no longer hides the errors after
+    /// it. The grammar cannot recover inside a section (every section may be
+    /// empty), so the driver reads the declarations one chunk at a time.
+    #[test]
+    fn a_broken_declaration_list_still_reports_what_follows() {
+        let src = "MODULE M;\n  CONST a = 1\n        b = 2;\n        c = ;\n        d = 4;\n\
+  VAR x: INTEGER\n      y: REAL;\nBEGIN\n  x := 1; y := 0.0\nEND M.\n";
+        let (parsed, diags) = parse_with_diagnostics(src);
+        // The module is not rebuilt — a missing `;` between declarations is fatal
+        // to the *module* parse, and the statement-level recovery works inside a
+        // body, not in a section. What the item asks for is that the errors after
+        // the first one are reported, and three are.
+        assert!(parsed.is_none(), "the module parse fails: {diags:#?}");
+        let errors: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(errors.len(), 3, "one per broken declaration: {errors:#?}");
+        assert!(
+            errors.iter().any(|m| m.contains("unexpected `b`")),
+            "the missing `;` is named: {errors:#?}"
+        );
+        assert!(
+            errors.iter().any(|m| m.contains("unexpected `y`")),
+            "and so is the one after it: {errors:#?}"
+        );
+        assert!(
+            errors.iter().any(|m| m.contains("incomplete")),
+            "an empty constant value reads as an incomplete declaration, not as the \\
+             end of the file: {errors:#?}"
+        );
     }
 
     /// W8.10: the default dialect is the report's, so a reserved word spelled in

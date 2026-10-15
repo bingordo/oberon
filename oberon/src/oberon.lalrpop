@@ -150,7 +150,11 @@ ConstSection: Vec<ConstDecl> = {
     "CONST" <ds:ConstDeclSemi*> => ds,
 };
 ConstDeclSemi: ConstDecl = <d:ConstDecl> ";" => d;
-ConstDecl: ConstDecl = <lo:@L> <id:IdentDef> "=" <value:Expr> <hi:@R> => ConstDecl {
+/// A single declaration, exposed so that a broken declaration list can still be
+/// read one chunk at a time: the grammar cannot recover inside a section, because
+/// the report lets every section be empty, but the driver can parse chunks
+/// (PLAN.md W5.1).
+pub ConstDecl: ConstDecl = <lo:@L> <id:IdentDef> "=" <value:Expr> <hi:@R> => ConstDecl {
     name: id.0,
     export: id.1,
     value,
@@ -162,7 +166,11 @@ TypeSection: Vec<TypeDecl> = {
     "TYPE" <ds:TypeDeclSemi*> => ds,
 };
 TypeDeclSemi: TypeDecl = <d:TypeDecl> ";" => d;
-TypeDecl: TypeDecl = <lo:@L> <id:IdentDef> "=" <ty:TypeExpr> <hi:@R> => TypeDecl {
+/// A single declaration, exposed so that a broken declaration list can still be
+/// read one chunk at a time: the grammar cannot recover inside a section, because
+/// the report lets every section be empty, but the driver can parse chunks
+/// (PLAN.md W5.1).
+pub TypeDecl: TypeDecl = <lo:@L> <id:IdentDef> "=" <ty:TypeExpr> <hi:@R> => TypeDecl {
     name: id.0,
     export: id.1,
     ty,
@@ -174,7 +182,11 @@ VarSection: Vec<VarDecl> = {
     "VAR" <ds:VarDeclSemi*> => ds,
 };
 VarDeclSemi: VarDecl = <d:VarDecl> ";" => d;
-VarDecl: VarDecl = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => VarDecl {
+/// A single declaration, exposed so that a broken declaration list can still be
+/// read one chunk at a time: the grammar cannot recover inside a section, because
+/// the report lets every section be empty, but the driver can parse chunks
+/// (PLAN.md W5.1).
+pub VarDecl: VarDecl = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => VarDecl {
     names,
     ty,
     span: sp(lo, hi),

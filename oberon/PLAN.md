@@ -527,7 +527,7 @@ in this item — W4.2 is the implementation.
 
 ## W5 — error recovery
 
-**W5.1 declaration-level recovery** (§5 D7)
+**W5.1 declaration-level recovery** (§5 D7) — **done**
 Why: today a missing `;` between two `CONST` declarations produces one located
 message and stops. The grammar *cannot* express recovery there — four shapes
 were tried and all four are rejected with a local ambiguity on the error token,
@@ -538,7 +538,18 @@ Two ways out, both outside the current grammar:
 2. hand-write the declaration-section parser and keep LALRPOP for statements and
    expressions.
 Done when: a missing `;` in a declaration list still reports the errors *after*
-it, with a test that fails today.
+it, with a test that fails today. **Done**, by option 1: `ConstDecl`, `TypeDecl` and
+`VarDecl` are public LALRPOP entry points, and the driver reads a broken section one
+chunk at a time — lexing, cutting at a `;` at nesting depth zero (a `;` inside a
+`RECORD` or parentheses is not a separator), and asking each chunk's parser. Only
+chunks that are wrong say anything, and the scan runs only when the module parse has
+already failed, so a clean parse pays nothing and cannot be second-guessed. The
+test `a_broken_declaration_list_still_reports_what_follows` fails without it: one
+missing `;` in a `CONST` list and one in a `VAR` list now produce three located
+errors (`unexpected `b``, an incomplete declaration, `unexpected `y``) instead of the
+first alone. Boundary, stated rather than implied: this reports *diagnostics*, not an
+AST — the module parse is still fatal there, so nothing after it is type-checked.
+That is the price of option 1 over a second, hand-written declaration parser.
 
 **W5.2 cascades, an error limit, and the baseline that pins them** — **done**
 Why: W5.1 is the *hard* half of recovery (LALR(1) will not let us resynchronise in
