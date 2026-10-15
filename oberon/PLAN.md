@@ -365,6 +365,103 @@ arm), but the decision should be written down in DESIGN §5.
 
 ---
 
+## W7 — memory safety: evaluate it, then test it
+
+Why: the design's promise is that a memory access in emitted code is either
+provably in bounds by the type system or guarded by a trap that names the source
+offset (§9.4, §8.6, R14) — with `SYSTEM` as the only deliberate escape. That
+promise has never been audited end to end, and R20 showed what happens when such
+a guarantee is assumed rather than tested. Probing it while writing this item
+found two holes (W7.1, W7.2) and confirmed two static checks are in place.
+
+**What is answered today** (probes, all in `fuzz/findings/` style modules):
+
+| question | answer |
+|---|---|
+| an out-of-range *constant* index, `a[10]` on `ARRAY 4 OF INTEGER` | accepted at compile time, traps at run time: `index out of range (at byte 62 of the source)` |
+| an out-of-range *variable* index | same check: every index goes through `rt_index(i, n, at)`, constants included — there is no static bounds analysis |
+| `ARRAY 5` assigned to `ARRAY 4` | **static error**: `cannot assign an ARRAY 5 OF … to an ARRAY 4 OF …` (report §9.1) |
+| a 4-character literal assigned to `ARRAY 3 OF CHAR` | **static error**: `cannot assign a 4-character string to an ARRAY 3 OF …` |
+| a failed *type guard* | traps with the offset, and the pointer spelling tests `v != NULL` first (§9.5) |
+| a **plain dereference of `NIL`** (`p.x := 1`, `p^ := p^`) | **nothing**: no check is emitted, so the process dies of SIGSEGV with no message — see W7.1 |
+
+**W7.1 a plain pointer dereference is not `NIL`-checked — open, a defect**
+Why: `rt_trap`'s own comment in the emitted header lists its reasons as
+"bounds, NIL, case, ASSERT", and §9.5 checks `NIL` on the *guard* path, but the
+emitter's dereference lowering (`Mem3__p->x = 1`) has no check at all. Evidence:
+`p := NIL; p.x := 1` exits 139 (SIGSEGV) with empty stderr, where every other
+violation of the same class reports a located trap. `p^ := p^` does not even
+crash — the C compiler is free to do anything with it, which is the other half
+of the problem.
+Fix, in `src/cgen.rs`: lower a pointer access through a `NIL` test, using the
+same comma-expression trick §9.5 already uses for guards where the access is a
+*read* (`(rt_nil(p, "… at byte N"), p->f)`) and a hoisted statement where it is
+an *lvalue* (`(rt_nil(p, …), p->f) = x` is not valid C), with a new `rt_nil`
+helper beside `rt_guard_is`. Decision needed: check every dereference (a trap
+per access, the safe and consistent choice) or only the ones whose pointer is
+not provably non-`NIL` — we have no such analysis, and pretending otherwise is
+how the hole got here. Recorded in DESIGN §13 either way.
+Done when: field and `^` dereferences of a `NIL` pointer both trap with the
+designator's offset, both spellings are in the e2e trap matrix, and the emitted
+C for the guarded case still compiles under the documented build line.
+
+**W7.2 a constant out-of-range index is not diagnosed — open, a decision**
+Why: `a[10]` on `ARRAY 4 OF INTEGER` compiles, and `e2e/Trap.mod` *relies* on
+that (its comment says the check must trap and say where). Nothing is wrong with
+the run-time behaviour — it traps, with the offset — but a provably wrong index
+is a program bug that a compiler can name for free: the index is folded already
+(`rt_index(((int32_t)10u), 4, 62)` appears in the emitted C), so the folder knows
+both the value and the length.
+Decision: warn (not error) when the folded index is outside `0 .. LEN-1` or the
+folded string is longer than its target, and update `Trap.mod` to expect the
+warning on the way to its trap. Declining is also defensible — Wirth's compilers
+do not diagnose it — but then §13 should say so, because "the check traps" and
+"the compiler can see it is wrong" are different promises.
+
+**W7.3 the audit (the main deliverable)** — **open**
+Why: "every access is safe" is a claim about *all* the places the emitted C
+touches memory, and it should be a table, not a feeling. Write it into DESIGN
+§9.4, one row per access kind, with what makes it safe and which test exercises
+it: array index (fixed and open); record field, including through an extended
+record and a guard; pointer dereference (`^` and `.`) including `NIL` (W7.1);
+value-parameter copy and whole-array/record assignment (`rt_rec_copy`,
+`rt_strcopy` — R14's exact-length case); string literal initialisation; the
+frame and the static link (R7); descriptor reads for a type guard and for a
+type-`CASE` (including a stale or corrupted `id`); `NEW` and a failing `malloc`
+(R3); and the trap path itself.
+Done when: the table exists, each row names a test, and every row's "safe
+because" is either the type system or a helper visible in the emitted C.
+
+**W7.4 the trap matrix in `e2e`** — **open**
+Why: one deliberate violation per kind, each asserting the *offset* reported,
+since a trap that says the wrong place is nearly as bad as no trap.
+Each in its own module (the first trap aborts the process): index below 0, index
+at `LEN`, index in an open-array parameter, a failed record guard and pointer
+guard (R15's two spellings), `NIL` field and `^` (W7.1), a type-`CASE` with no
+match, `DIV`/`MOD` by zero, and a failing `ASSERT`. `NEW` failing needs a way to
+force it — `rt_new` is already the hatch (R3) — so an `OB_ALLOC_FAIL_AT=n`
+environment hook makes that row testable too.
+Done when: the matrix runs in the gate and each row's expected offset is
+asserted, not just "it trapped".
+
+**W7.5 the generator as a memory-safety oracle** — **open**
+Why: the self-checks in W6.1 verify *values*; they cannot see a wrong length, a
+stale frame pointer or a descriptor read that happens to land inside the heap.
+Two additions, both cheap because the machinery exists:
+1. run the generated programs compiled with `-fsanitize=address,undefined`
+   (`obc build --cflag`, exactly as the golden suite already runs its own
+   programs twice) — a clean run is then evidence about the *emitted* code, not
+   about the program's own arithmetic;
+2. an adversarial mode: emit programs that *deliberately* violate — an index past
+   the end, a `NIL` dereference, a guard that cannot hold — where the mirror
+   records "a trap is due here" instead of a value, asserting that the program
+   traps at the expected offset and corrupts nothing. That is the only test that
+   exercises the guard paths rather than the value paths.
+Done when: a few hundred seeds are ASan/UBSan-clean, and the adversarial mode's
+traps all report their expected offsets.
+
+---
+
 ## Ideas not yet in the design (adopt or drop)
 
 - Fuzz the *lexer* with random bytes and random token streams: assert no panic
