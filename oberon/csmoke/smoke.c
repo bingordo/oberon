@@ -10,6 +10,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 /* ==================================================================== */
 /* runtime helpers (emitted by the backend for predeclared operations)   */
@@ -557,6 +558,104 @@ static void case_array_value_param(void) {
 }
 
 /* ==================================================================== */
+/* case 13: report 11.1's SYSTEM, in the emitted shape (W4.1)           */
+/* ==================================================================== */
+/* Every expression below is copied from what the emitter produces for the
+ * entry named in the case: SYSTEM is lowered in place, so there is no runtime
+ * helper to check here — the *shape* is the whole subject, and the suite's job
+ * is to execute it rather than trust it.  All of it runs on a *local* variable,
+ * so the addresses are stack addresses: an `int32_t` address (the report's own
+ * INTEGER) cannot carry one and dereferencing it faults, which is what R31
+ * records and what this case would catch (DESIGN 9.10).  `SysR` is the C type
+ * `SIZE(R)` is lowered against.                                             */
+typedef struct { const void *desc; int32_t a; int32_t b; } SysR;
+
+static void case_system(void) {
+  int32_t v;
+  int32_t got;
+  char ch;
+  float r, r2;
+  int32_t src[2];
+  int32_t dst[4];
+
+  /* ADR(v) ==> ((intptr_t)(uintptr_t)&(v)); PUT/GET then round-trip through it. */
+  v = 12345;
+  (*(uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v))) = (uint32_t)(((int32_t)987654u)));
+  check("system-adr-is-the-address-put-wrote[v]", v == 987654,
+        "PUT did not write the variable ADR named");
+  got = ((int32_t)(*(const uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v)))));
+  check("system-get-round-trips-through-adr[got]", got == 987654, "GET did not read it back");
+  check("system-adr-distinguishes-variables",
+        ((intptr_t)(uintptr_t)&(v)) != ((intptr_t)(uintptr_t)&(got)), "two variables share an address");
+
+  /* BIT(a, n) ==> (((*(const uint32_t *)(uintptr_t)(a) >> ((uint32_t)(n) & 31u)) & 1u) != 0) */
+  (*(uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v))) = (uint32_t)(((int32_t)8u)));
+  check("system-bit-3-of-8",
+        (((*(const uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v))) >> ((uint32_t)(((int32_t)3u)) & 31u)) & 1u) != 0) == 1,
+        "bit 3 of the word PUT stored is not set");
+  check("system-bit-2-of-8-clear",
+        (((*(const uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v))) >> ((uint32_t)(((int32_t)2u)) & 31u)) & 1u) != 0) == 0,
+        "bit 2 of 8 read as set");
+  /* The count is masked into 0..31 the way the runtime's shifts are (R22): the
+   * report says nothing about a count outside that range, and an unmasked C
+   * shift would be undefined. */
+  check("system-bit-count-is-masked[32 reads bit 0]",
+        (((*(const uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v))) >> ((uint32_t)(((int32_t)32u)) & 31u)) & 1u) != 0) == 0,
+        "a count of 32 did not wrap to bit 0");
+
+  /* GET/PUT widths: PUT stores the word its *value* occupies — a CHAR zeroes the
+   * rest of the word — and GET narrows the word to the variable's type. */
+  v = -1;
+  ch = ((char)((*(const uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(v)))) & 0xFFu));
+  check("system-get-narrows-to-char[0xFFFFFFFF => -1]", ch == (char)-1, "the CHAR did not keep the low byte");
+  check("system-get-narrowed-char-reads-back-as-255", (int32_t)(unsigned char)ch == 255, "ORD of the CHAR is wrong");
+  dst[0] = 7; dst[1] = -1;
+  ch = (char)-1;
+  (*(uint32_t *)(uintptr_t)(((intptr_t)(uintptr_t)&(dst[1]))) = ((uint32_t)(ch) & 0xFFu));
+  check("system-put-masks-to-the-value's-width[CHAR zeroes the rest of the word]",
+        dst[1] == 255, "a CHAR store did not mask to its low byte");
+  r = 2.5f;
+  (*(float *)(uintptr_t)(((intptr_t)(uintptr_t)&(r))) = (r));
+  r2 = (*(const float *)(uintptr_t)(((intptr_t)(uintptr_t)&(r))));
+  check("system-put-get-real-keeps-the-bit-pattern[r2 = 2.5]", r2 == 2.5f, "a REAL did not survive a word store");
+
+  /* COPY(src, dst, n) ==> memcpy(dst, src, (size_t)n * 4): n counts *words*, so
+   * two words move two int32_t and leave the words around them alone. */
+  src[0] = 65536; /* 0x10000: a byte-count copy of the low bytes would give 0 */
+  src[1] = 2;
+  dst[0] = 7; dst[1] = -1; dst[2] = -1; dst[3] = 9;
+  memcpy((void *)(uintptr_t)(((intptr_t)(uintptr_t)&(dst[1]))),
+         (const void *)(uintptr_t)(((intptr_t)(uintptr_t)&(src[0]))),
+         (size_t)(((int32_t)2u)) * 4u);
+  check("system-copy-moves-words-not-bytes[dst[1] = 0x10000]", dst[1] == 65536, "the copy was not a word copy");
+  check("system-copy-moves-exactly-n-words", dst[0] == 7 && dst[2] == 2 && dst[3] == 9,
+        "the copy touched a word outside the n it was given");
+
+  /* SIZE(T) ==> ((int32_t)sizeof(<C type>)): the layout the descriptors are built
+   * beside, so a whole record is `SIZE(R) DIV 4` words long. */
+  check("system-size-integer[sizeof(int32_t)]", ((int32_t)sizeof(int32_t)) == 4, "INTEGER is not one word");
+  check("system-size-char[sizeof(char)]", ((int32_t)sizeof(char)) == 1, "CHAR is not one byte");
+  check("system-size-real[sizeof(float)]", ((int32_t)sizeof(float)) == 4, "REAL is not one word");
+  check("system-size-record-is-the-layout[sizeof(SysR)]",
+        ((int32_t)sizeof(SysR)) == (int32_t)(2 * sizeof(int32_t) + sizeof(const void *)),
+        "the record's extent is not its fields plus the descriptor word");
+  {
+    SysR sr;
+    unsigned char bytes[sizeof(SysR)];
+    sr.a = 11; sr.b = 22;
+    memset(bytes, 0, sizeof bytes);
+    /* SIZE(R) DIV 4 words, moved by the emitted memcpy, cover the *whole*
+     * record — descriptor word included — so the byte image compares equal. */
+    memcpy(bytes,
+           (const void *)(uintptr_t)(((intptr_t)(uintptr_t)&(sr))),
+           (size_t)rt_div(((int32_t)sizeof(SysR)), 4) * 4u);
+    check("system-size-counts-the-whole-record[size-words move the record]",
+          memcmp(bytes, &sr, sizeof(SysR)) == 0,
+          "SIZE(R) DIV 4 words did not cover the record");
+  }
+}
+
+/* ==================================================================== */
 int main(void) {
   case_divmod();
   case_sets();
@@ -570,6 +669,7 @@ int main(void) {
   case_nested_links();
   case_typecase_id();
   case_array_value_param();
+  case_system();
 
   printf("----\n");
   printf("SUMMARY: %d assertion failure(s)\n", (int)failures);

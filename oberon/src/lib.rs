@@ -643,7 +643,7 @@ mod tests {
     /// A module that exercises every branch of the reclassification pass.
     const RECLASSIFY: &str = r#"
 MODULE M;
-  IMPORT Out := Texts;
+  IMPORT Out := Texts, SYSTEM;
   TYPE T = POINTER TO R; R = RECORD f: INTEGER END;
   VAR t: T; x: INTEGER;
   PROCEDURE g(a: INTEGER): INTEGER; BEGIN RETURN a END g;
@@ -653,7 +653,8 @@ BEGIN
   x := t(T).f;
   Out.Write(x);
   x := t.f;
-  INC(x)
+  INC(x);
+  x := SYSTEM.SIZE(T)
 END M.
 "#;
 
@@ -725,6 +726,16 @@ END M.
                 }
             }
             other => panic!("statement 5 is not a call: {other:?}"),
+        }
+
+        // 6: `SYSTEM.SIZE(T)` - report §11.1's `SIZE` takes a *type*, so rule
+        // (b) would read `(T)` as a guard; the entry's name is what keeps it a
+        // call (DESIGN §9.10).
+        let d = designator_of(&value_of(6));
+        assert_eq!(d.base, vec!["SYSTEM".to_string(), "SIZE".to_string()]);
+        match &d.sels[..] {
+            [Sel::Call(args)] => assert_eq!(args.len(), 1),
+            other => panic!("expected one call, got {other:?}"),
         }
     }
 
@@ -1571,6 +1582,90 @@ BEGIN Outer END M.\n";
         assert!(e.is_empty(), "a local `T` shadows the type: {e:#?}");
     }
 
+    /// Report §11.1's SYSTEM, in full (W4.1): every entry of the table's portable
+    /// six, the entry the report does not define, both spellings of the import
+    /// alias, and the qualified type name in `SIZE`.
+    #[test]
+    fn system_entries_check_clean() {
+        let src = "MODULE M;\n  IMPORT SYSTEM, S := SYSTEM;\n\
+  TYPE R = RECORD a: INTEGER END; P = POINTER TO R; Arr = ARRAY 4 OF INTEGER;\n\
+  VAR i, j: INTEGER; r: R; c: CHAR; b: BOOLEAN; x: REAL; a: Arr; p: P;\n\
+  PROCEDURE P0(VAR v: R);\n    VAR w: R;\n  BEGIN\n\
+    i := SYSTEM.ADR(v);\n\
+    i := S.ADR(w);\n\
+    i := SYSTEM.SIZE(R);\n\
+    i := SYSTEM.SIZE(INTEGER);\n\
+    i := SYSTEM.SIZE(Arr);\n\
+    b := SYSTEM.BIT(i, 31)\n\
+  END P0;\n\
+BEGIN\n\
+  SYSTEM.PUT(SYSTEM.ADR(i), 1);\n\
+  SYSTEM.GET(SYSTEM.ADR(i), j);\n\
+  SYSTEM.PUT(SYSTEM.ADR(c), c);\n\
+  SYSTEM.GET(SYSTEM.ADR(c), c);\n\
+  SYSTEM.PUT(SYSTEM.ADR(b), b);\n\
+  SYSTEM.GET(SYSTEM.ADR(b), b);\n\
+  SYSTEM.PUT(SYSTEM.ADR(x), x);\n\
+  SYSTEM.GET(SYSTEM.ADR(x), x);\n\
+  SYSTEM.COPY(SYSTEM.ADR(a), SYSTEM.ADR(a), SYSTEM.SIZE(R) DIV 4);\n\
+  NEW(p);\n\
+  SYSTEM.COPY(SYSTEM.ADR(r), SYSTEM.ADR(p^), 2);\n\
+  P0(r)\n\
+END M.\n";
+        let e = errors(src, &[]);
+        // `SIZE`'s one-argument rule (`Arr` is an *array type name* here, not a
+        // value: `SIZE(T)` takes any type) and both aliases are the point.
+        assert!(e.is_empty(), "the report's SYSTEM entries must check: {e:#?}");
+        let w = warnings(src, &[]);
+        assert!(w.is_empty(), "every import is used, and so is P0: {w:#?}");
+    }
+
+    /// `SIZE(Texts.Writer)` is a *type* from another module: the qualified name
+    /// has to resolve, and it counts as a use of the import that names it.
+    #[test]
+    fn system_size_takes_an_imported_type_name() {
+        let src = "MODULE M;\n  IMPORT SYSTEM, Texts;\n  VAR i: INTEGER;\n\
+  BEGIN i := SYSTEM.SIZE(Texts.Writer) END M.\n";
+        let all = run(src, &report_interfaces());
+        let e: Vec<&String> = all.iter().filter(|d| d.is_error()).map(|d| &d.message).collect();
+        assert!(e.is_empty(), "SIZE of an imported type must check: {e:#?}");
+        let w: Vec<&String> = all.iter().filter(|d| !d.is_error()).map(|d| &d.message).collect();
+        assert!(w.is_empty(), "the qualified name is a use of `Texts`: {w:#?}");
+    }
+
+    /// SYSTEM is built in, so an interface file *named* SYSTEM is not what the
+    /// import resolves to (DESIGN §9.10): the report's entries are there, and
+    /// anything else is refused by name rather than looked up in that file.
+    #[test]
+    fn system_import_is_not_an_interface_lookup() {
+        let interfaces = vec![iface("MODULE SYSTEM\nPROC Nope\n")];
+        let src = "MODULE M;\n  IMPORT SYSTEM;\n  VAR i: INTEGER;\n\
+  BEGIN i := SYSTEM.ADR(i) END M.\n";
+        let e = errors(src, &interfaces);
+        assert!(e.is_empty(), "the builtin entries must resolve: {e:#?}");
+
+        let src = "MODULE M;\n  IMPORT SYSTEM;\n  VAR i: INTEGER;\n\
+  BEGIN i := SYSTEM.Nope(1) END M.\n";
+        let e = errors(src, &interfaces);
+        assert_eq!(e.len(), 1, "{e:#?}");
+        assert!(e[0].contains("SYSTEM.Nope is not implemented"), "{e:#?}");
+    }
+
+    /// R17 applies to this pass's SYSTEM set as well: a declaration named SYSTEM
+    /// shadows the import alias, so `SYSTEM.SIZE` there is a field select on that
+    /// declaration. The test is the *absence* of a diagnostic: report §11.1's
+    /// entry written without its argument list would be row 51's error, so
+    /// resolving it as the record's field is the only way this checks clean.
+    #[test]
+    fn an_inner_declaration_shadows_the_system_alias() {
+        let src = "MODULE M;\n  IMPORT SYSTEM;\n  TYPE T = RECORD SIZE: INTEGER END;\n\
+  VAR i: INTEGER;\n\
+  PROCEDURE Use;\n    VAR SYSTEM: T;\n  BEGIN\n    SYSTEM.SIZE := 1;\n    i := SYSTEM.SIZE\n  END Use;\n\
+BEGIN Use END M.\n";
+        let e = errors(src, &[]);
+        assert!(e.is_empty(), "the local SYSTEM is a record: {e:#?}");
+    }
+
     #[test]
     fn report_out_module_checks_clean() {
         let e = errors(OUT_MODULE, &report_interfaces());
@@ -1704,8 +1799,84 @@ BEGIN Outer END M.\n";
                 "cannot be passed as a procedure parameter",
             ),
             (51, "MODULE M; VAR i: INTEGER; BEGIN i := ABS END M.", "cannot be used as a value"),
+            // Row 51 covers report §11.1's entries too: they are predeclared
+            // procedures as well, and one the report lists as
+            // implementation-specific is refused by row 53's message instead.
+            (
+                51,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN i := SYSTEM.ADR END M.",
+                "`SYSTEM.ADR` is a predeclared procedure: it cannot be used as a value",
+            ),
             (52, "MODULE M; VAR s: SET; BEGIN s := {32} END M.", "outside 0..31"),
-            (53, "MODULE M; IMPORT SYSTEM; BEGIN END M.", "module SYSTEM is not available"),
+            // Row 53 is the by-name refusal (W4.1): the report's table defines
+            // six entries, and the extras *it* lists (`VAL`, `ADC`, `SBC`, `UML`,
+            // `COND`, `LED`) plus anything else a program spells are refused with
+            // the name the program used, never silently.
+            (
+                53,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN SYSTEM.ADC(i, i) END M.",
+                "SYSTEM.ADC is not implemented",
+            ),
+            (
+                53,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN i := SYSTEM.H(i) END M.",
+                "SYSTEM.H is not implemented",
+            ),
+            // Rows 55-59 are the entries' argument rules (W4.1).
+            (
+                55,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN i := SYSTEM.SIZE(i) END M.",
+                "the argument of SYSTEM.SIZE must be a type name",
+            ),
+            (
+                56,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN i := SYSTEM.ADR(1) END M.",
+                "the argument of SYSTEM.ADR must be a variable",
+            ),
+            (
+                57,
+                "MODULE M; IMPORT SYSTEM; TYPE R = RECORD a: INTEGER END;\n\
+                 VAR i: INTEGER; r: R;\n\
+                 BEGIN SYSTEM.GET(i, r) END M.",
+                "argument 2 of SYSTEM.GET must be of a basic type",
+            ),
+            (
+                57,
+                "MODULE M; IMPORT SYSTEM; TYPE R = RECORD a: INTEGER END;\n\
+                 VAR i: INTEGER; r: R;\n\
+                 BEGIN SYSTEM.PUT(i, r) END M.",
+                "argument 2 of SYSTEM.PUT must be of a basic type",
+            ),
+            (
+                58,
+                "MODULE M; IMPORT SYSTEM; CONST K = 7; VAR i: INTEGER;\n\
+                 BEGIN SYSTEM.GET(i, K) END M.",
+                "read-only",
+            ),
+            (
+                59,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN SYSTEM.COPY(i, i) END M.",
+                "SYSTEM.COPY takes 3 argument(s), but 2 were given",
+            ),
+            // Row 30's shape reaches SYSTEM's proper entries as well.
+            (
+                30,
+                "MODULE M; IMPORT SYSTEM; BEGIN SYSTEM.GET END M.",
+                "`SYSTEM.GET` needs an actual parameter list",
+            ),
+            // ... and row 31's its functions: a call, which the statement path
+            // asks about by name; and the bare name, which no argument list
+            // follows at all.
+            (
+                31,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN SYSTEM.ADR(i) END M.",
+                "a function procedure must be used for its value, not as a statement",
+            ),
+            (
+                31,
+                "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN SYSTEM.ADR END M.",
+                "`SYSTEM.ADR` is a function procedure: its value must be used",
+            ),
             (
                 39,
                 "MODULE M; TYPE R = RECORD END; P = POINTER TO R; VAR p: P;\n\

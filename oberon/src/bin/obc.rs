@@ -320,6 +320,13 @@ fn emit_tree(
         if done.contains(&m) {
             continue;
         }
+        // Report §11.1's SYSTEM is built into the compiler (DESIGN §9.10): there
+        // is no module to compile, nothing to link, and no interface to find.
+        // Looking for `SYSTEM.mod` here would both shadow the report's module with
+        // whatever the search path holds and fail the build when it holds nothing.
+        if m == "SYSTEM" {
+            continue;
+        }
         let m = m.clone();
         match find_file(o, &format!("{m}.mod")) {
             Some(mod_path) => {

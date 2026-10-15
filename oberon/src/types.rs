@@ -279,6 +279,12 @@ impl Types {
     pub fn is_set(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Basic(Basic::Set))
     }
+    /// report §6.1's basic types — what report §11.1 lets `SYSTEM.GET` and
+    /// `SYSTEM.PUT` read and write ("v: any basic type"), as opposed to a record,
+    /// an array or a pointer.
+    pub fn is_basic(&self, t: TypeId) -> bool {
+        matches!(self.get(t), Type::Basic(_))
+    }
     pub fn is_pointer(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Pointer { .. })
     }

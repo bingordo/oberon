@@ -116,6 +116,14 @@ enum Sym {
     },
     /// A predeclared procedure of report §10.2.
     Predef(&'static str),
+    /// Report §11.1's module `SYSTEM`, imported as a *builtin*: no interface
+    /// file is read for it (see `imports`).
+    System,
+    /// One entry of `SYSTEM`, dispatched by name in the checker. `ADR`, `GET`
+    /// and `PUT` take a variable and `SIZE` takes a type, so the entries have
+    /// no signature to check against (§5 D2's shape: one production, decided by
+    /// the name it names).
+    Sys(String),
     /// An imported module; the index selects the interface.
     Module(usize),
 }
@@ -448,6 +456,13 @@ impl<'a> Sema<'a> {
             };
         }
         self.used.push(q[0].clone());
+        // An entry of report §11.1's builtin SYSTEM. It has no interface to look
+        // the name up in, so the entry is handed to the checker as *the name it
+        // names* and dispatched there: `ADR`, `GET` and `PUT` take a variable
+        // and `SIZE` takes a type, so there is no signature to build.
+        if matches!(self.lookup(&q[0]), Some(Sym::System)) {
+            return Some(Sym::Sys(q[1].clone()));
+        }
         // Inside an interface's own rendering, a qualifier resolves through
         // that interface's import list (or the module itself), not through the
         // importing module's scope.
@@ -524,14 +539,6 @@ impl<'a> Sema<'a> {
 
     fn imports(&mut self, m: &Module) {
         for imp in &m.imports {
-            // ✔ row 53: report §11.1's module is optional and not provided.
-            if imp.module == "SYSTEM" {
-                self.error(
-                    imp.span,
-                    "module SYSTEM is not available in this implementation (report 11.1)",
-                );
-                continue;
-            }
             // ✔ row 5: no self-import, no duplicate alias (row 2 covers the
             // duplicate through `declare`).
             if imp.alias == m.name {
@@ -539,6 +546,17 @@ impl<'a> Sema<'a> {
                     imp.span,
                     format!("module `{}` cannot import itself (report 11)", m.name),
                 );
+                continue;
+            }
+            // Report §11.1's module is *built in* (R5): the compiler supplies
+            // its entries, so no `SYSTEM.sym` and no `SYSTEM.mod` is read or
+            // compiled for it, and one on the search path is therefore shadowed
+            // — a user supply would be a different language, while a module that
+            // names SYSTEM in its import list must get the report's entries
+            // (DESIGN §9.10).
+            if imp.module == "SYSTEM" {
+                self.imports.push((imp.alias.clone(), imp.span));
+                self.declare(&imp.alias, Sym::System, imp.span);
                 continue;
             }
             match self.interfaces.iter().position(|i| i.module == imp.module) {
@@ -1554,6 +1572,8 @@ impl<'a> Sema<'a> {
                             Typed::value(result.unwrap_or_else(|| self.types.error()))
                         }
                         Sym::Predef(n) => self.predef_call(d.span, n, args),
+                        // Report §11.1: one production, dispatched by name.
+                        Sym::Sys(n) => self.sys_call(d.span, &n, args),
                         _ => {
                             // ✔ row 28.
                             let ty = self.error_ty(
@@ -1802,6 +1822,29 @@ impl<'a> Sema<'a> {
                 );
                 Typed::error(ty)
             }
+            // ✔ row 51 holds for report §11.1's entries too; an entry the report
+            // lists as implementation-specific is refused by name instead (row
+            // 53), which is the more useful of the two messages.
+            Sym::Sys(n) => {
+                let ty = if SYSTEM_FUNCTIONS.contains(&n.as_str())
+                    || SYSTEM_PROPER.contains(&n.as_str())
+                {
+                    self.error_ty(
+                        d.span,
+                        format!("`SYSTEM.{n}` is a predeclared procedure: it cannot be used as a value (report 10.1)"),
+                    )
+                } else {
+                    self.sys_unimplemented(d.span, n)
+                };
+                Typed::error(ty)
+            }
+            Sym::System => {
+                let ty = self.error_ty(
+                    d.span,
+                    "`SYSTEM` is a module, not a value (report 11)",
+                );
+                Typed::error(ty)
+            }
             Sym::Type(_) => {
                 let ty = self.error_ty(d.span, format!("`{name}` is a type, not a value (report 4)"));
                 Typed::error(ty)
@@ -1828,7 +1871,7 @@ impl<'a> Sema<'a> {
             Sym::Var { ty, .. } => *ty,
             Sym::Param { ty, .. } => *ty,
             Sym::Proc { ty, .. } => *ty,
-            Sym::Predef(_) | Sym::Module(_) => self.types.error(),
+            Sym::Predef(_) | Sym::System | Sym::Sys(_) | Sym::Module(_) => self.types.error(),
         }
     }
 
@@ -2005,6 +2048,11 @@ impl<'a> Sema<'a> {
         if q.len() != 2 {
             return None;
         }
+        // Report §11.1's entries have no interface and no signature: the entry's
+        // name says whether a call to it yields a value (row 31).
+        if matches!(self.lookup(&q[0]), Some(Sym::System)) {
+            return Some(SYSTEM_FUNCTIONS.contains(&q[1].as_str()));
+        }
         let idx = match self.lookup(&q[0]) {
             Some(Sym::Module(i)) => i,
             _ => return None,
@@ -2021,8 +2069,15 @@ impl<'a> Sema<'a> {
 
     /// A mutating predefined procedure must be handed a writable variable: the
     /// same rules as an assignment target apply (report §9.1, §9.8, §10.1).
+    /// `SYSTEM.GET` writes its second argument, so it is one of them, and it has
+    /// already typed that argument (row 58) — hence the split.
     fn note_mutation(&mut self, a: &Expr) {
         let v = self.expr(a);
+        self.note_mutation_of(a, &v);
+    }
+
+    /// The rule itself, over an argument that has been typed already.
+    fn note_mutation_of(&mut self, a: &Expr, v: &Typed) {
         let what = match &a.kind {
             ExprKind::Designator(d) => d.base.join("."),
             _ => "this expression".to_string(),
@@ -2136,6 +2191,180 @@ impl<'a> Sema<'a> {
         Typed::value(self.types.error())
     }
 
+    // ------------------------------------------------- report §11.1: SYSTEM
+
+    /// An entry the report lists as implementation-specific — or one no compiler
+    /// knows. It is refused *by name*, because the program said which one it
+    /// wanted (row 53; `SYSTEM.ADC is not implemented` rather than a silent
+    /// no-op or a plausible invention).
+    fn sys_unimplemented(&mut self, span: Span, name: &str) -> TypeId {
+        self.error_ty(
+            span,
+            format!("SYSTEM.{name} is not implemented (report 11.1)"),
+        )
+    }
+
+    /// An entry of report §11.1's `SYSTEM` written as a statement without its
+    /// argument list: a function's value must be used (row 31), a proper
+    /// procedure needs its actuals (row 30), and an entry the report lists as
+    /// implementation-specific is refused by name (row 53).
+    fn sys_bare(&mut self, span: Span, name: &str) {
+        if SYSTEM_FUNCTIONS.contains(&name) {
+            self.error(
+                span,
+                format!("`SYSTEM.{name}` is a function procedure: its value must be used (report 9)"),
+            );
+        } else if SYSTEM_PROPER.contains(&name) {
+            self.error(
+                span,
+                format!("`SYSTEM.{name}` needs an actual parameter list (report 9.2)"),
+            );
+        } else {
+            self.sys_unimplemented(span, name);
+        }
+    }
+
+    /// Report §11.1's `a` and `n` are INTEGER expressions: DESIGN §9.10's address
+    /// model puts a byte address in an INTEGER, and the word count of `COPY` is
+    /// one too.
+    fn sys_integer(&mut self, a: &Expr, entry: &str, which: usize) {
+        let v = self.expr(a);
+        if !self.types.is_integer_like(v.ty) && !self.types.is_error(v.ty) {
+            self.error(
+                a.span,
+                format!("argument {which} of SYSTEM.{entry} must be an INTEGER (report 11.1)"),
+            );
+        }
+    }
+
+    /// Report §11.1's `v: any basic type`: a record, an array or a pointer is
+    /// not one (row 57).
+    fn sys_basic(&mut self, a: &Expr, entry: &str, which: usize) -> Typed {
+        let v = self.expr(a);
+        if !self.types.is_basic(v.ty) && !self.types.is_error(v.ty) {
+            self.error(
+                a.span,
+                format!(
+                    "argument {which} of SYSTEM.{entry} must be of a basic type, but this is \
+                     {} (report 11.1)",
+                    self.describe(v.ty)
+                ),
+            );
+        }
+        v
+    }
+
+    /// A call to report §11.1's `SYSTEM`, decided by the *name* of the entry: the
+    /// entries are not ordinary procedures (`ADR`, `GET` and `PUT` take a
+    /// variable and `SIZE` takes a type), so there is no formal parameter list to
+    /// check an actual against — which is exactly why the call production reaches
+    /// here and the name decides (§5 D2's shape).
+    ///
+    /// Every rule below says what an entry *takes*; none of them is a run-time
+    /// check, and none of them consults `-Ochecks` — SYSTEM is the escape hatch
+    /// (row 60, DESIGN §9.10).
+    fn sys_call(&mut self, span: Span, name: &str, args: &[Expr]) -> Typed {
+        let arity = match name {
+            "ADR" | "SIZE" => 1,
+            "BIT" | "GET" | "PUT" => 2,
+            "COPY" => 3,
+            _ => return Typed::error(self.sys_unimplemented(span, name)),
+        };
+        if args.len() != arity {
+            // ✔ row 59: there is no formal parameter list to report row 25.
+            self.error(
+                span,
+                format!(
+                    "SYSTEM.{name} takes {arity} argument(s), but {} were given (report 11.1)",
+                    args.len()
+                ),
+            );
+            return Typed::error(self.types.error());
+        }
+        match name {
+            "ADR" => {
+                let v = self.expr(&args[0]);
+                // ✔ row 56: "x, a, and n stand for ... expressions" but `v` is a
+                // variable, and its *address* has to exist. A constant, a
+                // structured value parameter (which the report makes read-only
+                // *because* there is no variable behind it, report §10.1) and a
+                // procedure have none.
+                if !(v.lvalue || v.var_ok) {
+                    self.error(
+                        args[0].span,
+                        "the argument of SYSTEM.ADR must be a variable: its address does not \
+                         exist (report 11.1)",
+                    );
+                }
+                Typed::value(self.types.integer())
+            }
+            "SIZE" => {
+                // ✔ row 55: report §11.1 writes `SIZE(T)`, and the table's
+                // "Argument types: any type" says the argument is a *type name*
+                // and not an expression. The lookup is the silent one: `expr` on
+                // a type name would add "is a type, not a value" to a diagnostic
+                // that already names the mistake.
+                let ty = match &args[0].kind {
+                    ExprKind::Designator(d) if d.sels.is_empty() => {
+                        if d.base.len() == 2 {
+                            // A qualified type name is a use of its import (row
+                            // 54's warning half).
+                            self.used.push(d.base[0].clone());
+                        }
+                        self.type_of_qual_silent(&d.base, args[0].span)
+                    }
+                    _ => None,
+                };
+                match ty {
+                    Some(t) => {
+                        // The emitter lowers `SIZE(T)` to `sizeof` and needs the
+                        // type to do it: the argument's span is the key it reads.
+                        self.note_type(args[0].span, t);
+                        Typed::value(self.types.integer())
+                    }
+                    None => {
+                        let ty = self.error_ty(
+                            args[0].span,
+                            "the argument of SYSTEM.SIZE must be a type name, not an expression \
+                             (report 11.1)",
+                        );
+                        Typed::error(ty)
+                    }
+                }
+            }
+            "BIT" => {
+                self.sys_integer(&args[0], "BIT", 1);
+                self.sys_integer(&args[1], "BIT", 2);
+                Typed::value(self.types.boolean())
+            }
+            "GET" => {
+                self.sys_integer(&args[0], "GET", 1);
+                // `GET(a, v)` writes `v`, so the rule for a mutating predefined
+                // procedure applies verbatim: it must be a writable variable
+                // (row 58, with row 6's reasons - a constant, an imported
+                // variable, a structured value parameter, a `FOR` control
+                // variable).
+                let v = self.sys_basic(&args[1], "GET", 2);
+                self.note_mutation_of(&args[1], &v);
+                Typed::value(self.types.error())
+            }
+            "PUT" => {
+                self.sys_integer(&args[0], "PUT", 1);
+                // ✔ row 57: "x: any basic type" - and a *value*, since PUT writes
+                // the memory the address points at, not x.
+                self.sys_basic(&args[1], "PUT", 2);
+                Typed::value(self.types.error())
+            }
+            "COPY" => {
+                for (k, a) in args.iter().enumerate() {
+                    self.sys_integer(a, "COPY", k + 1);
+                }
+                Typed::value(self.types.error())
+            }
+            _ => Typed::error(self.sys_unimplemented(span, name)),
+        }
+    }
+
     // ----------------------------------------------------------- statements
 
     fn stmt(&mut self, s: &Stmt) {
@@ -2237,6 +2466,11 @@ impl<'a> Sema<'a> {
                                 );
                             }
                         }
+                        // ✔ rows 31 and 30 for report §11.1's entries: a
+                        // function's value must be used, a proper procedure needs
+                        // its argument list, and an entry the report lists as
+                        // implementation-specific is refused by name (row 53).
+                        Some(Sym::Sys(n)) => self.sys_bare(d.span, &n),
                         Some(_) => {
                             let name = d.base.join(".");
                             self.error(d.span, format!("`{name}` is not a procedure (report 9.2)"));
@@ -2611,6 +2845,12 @@ const PREDEFINED_FUNCTIONS: &[&str] = &[
 const PREDEFINED_PROPER: &[&str] = &[
     "INC", "DEC", "INCL", "EXCL", "NEW", "ASSERT", "PACK", "UNPK",
 ];
+
+/// Report §11.1's function procedures. A call to one is a value, so using it as
+/// a statement is row 31's defect, and its result is what the emitter lowers.
+const SYSTEM_FUNCTIONS: &[&str] = &["ADR", "SIZE", "BIT"];
+/// Report §11.1's proper procedures, the ones that write memory.
+const SYSTEM_PROPER: &[&str] = &["GET", "PUT", "COPY"];
 
 /// Parse a type as an interface file renders it, using the module grammar.
 fn rendered_type(text: &str) -> Option<TypeExpr> {

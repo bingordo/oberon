@@ -507,6 +507,122 @@ BEGIN
 END R16.
 '
 
+# 10. report §11.1's SYSTEM (PLAN.md W4.1): the six entries of the table in one
+#     program whose every step is an assertion (Sys.mod), the import that resolves
+#     to a builtin, the entries the report lists as implementation-specific
+#     refused *by name*, and the promise that `-Ochecks` has nothing to do here.
+if "$OBC" build Sys.mod -I . --out "$DRV" -o "$DRV/sys" 2>"$DRV/sys.log"; then
+    echo "PASS system-entries-compile"
+    pass=$((pass + 1))
+else
+    echo "FAIL system-entries-compile:"
+    sed -n '1,20p' "$DRV/sys.log"
+    fail=$((fail + 1))
+fi
+status=0
+"$DRV/sys" || status=$?
+check "system-entries-run[ADR, SIZE, BIT, GET, PUT, COPY]" "0" "$status"
+# The import is in the interface, so a client can see that this module is not
+# portable (PLAN.md W4.1 step 4) -- and SYSTEM has no `.h` to include.
+check "system-import-is-recorded-in-the-interface" "IMPORT SYSTEM" "$(sed -n 3p "$DRV/Sys.sym")"
+check "system-has-no-header-to-include" "0" "$(grep -c 'SYSTEM\.h' "$DRV/Sys.h")"
+
+# The module is *the compiler's*: a `SYSTEM.mod`/`SYSTEM.sym` on the search path
+# is never read, compiled or linked, so a broken pair there cannot reach a build
+# (a user supply would be a different language, and a program that names SYSTEM
+# in its import list must get the report's entries).
+mkdir -p "$DRV/shadow"
+printf 'MODULE SYSTEM; VAR this: INTEGER; BEGIN this := ;\n' > "$DRV/shadow/SYSTEM.mod"
+printf 'MODULE SYSTEM\nTYPE Garbage = RECORD x: INTEGER\n' > "$DRV/shadow/SYSTEM.sym"
+if "$OBC" build Sys.mod -I . -I "$DRV/shadow" --out "$DRV/shadowout" -o "$DRV/shadow-sys" \
+        >"$DRV/shadow.log" 2>&1; then
+    echo "PASS system-on-the-search-path-is-shadowed"
+    pass=$((pass + 1))
+else
+    echo "FAIL system-on-the-search-path-is-shadowed:"
+    sed -n '1,10p' "$DRV/shadow.log"
+    fail=$((fail + 1))
+fi
+check "shadowed-system-is-not-compiled" "0" "$(ls "$DRV/shadowout"/SYSTEM.* 2>/dev/null | wc -l)"
+status=0
+"$DRV/shadow-sys" || status=$?
+check "shadowed-build-still-runs" "0" "$status"
+
+# SYSTEM is the escape hatch, so `-Ochecks=n` must not add *or remove* anything:
+# a module whose memory accesses are all SYSTEM's emits byte-identical C either
+# way, and carries no runtime check to begin with.
+cat > "$DRV/SysChk.mod" <<'MODEOF'
+MODULE SysChk;
+  IMPORT SYSTEM;
+  TYPE R = RECORD a: INTEGER END;
+  VAR v, got: INTEGER; ch: CHAR; r: REAL; f: BOOLEAN; src, dst: ARRAY 4 OF INTEGER;
+BEGIN
+  SYSTEM.PUT(SYSTEM.ADR(v), 1);
+  SYSTEM.GET(SYSTEM.ADR(v), got);
+  f := SYSTEM.BIT(SYSTEM.ADR(got), 0);
+  v := SYSTEM.ADR(v) + SYSTEM.SIZE(R) + SYSTEM.SIZE(INTEGER) + SYSTEM.SIZE(CHAR);
+  SYSTEM.COPY(SYSTEM.ADR(src), SYSTEM.ADR(dst), 4);
+  SYSTEM.PUT(SYSTEM.ADR(ch), ch);
+  SYSTEM.GET(SYSTEM.ADR(ch), ch);
+  SYSTEM.PUT(SYSTEM.ADR(r), r)
+END SysChk.
+MODEOF
+if "$OBC" emit "$DRV/SysChk.mod" --out "$DRV/chk-on" >/dev/null 2>&1 &&
+   "$OBC" emit "$DRV/SysChk.mod" --out "$DRV/chk-off" -Ochecks=n >/dev/null 2>&1; then
+    same=0
+    cmp -s "$DRV/chk-on/SysChk.c" "$DRV/chk-off/SysChk.c" || same=1
+    check "system-emits-the-same-c-under--Ochecks=n" "0" "$same"
+    check "system-emits-no-runtime-check" "0" \
+        "$(grep -c 'rt_index\|rt_nil\|rt_guard_is' "$DRV/chk-on/SysChk.c")"
+else
+    echo "FAIL system-checks-flag: the module did not emit either way"
+    fail=$((fail + 1))
+fi
+
+# Every refusal is located, and the extras are refused by the name the program
+# used (`SYSTEM.ADC is not implemented`, not a silent no-op).
+cat > "$DRV/SysBad.mod" <<'MODEOF'
+MODULE SysBad;
+  IMPORT SYSTEM;
+  CONST K = 7;
+  TYPE R = RECORD a: INTEGER END;
+  VAR i: INTEGER; r: R; a: ARRAY 4 OF INTEGER;
+BEGIN
+  SYSTEM.ADC(i, i);
+  SYSTEM.VAL(INTEGER, i);
+  SYSTEM.LED(3);
+  SYSTEM.GET(i, r);
+  SYSTEM.PUT(i, a);
+  i := SYSTEM.SIZE(i);
+  i := SYSTEM.ADR(1);
+  SYSTEM.GET(i, K);
+  SYSTEM.COPY(i, i)
+END SysBad.
+MODEOF
+"$OBC" check "$DRV/SysBad.mod" -I . >"$DRV/sysbad.out" 2>&1 || true
+for refused in ADC VAL LED; do
+    check "system-$refused-is-refused-by-name" "1" \
+        "$(grep -c "SYSTEM.$refused is not implemented" "$DRV/sysbad.out")"
+done
+check "system-get-needs-a-basic-variable" "1" \
+    "$(grep -c 'argument 2 of SYSTEM.GET must be of a basic type' "$DRV/sysbad.out")"
+check "system-put-needs-a-basic-value" "1" \
+    "$(grep -c 'argument 2 of SYSTEM.PUT must be of a basic type' "$DRV/sysbad.out")"
+check "system-size-needs-a-type-name" "1" \
+    "$(grep -c 'the argument of SYSTEM.SIZE must be a type name' "$DRV/sysbad.out")"
+check "system-adr-needs-an-address" "1" \
+    "$(grep -c 'the argument of SYSTEM.ADR must be a variable' "$DRV/sysbad.out")"
+check "system-get-target-must-be-writable" "1" \
+    "$(grep -c '`K` is a constant, which is read-only' "$DRV/sysbad.out")"
+check "system-arity-is-checked" "1" \
+    "$(grep -c 'SYSTEM.COPY takes 3 argument(s), but 2 were given' "$DRV/sysbad.out")"
+# `SYSTEM` is a module, so it has to be imported like one (row 3's second shape).
+printf 'MODULE SysNoImp;\n  VAR i: INTEGER;\nBEGIN\n  i := SYSTEM.ADR(i)\nEND SysNoImp.\n' \
+    > "$DRV/SysNoImp.mod"
+"$OBC" check "$DRV/SysNoImp.mod" -I . >"$DRV/sysnoimp.out" 2>&1 || true
+check "system-must-be-imported" "1" \
+    "$(grep -c '`SYSTEM` is not declared' "$DRV/sysnoimp.out")"
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

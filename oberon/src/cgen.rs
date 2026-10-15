@@ -42,6 +42,13 @@ const PREDEFINED_PROPER: &[&str] = &["INC", "DEC", "INCL", "EXCL", "NEW", "ASSER
 const PREDEFINED_FUNCTIONS: &[&str] =
     &["ABS", "ODD", "LEN", "LSL", "ASR", "ROR", "FLOOR", "FLT", "ORD", "CHR"];
 
+/// Report §11.1's entries, split the only way the emitter needs: a call to one of
+/// the functions is a *value* and a call to one of the proper procedures is a
+/// *statement*. Neither is called through a signature — see `sys_function` and
+/// `sys_proper`.
+const SYSTEM_FUNCTIONS: &[&str] = &["ADR", "SIZE", "BIT"];
+const SYSTEM_PROPER: &[&str] = &["GET", "PUT", "COPY"];
+
 /// What an identifier means at emission time.
 #[derive(Clone)]
 struct Sym {
@@ -289,8 +296,13 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(h, "#define {guard}");
         h.push_str("#include \"oberon.h\"\n");
         // The modules this one imports, so their types and prototypes are
-        // visible to whoever includes this header (DESIGN §9.8).
+        // visible to whoever includes this header (DESIGN §9.8). SYSTEM has no
+        // header: it is the compiler's own module (§9.10), and the import list of
+        // the emitted `.sym` is what records that a client depended on it.
         for imp in &module.imports {
+            if imp.module == "SYSTEM" {
+                continue;
+            }
             let _ = writeln!(h, "#include \"{}.h\"", imp.module);
         }
         h.push_str(&self.typedefs);
@@ -1321,7 +1333,11 @@ impl<'a> Emitter<'a> {
                     || (self.types.is_char_array(rt) && !self.types.is_char_like(rt)))
         };
         let mut a = self.expr(l, want);
-        if sequenced && !array_of_operands && !self.is_aggregate(lt) {
+        // An `ADR` operand has no side effect and is as wide as the host's
+        // pointers (R31), so it is neither sequenced nor narrowed: a temporary of
+        // its Oberon type would cut the address in half, and the comparison below
+        // would then compare two truncations.
+        if sequenced && !self.is_address(l) && !array_of_operands && !self.is_aggregate(lt) {
             a = self.materialise(want.unwrap_or(lt), &a);
         }
         let mut b = if matches!(op, BinOp::And | BinOp::Or) {
@@ -1332,7 +1348,7 @@ impl<'a> Emitter<'a> {
         } else {
             self.expr(r, want)
         };
-        if sequenced && !array_of_operands && !self.is_aggregate(rt) {
+        if sequenced && !self.is_address(r) && !array_of_operands && !self.is_aggregate(rt) {
             b = self.materialise(want.unwrap_or(rt), &b);
         }
         // Two single characters compare as ordinals: a C `char` may be signed,
@@ -1917,6 +1933,12 @@ impl<'a> Emitter<'a> {
     /// A call used as a statement.
     fn call(&mut self, d: &ast::Designator, level: usize, out: &mut String) {
         let name = d.base[0].clone();
+        if let Some(entry) = self.system_entry(&d.base) {
+            if SYSTEM_PROPER.contains(&entry) {
+                self.sys_proper(entry, d, level, out);
+                return;
+            }
+        }
         if self.lookup(&name).is_none() && PREDEFINED_PROPER.contains(&name.as_str()) {
             self.predef_proper(&name, d, level, out);
             return;
@@ -1933,6 +1955,11 @@ impl<'a> Emitter<'a> {
             Some(Selector::Call(a)) => a.clone(),
             _ => Vec::new(),
         };
+        if let Some(entry) = self.system_entry(&d.base) {
+            if SYSTEM_FUNCTIONS.contains(&entry) {
+                return self.sys_function(entry, &args, level);
+            }
+        }
         if self.lookup(&name).is_none() && PREDEFINED_FUNCTIONS.contains(&name.as_str()) {
             return self.predef_function(&name, &args, level);
         }
@@ -2305,6 +2332,190 @@ impl<'a> Emitter<'a> {
                 }
             }
             _ => "0".into(),
+        }
+    }
+
+    // ------------------------------------------------- report §11.1: SYSTEM
+
+    /// The `SYSTEM.<entry>` a designator names, if it names one. The import
+    /// *alias* is what makes it an entry, so `IMPORT S := SYSTEM` works too, and
+    /// the alias cannot be anything else: `IMPORT SYSTEM` is resolved before any
+    /// interface is looked for (DESIGN §9.10).
+    fn system_entry<'b>(&self, base: &'b [String]) -> Option<&'b str> {
+        if base.len() != 2 {
+            return None;
+        }
+        match self.module_of_alias(&base[0]) {
+            Some(m) if m == "SYSTEM" => Some(&base[1]),
+            _ => None,
+        }
+    }
+
+    /// The mask a word is narrowed to when the type is *narrower* than a word: a
+    /// `CHAR` is one byte in this back end's model (§9.2), and every other basic
+    /// type `GET`/`PUT` accept fills the whole word, which is what report §11.1's
+    /// `mem[a]` holds.
+    fn word_mask(&self, t: TypeId) -> Option<&'static str> {
+        if self.types.is_char(t) {
+            Some("0xFFu")
+        } else {
+            None
+        }
+    }
+
+    /// `SYSTEM.GET(a, v)`: one word read through the byte address `a`, narrowed to
+    /// `v`'s own type. A `REAL` is one word too, so the read *is* its bit pattern —
+    /// an integer read converted to `float` would be `FLT`'s rule, not this one.
+    fn sys_load(&self, addr: &str, t: TypeId) -> String {
+        if matches!(self.types.get(t), Type::Basic(Basic::Real)) {
+            return format!("(*(const float *)(uintptr_t)({addr}))");
+        }
+        match self.word_mask(t) {
+            Some(m) => format!(
+                "(({})((*(const uint32_t *)(uintptr_t)({addr})) & {m}))",
+                self.c_type(t)
+            ),
+            None => format!(
+                "(({})(*(const uint32_t *)(uintptr_t)({addr})))",
+                self.c_type(t)
+            ),
+        }
+    }
+
+    /// `SYSTEM.PUT(a, x)`: the word `x` occupies, stored through the byte address.
+    /// The width is *x's*, since PUT has no variable of its own to take one from —
+    /// a `CHAR` contributes its low byte and leaves the rest of the word zeroed, a
+    /// `REAL` is one word whose bit pattern *is* the word, and an integer fills it.
+    fn sys_store(&self, addr: &str, t: TypeId, value: &str) -> String {
+        if matches!(self.types.get(t), Type::Basic(Basic::Real)) {
+            return format!("(*(float *)(uintptr_t)({addr}) = ({value}))");
+        }
+        match self.word_mask(t) {
+            Some(m) => format!(
+                "(*(uint32_t *)(uintptr_t)({addr}) = ((uint32_t)({value}) & {m}))"
+            ),
+            None => format!("(*(uint32_t *)(uintptr_t)({addr}) = (uint32_t)({value}))"),
+        }
+    }
+
+    /// Whether `e` is a `SYSTEM.ADR` call. Its C value is the host's address width
+    /// (R31) — the one expression whose C type is not its Oberon type — and it has
+    /// no side effect, so it is neither narrowed into a temporary of its Oberon
+    /// type (`INTEGER`) nor in need of sequencing.
+    fn is_address(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Designator(d) => matches!(self.system_entry(&d.base), Some("ADR")),
+            _ => false,
+        }
+    }
+
+    /// One operand of a SYSTEM entry, fixed in a temporary when any operand of the
+    /// call can have a side effect: Oberon evaluates them left to right while C
+    /// leaves their order unspecified, which is the same reason a call's actuals
+    /// are sequenced (R23). `seq` is the caller's answer for the whole call, so
+    /// the temporaries are initialised in source order.
+    fn sys_operand(&mut self, e: &Expr, seq: bool, want: Option<TypeId>) -> String {
+        let text = self.expr(e, want);
+        match (seq, self.sema.type_at(e.span, self.types)) {
+            (true, Some(t)) if !self.is_address(e) => self.materialise(t, &text),
+            _ => text,
+        }
+    }
+
+    /// `SYSTEM.GET`, `SYSTEM.PUT` and `SYSTEM.COPY`: proper procedures, lowered
+    /// here and in place (DESIGN §9.10). None of them consults `self.checks`:
+    /// `-Ochecks=n` must not add *or remove* anything for SYSTEM, which is the
+    /// escape hatch the checks exist to be escaped by.
+    fn sys_proper(&mut self, entry: &str, d: &ast::Designator, level: usize, out: &mut String) {
+        let args = match d.sels.last() {
+            Some(Selector::Call(a)) => a.clone(),
+            // Unreachable: the checker reports rows 59 and 30 first.
+            _ => Vec::new(),
+        };
+        let seq = args.iter().any(|a| self.has_call(a));
+        let text = match entry {
+            "GET" | "PUT" => {
+                let addr = self.sys_operand(&args[0], seq, Some(self.types.integer()));
+                // The width is the typed operand's, and which one that is follows
+                // from the report's own signatures: `GET(a, v)` names the variable
+                // it writes, `PUT(a, x)` names only the value it stores, so there
+                // is no other type in sight (DESIGN §9.10).
+                let t = self.sema.type_at(args[1].span, self.types).unwrap_or(TypeId(0));
+                if entry == "GET" {
+                    let place = self.designator_of_mut(&args[1], level);
+                    format!("{place} = {};", self.sys_load(&addr, t))
+                } else {
+                    let value = self.sys_operand(&args[1], seq, None);
+                    format!("{};", self.sys_store(&addr, t, &value))
+                }
+            }
+            "COPY" => {
+                // report §11.1's `mem` is an array of *words*, so `n` counts
+                // words and the byte count is `n * 4` (DESIGN §9.10). No bounds
+                // check, and no overlap promise: `memcpy` is what "copy n
+                // consecutive words" means here.
+                let src = self.sys_operand(&args[0], seq, None);
+                let dst = self.sys_operand(&args[1], seq, None);
+                let n = self.sys_operand(&args[2], seq, None);
+                format!(
+                    "memcpy((void *)(uintptr_t)({dst}), (const void *)(uintptr_t)({src}), \
+                     (size_t)({n}) * 4u);"
+                )
+            }
+            _ => {
+                // Filtered by `SYSTEM_PROPER` at the call site.
+                self.unresolved += 1;
+                String::new()
+            }
+        };
+        let pre = self.take_prelude();
+        out.push_str(&pre);
+        let _ = writeln!(out, "    {text}");
+    }
+
+    /// `SYSTEM.ADR`, `SYSTEM.SIZE` and `SYSTEM.BIT`: function procedures, lowered
+    /// here and in place — the `ob_sys_` name space stays reserved for the runtime
+    /// (DESIGN §9.10).
+    fn sys_function(&mut self, entry: &str, args: &[Expr], level: usize) -> String {
+        match entry {
+            // The address of the variable itself, in §9.10's byte address model.
+            // `intptr_t` and not the report's `INTEGER`: an `int32_t` cannot carry
+            // a stack or `mmap`ed address on a 64-bit host, and putting one
+            // through the round trip `(uint32_t *)(uintptr_t)a` would dereference
+            // a sign-extended truncation of it (R31; the expression is as wide as
+            // the host's addresses, and an *INTEGER* the program stores it in
+            // narrows it, which is the report's own 32-bit model).
+            "ADR" => {
+                let place = self.designator_of_mut(&args[0], level);
+                format!("((intptr_t)(uintptr_t)&({place}))")
+            }
+            // `SIZE(T)` is the byte size the *layout* gives, which is the extent
+            // `NEW` hands `rt_new` and the one the record descriptor is built
+            // from: `sizeof`, folded by the C compiler (DESIGN §9.10).
+            "SIZE" => match self.sema.type_at(args[0].span, self.types) {
+                Some(t) => format!("((int32_t)sizeof({}))", self.c_type(t)),
+                None => {
+                    // Unreachable: the checker types the argument (row 55).
+                    self.unresolved += 1;
+                    "0".into()
+                }
+            },
+            // Bit `n` of the word at `a`. The count is masked into 0..31 the way
+            // the runtime's shifts are (R22): outside that range the report says
+            // nothing, and an unmasked shift would be undefined C.
+            "BIT" => {
+                let seq = args.iter().any(|a| self.has_call(a));
+                let a = self.sys_operand(&args[0], seq, Some(self.types.integer()));
+                let n = self.sys_operand(&args[1], seq, Some(self.types.integer()));
+                format!(
+                    "(((*(const uint32_t *)(uintptr_t)({a}) >> ((uint32_t)({n}) & 31u)) & 1u) != 0)"
+                )
+            }
+            _ => {
+                // Filtered by `SYSTEM_FUNCTIONS` at the call site.
+                self.unresolved += 1;
+                String::new()
+            }
         }
     }
 

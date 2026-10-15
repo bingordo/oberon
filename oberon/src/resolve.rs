@@ -14,7 +14,9 @@
 //! * A paren group is a guard iff (a) it is followed by at least one more
 //!   selector, or (b) it holds exactly one bare designator that denotes a type.
 //!   Types and variables share one namespace in Oberon (report §4), so an
-//!   identifier that denotes a type can never be the value argument of a call.
+//!   identifier that denotes a type can never be the value argument of a call —
+//!   with one exception, `SYSTEM.SIZE(T)`, whose single argument *is* a type
+//!   name by definition (report §11.1), so rule (b) is suppressed for that call.
 //! * The leading selector is a module qualifier iff the base identifier is a
 //!   name bound by the module's import list.
 //!
@@ -43,6 +45,11 @@ enum Kind {
 #[derive(Debug, Default)]
 pub struct Names {
     scopes: Vec<HashMap<String, Kind>>,
+    /// The import aliases bound to report §11.1's builtin module `SYSTEM`.
+    /// Every import is a `Kind::Module`, so the one paren group that must *not*
+    /// follow rule (b) — `SYSTEM.SIZE(T)` — needs this extra set, and it is
+    /// consulted through `lookup` so an inner declaration still shadows it (R17).
+    system: Vec<String>,
 }
 
 impl Names {
@@ -80,6 +87,9 @@ impl Names {
         }
         for imp in &m.imports {
             scope.insert(imp.alias.clone(), Kind::Module);
+            if imp.module == "SYSTEM" {
+                n.system.push(imp.alias.clone());
+            }
         }
         decl_bindings(&m.decls, &mut scope);
         n.push(scope);
@@ -91,6 +101,11 @@ impl Names {
     }
     fn is_module(&self, name: &str) -> bool {
         self.lookup(name) == Some(Kind::Module)
+    }
+    /// Whether `name` is an alias the import list bound to `SYSTEM` (report
+    /// §11.1) *and* is still the module in the scope the designator sits in.
+    fn is_system(&self, name: &str) -> bool {
+        self.is_module(name) && self.system.iter().any(|s| s == name)
     }
 }
 
@@ -346,13 +361,21 @@ fn reclassify_designator(d: &mut Designator, names: &mut Names) -> Result<(), Re
     for i in 0..d.sels.len() {
         let taken = std::mem::replace(&mut d.sels[i], Selector::Deref);
         d.sels[i] = match taken {
-            Selector::Args(args) => match args.as_ref().and_then(|a| single_type_name(a, names)) {
-                // `t(T)` is a guard whether or not more selectors follow: a
-                // procedure call can never take a *type* as its only argument,
-                // because types and variables share one namespace (report 4).
-                Some(q) => Selector::Guard(q),
-                None => Selector::Call(args.unwrap_or_default()),
-            },
+            Selector::Args(args) => {
+                // `SYSTEM.SIZE(T)` is the one call whose single argument is a
+                // type name (report §11.1: `SIZE(T)` takes "any type"), so rule
+                // (b) must not swallow it: this paren group stays a call.
+                let sized = matches!(d.base.as_slice(), [alias, entry]
+                    if entry == "SIZE" && names.is_system(alias));
+                match args.as_ref().and_then(|a| single_type_name(a, names)) {
+                    // `t(T)` is a guard whether or not more selectors follow: a
+                    // procedure call can never take a *type* as its only
+                    // argument, because types and variables share one namespace
+                    // (report 4).
+                    Some(q) if !sized => Selector::Guard(q),
+                    _ => Selector::Call(args.unwrap_or_default()),
+                }
+            }
             other => other,
         };
     }
