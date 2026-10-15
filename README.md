@@ -35,8 +35,8 @@ Every change keeps these green (PLAN.md's preamble is the same list):
 cargo test --manifest-path oberon/Cargo.toml
 bash oberon/golden/run.sh      # 67 cases, plain and under ASan/UBSan
 bash oberon/csmoke/run.sh      # 67 C-level cases
-bash oberon/e2e/run.sh         # 101 checks, end to end through the driver
-bash oberon/fuzz/run.sh        # the regression list in four modes, then coverage
+bash oberon/e2e/run.sh         # 126 checks, end to end through the driver
+bash oberon/fuzz/run.sh        # 86 generated programs in seven blocks, on either back end
 cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings
 ```
 
@@ -48,8 +48,9 @@ oracle, against the collector with a collection forced on every allocation, and 
 the `-Odialect=lower` dialect; then a coverage block and an adversarial one, where
 each program ends in a deliberate violation and the run must produce the exact trap
 line, source byte included. `SEEDS`/`BASE`/`COVER`/`ADVCOVER`/`SAN` select other runs,
-and `BACKEND=clif` runs the corpus against the Cranelift back end instead of the C
-one. A seed reproduces a random program exactly, together with the values it must
+and `BACKEND=clif` runs the corpus, and the `e2e` suite, against the Cranelift back end
+instead of the C one; `OB_GC_LIMIT`/`OB_GC_STRESS` exercise the collector with a
+bounded heap or on every allocation. A seed reproduces a random program exactly, together with the values it must
 compute, so the list is a regression suite rather than a memory of one.
 
 ## Using it
