@@ -27,6 +27,7 @@ OUT=$(mktemp -d)
 DRV=$(mktemp -d)
 trap 'rm -rf "$OUT" "$DRV"' EXIT
 
+
 # 1. Interface files are part of the build: the compiler writes them and reads
 #    them back for the importing module.
 cp Texts.sym Oberon.sym Texts.h Texts.c Oberon.h Oberon.c "$OUT"/
@@ -85,6 +86,19 @@ check "hello-world-runs" "$(cat hello.expected.txt)" "$(cat "$OUT/hello.got")"
 # 6. The driver: source in, runnable program out, with the import graph
 #    resolved and the C compiler invoked for us.
 OBC=${OBC:-../target/debug/obc}
+# BACKEND=clif runs every check through the Cranelift back end instead of the C one
+# (PLAN.md W9.1/W9.2). The driver takes `--backend` after the subcommand and the
+# module, so a one-line wrapper is enough to re-point all hundred-odd call sites
+# below rather than edit each of them into a build of its own.
+if [ -n "${BACKEND:-}" ] && [ "$BACKEND" != c ]; then
+    real_obc=$(cd "$(dirname -- "$OBC")" && pwd)/$(basename -- "$OBC")
+    cat > "$DRV/obc-backend" <<WRAPPER
+#!/bin/sh
+exec "$real_obc" "\$@" --backend=$BACKEND
+WRAPPER
+    chmod +x "$DRV/obc-backend"
+    OBC="$DRV/obc-backend"
+fi
 
 if "$OBC" build Hello.mod -I . --out "$DRV" -o "$DRV/hello" 2>"$DRV/build.log"; then
     echo "PASS driver-builds-a-program"
