@@ -189,7 +189,7 @@ and the failing record-spelling write compiles and traps with the guard's offset
 under both compilers (`trap-guard-record-spelling-as-target` for gcc, and the same
 program built with `--cc clang`). The pointer spelling was already tested.
 
-**W2.4 a pointer array cannot see a record declared later in the module** — **open**
+**W2.4 a pointer array cannot see a record declared later in the module** — **done**
 
 **Found while building the collector** (W10.2), and *not* caused by it: the same
 output comes from the compiler at HEAD. A legal Oberon-07 program does not build:
@@ -226,7 +226,15 @@ header but `Def__Node` in the interface, so the header and the `.sym` disagree.
 Done when: a pointer array of a same-module record compiles and runs, the
 cross-module pair's header and interface agree on the name, and both are pinned —
 `e2e`'s pointer-array row currently borrows its pointee from another module, which
-is exactly what this hides.
+is exactly what this hides. **Done**, by the two changes the causes called for: the
+module's *declared* type names are collected before any type is visited, so a
+composite reached through a pointer keeps its own name instead of an anonymous one;
+and every named composite gets a forward `typedef struct X X;` before all the
+definitions, so `type_rank`'s ordering no longer matters for a pointer use (the
+definition repeats the same typedef, which C11 allows and `-Wall -Wextra` accepts).
+Rows: `pointer-array-of-a-later-record` (compiles and runs), the cross-module pair
+(`pointer-to-a-record-in-another-module`), and `neither-side-names-the-pointee-anonymously`,
+which asserts the bug's own signature: no `Anon` name survives on either side.
 
 **W2.3 R16: a structured value argument inside a short-circuit operand is copied eagerly** — **done**
 Why: a record argument inside `AND`/`OR` whose own index expressions contain

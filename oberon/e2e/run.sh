@@ -859,6 +859,49 @@ printf 'MODULE Lost;\nBEGIN\n  EXIT\nEND Lost.\n' > "$DRV/Lost.mod"
 "$OBC" check "$DRV/Lost.mod" >"$DRV/lost.out" 2>&1 || true
 check "exit-outside-a-loop-is-refused" "1" "$(grep -c 'only allowed inside a loop' "$DRV/lost.out")"
 
+# A pointer array of a record declared later in the same module, and the same pair
+# across a module boundary: both used to fail, the first on the emitted C and the
+# second by naming the pointee differently in the header and the interface (R32,
+# PLAN.md W2.4).
+runs_case pointer-array-of-a-later-record 'MODULE Later;
+  TYPE P = POINTER TO R; R = RECORD x: INTEGER END;
+  VAR a: ARRAY 2 OF P; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  NEW(a[0]); a[0].x := 1; NEW(a[1]); a[1].x := 2;
+  IF a[0].x + a[1].x # 3 THEN ok[1] := 0 END
+END Later.
+'
+cat > "$DRV/Def.mod" <<'MODEOF'
+MODULE Def;
+  TYPE P* = POINTER TO Node; Node* = RECORD k*: INTEGER END;
+  PROCEDURE Get*(VAR p: P);
+  BEGIN NEW(p); p.k := 5 END Get;
+END Def.
+MODEOF
+cat > "$DRV/UseDef.mod" <<'MODEOF'
+MODULE UseDef;
+  IMPORT Def;
+  VAR p: Def.P; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  Def.Get(p);
+  IF p.k # 5 THEN ok[1] := 0 END
+END UseDef.
+MODEOF
+if "$OBC" build "$DRV/UseDef.mod" -I "$DRV" --out "$DRV" -o "$DRV/usedef" >/dev/null 2>&1; then
+    status=0
+    "$DRV/usedef" || status=$?
+    check "pointer-to-a-record-in-another-module" "0" "$status"
+    # The bug's signature is a name one side does not know: the header said
+    # `Def__Anon_1` while the interface said `Node`, so neither may appear.
+    check "neither-side-names-the-pointee-anonymously" "0" \
+        "$(cat "$DRV/Def.h" "$DRV/Def.sym" | grep -c 'Anon')"
+    check "the-pointee-keeps-its-name-on-both-sides" "1" \
+        "$(grep -c 'Def__Node' "$DRV/Def.h" | grep -c '^[1-9]')"
+else
+    echo "FAIL pointer-to-a-record-in-another-module: did not build"
+    fail=$((fail + 1))
+fi
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

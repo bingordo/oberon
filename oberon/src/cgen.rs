@@ -98,6 +98,13 @@ pub struct Emitter<'a> {
     unresolved: usize,
     /// Import alias -> the module it stands for.
     aliases: HashMap<String, String>,
+    /// The name each *declared* type will be given, filled before any type is
+    /// visited. A composite reached through a pointer — `ARRAY 2 OF P` where
+    /// `P = POINTER TO R` and `R` comes later in the same `TYPE` section — would
+    /// otherwise be met before its declaration and named `Anon_n`, so the
+    /// emitter would use one name and every other use another (DESIGN R32,
+    /// PLAN.md W2.4).
+    declared_names: HashMap<TypeId, String>,
     /// Emitted into the header: struct definitions, constants, externs.
     typedefs: String,
     header: String,
@@ -200,6 +207,7 @@ impl<'a> Emitter<'a> {
             oberon_names: HashMap::new(),
             unresolved: 0,
             aliases: HashMap::new(),
+            declared_names: HashMap::new(),
             typedefs: String::new(),
             header: String::new(),
             descriptors: String::new(),
@@ -224,8 +232,25 @@ impl<'a> Emitter<'a> {
         }
         // 1. Every composite type the module mentions, named, then emitted in
         //    dependency order (element before array, base before derived).
+        //    The declared names go in *first*, so a type reached through a
+        //    pointer before its declaration still gets its own name.
+        for t in &module.decls.types {
+            let ty = self.decl_type(&t.ty);
+            self.declared_names.insert(ty, self.cname(&t.name));
+        }
         let mut wanted = Vec::new();
         self.collect_types(&module.decls, &mut wanted);
+        // Every named composite gets its forward declaration before any of them
+        // is defined: an array of pointers can then name a record declared later
+        // in the module, which is what `type_rank`'s ordering alone cannot give
+        // (a pointer imposes no order, so the array is emitted first). The
+        // definition repeats the same typedef, which C11 allows.
+        for t in self.type_names.keys().copied().collect::<Vec<_>>() {
+            if matches!(self.types.get(t), Type::Array { .. } | Type::Record { .. }) {
+                let name = self.type_names[&t].clone();
+                let _ = writeln!(self.typedefs, "typedef struct {name} {name};");
+            }
+        }
         let mut all: Vec<TypeId> = self.type_names.keys().copied().collect();
         all.sort_by_key(|t| self.type_rank(*t));
         for t in all {
@@ -456,7 +481,10 @@ impl<'a> Emitter<'a> {
         match self.types.get(t).clone() {
             Type::Array { elem, .. } => {
                 let name = if declared.is_empty() {
-                    format!("{}__Arr_{}", self.module, t.0)
+                    match self.declared_names.get(&t) {
+                        Some(n) => n.clone(),
+                        None => format!("{}__Arr_{}", self.module, t.0),
+                    }
                 } else {
                     declared.to_string()
                 };
@@ -470,8 +498,13 @@ impl<'a> Emitter<'a> {
             }
             Type::Record { base, fields, .. } => {
                 let name = if declared.is_empty() {
-                    self.anon += 1;
-                    format!("{}__Anon_{}", self.module, self.anon)
+                    match self.declared_names.get(&t) {
+                        Some(n) => n.clone(),
+                        None => {
+                            self.anon += 1;
+                            format!("{}__Anon_{}", self.module, self.anon)
+                        }
+                    }
                 } else {
                     declared.to_string()
                 };
@@ -488,7 +521,14 @@ impl<'a> Emitter<'a> {
                 }
             }
             Type::Pointer { base } => {
-                let bname = self.type_c_name(base).unwrap_or_default();
+                // The pointee may not be named yet — that is exactly the case this
+                // map exists for — so its *declared* name comes first.
+                let bname = self
+                    .declared_names
+                    .get(&base)
+                    .cloned()
+                    .or_else(|| self.type_c_name(base))
+                    .unwrap_or_default();
                 self.name_type(base, &bname);
             }
             Type::Proc { params, result } => {
