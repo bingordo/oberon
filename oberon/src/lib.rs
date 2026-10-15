@@ -75,12 +75,23 @@ pub fn emit_c<'input>(
     input: &'input str,
     interfaces: &[sym::Interface],
 ) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
+    emit_c_with_checks(input, interfaces, true)
+}
+
+/// The same, with the runtime checks under the caller's control: `-Ochecks=n`
+/// removes the index, `NIL` and guard checks and the type-`CASE` fallback
+/// (DESIGN §9.4, PLAN.md W3.1).
+pub fn emit_c_with_checks<'input>(
+    input: &'input str,
+    interfaces: &[sym::Interface],
+    checks: bool,
+) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
     let mut m = parse_module(input)?;
     let sema = sema::Sema::check_owned(&mut m, interfaces);
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return Ok(Err(sema.diags.clone()));
     }
-    let (c, h) = cgen::emit_module(&m, &sema.types, &sema);
+    let (c, h) = cgen::emit_module_checked(&m, &sema.types, &sema, checks);
     Ok(Ok((c, h)))
 }
 

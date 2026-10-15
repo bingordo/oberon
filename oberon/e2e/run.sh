@@ -275,6 +275,33 @@ if command -v clang >/dev/null 2>&1; then
 else
     echo "SKIP guard-record-spelling-clang: no clang on this machine"
 fi
+# `-Ochecks=n` compiles the runtime checks out (PLAN.md W3.1): the same module
+# traps by default and reads on without them, and the emitted C of the unchecked
+# build carries no check at all.
+cat > "$DRV/Checks.mod" <<'MODEOF'
+MODULE Checks;
+  VAR a: ARRAY 100 OF INTEGER; n: INTEGER;
+BEGIN
+  n := a[150]
+END Checks.
+MODEOF
+if "$OBC" build "$DRV/Checks.mod" --out "$DRV" -o "$DRV/checks-on" >/dev/null 2>&1 &&
+   "$OBC" build "$DRV/Checks.mod" -Ochecks=n --out "$DRV" -o "$DRV/checks-off" >/dev/null 2>&1; then
+    status=0
+    sh -c '"$0" >/dev/null 2>"$1"' "$DRV/checks-on" "$DRV/checks-on.err" || status=$?
+    check "checks-on-traps" "134" "$status"
+    check "checks-on-names-the-offset" "1" \
+        "$(grep -c 'index out of range (at byte' "$DRV/checks-on.err")"
+    status=0
+    "$DRV/checks-off" || status=$?
+    check "checks-off-runs" "0" "$status"
+    check "checks-off-emits-no-check" "0" \
+        "$(grep -c 'rt_index\|rt_nil\|rt_guard_is' "$DRV/Checks.c")"
+else
+    echo "FAIL checks-flag: the module did not build either way"
+    fail=$((fail + 1))
+fi
+
 trap_case case-no-match 'MODULE T6;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P;

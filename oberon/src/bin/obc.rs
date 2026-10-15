@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use oberon_front::{
-    cgen, check_module_recovering, emit_c, emit_interface, limit_errors, parse_module,
+    cgen, check_module_recovering, emit_c_with_checks, emit_interface, limit_errors, parse_module,
     parse_with_diagnostics, render_diagnostics, sym, Diagnostic,
 };
 
@@ -57,6 +57,8 @@ struct Opts {
     /// How many errors to print before saying the rest were suppressed; `0` is
     /// no limit (PLAN.md W5.2).
     ferror_limit: usize,
+    /// Runtime checks: on unless `-Ochecks=n` (DESIGN §9.4, PLAN.md W3.1).
+    checks: bool,
 }
 
 /// One module in the link: source this build emitted, or C found on disk.
@@ -79,7 +81,8 @@ fn usage() -> ExitCode {
          \x20 --cflag ARG       one extra C flag (repeatable, no splitting)\n\
          \x20 --command M.P     run this command after the modules load (run)\n\
          \x20 --keep            keep the temporary build directory\n\
-         \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)"
+         \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)
+         \x20 -Ochecks | -Ochecks=n   runtime checks on (default) or compiled out)"
     );
     ExitCode::FAILURE
 }
@@ -137,6 +140,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         command: None,
         keep: false,
         ferror_limit: 20,
+        checks: true,
     };
     let mut i = 2;
     while i < args.len() {
@@ -161,6 +165,8 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
+            "-Ochecks" => o.checks = true,
+            "-Ochecks=n" => o.checks = false,
             "--ferror-limit" => {
                 o.ferror_limit = take(&mut i)?
                     .parse()
@@ -401,7 +407,7 @@ fn emit_tree(
         return Err(format!("`{name}` does not check"));
     }
     let _ = parsed;
-    let (c, h) = emit_c(src, interfaces)
+    let (c, h) = emit_c_with_checks(src, interfaces, o.checks)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .map_err(|diags| {
             print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));

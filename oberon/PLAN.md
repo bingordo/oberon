@@ -206,7 +206,7 @@ old code.
 
 ## W3 — toolchain, driver, packaging
 
-**W3.1 `-Ochecks` / `-Ochecks=n`** (M6, §9.4, R6)
+**W3.1 `-Ochecks` / `-Ochecks=n`** (M6, §9.4, R6) — **done**
 Why: the design says runtime checks are on by default and compiled out with
 `-Ochecks=n`; in fact `cgen` emits `rt_trap` unconditionally and the driver has
 no such flag.
@@ -215,6 +215,13 @@ dereference, type-`CASE` no-match), `src/bin/obc.rs`, `e2e/run.sh`.
 Done when: a bounds violation traps by default and runs without the check under
 `-Ochecks=n`, both covered by suite checks; R6's `FOR`-at-`MAX(INTEGER)` note is
 resolved in the same pass (the trap is one of the checks the flag turns off).
+**Done**: `-Ochecks=n` removes the index check, the `NIL` check, a guard's tag test
+and the type-`CASE` fallback — the four rows in `e2e` assert that the same module
+traps by default (with the offset) and exits 0 without them, and that the emitted C
+of the unchecked build has no `rt_index`/`rt_nil`/`rt_guard_is` at all. The divisor
+checks stay, because they keep the arithmetic *defined* rather than unchecked, and
+`ASSERT` is a statement rather than a check; both are stated in §9.4. R6 is
+resolved as defined-by-the-report rather than checked — see its row.
 
 **W3.2 interface-file versioning** (§7, "prototype codec") — **done**
 Why: the format starts at `MODULE <name>` with no version, so a stale interface

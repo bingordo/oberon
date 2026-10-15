@@ -1003,7 +1003,16 @@ The one row without a test is `rt_new`'s failure path, and the one access withou
 a check is the exception named in the pointer row. Both are itemised (W7.4, R26)
 rather than implied.
 
-Runtime checks are on by default (`-Ochecks`) and compiled out with `-Ochecks=n`.
+Runtime checks are on by default (`-Ochecks`) and compiled out with `-Ochecks=n`
+(W3.1). What the flag removes: the index bounds check, the `NIL` check on a
+pointer access, a type guard's tag test, and the type-`CASE` fallback that traps
+when no label matches — after which a violation is the program's problem, which is
+the point of the switch. What it keeps, deliberately: the divisor checks, because
+they are what keeps the *arithmetic* defined rather than merely unchecked (R4's
+stance is that no emitted C relies on undefined behaviour), and `ASSERT`, which is
+a language statement rather than a check. `-Ochecks=n` also removes the emitted
+C's calls to `rt_index`/`rt_nil`/`rt_guard_is` entirely, which is what the suite
+checks.
 The trap payload is a message and the source position of the operation, so a
 failing program says `foo.Mod:41: index 12 out of range 0..9`.
 
@@ -1326,7 +1335,7 @@ section or risk each item comes from.
 | R3 | No garbage collector. | Documented deviation (§1). `NEW` failures yield `NIL`, which is specified. A mark-sweep collector can replace `rt_new` without touching generated code. |
 | R4 | Signed overflow: C's UB vs. Oberon's unspecified wrap. | `-fwrapv` in the documented compile line **[verified]**; the emitted code never relies on the C compiler's optimiser reasoning about overflow. |
 | R5 | `SYSTEM` (§11.1) is not implemented. | Importing it is a hard error in v1. If needed later, `ADR`, `SIZE`, `VAL`, `BIT` are intrinsics and `GET`/`PUT`/`COPY` are `memcpy`-shaped; the design reserves the `ob_sys_` prefix for them. |
-| R6 | `FOR` loops that end at the largest `INTEGER`: `v += k` wraps and the guard is re-tested against a wrapped value. | Same shape as the report's own equivalence and as ETH's compiler; with `-fwrapv` the behaviour is defined and matches the report's while-loop desugaring. Worth a note in the manual, and a `-Ochecks` trap is possible if it ever matters. |
+| R6 | `FOR` loops that end at the largest `INTEGER`: `v += k` wraps and the guard is re-tested against a wrapped value. | **Resolved**: the report's own equivalence (§9.8) is `v := beg; WHILE v <= end DO S; v := v + inc END`, so the wrap and the re-test *are* the specified behaviour, and with `-fwrapv` it is defined C. No check is added, and W3.1's flag does not need one: a `FOR` loop cannot exceed its bound. |
 | R7 | Nested procedures need a static link. | Only emitted when the nested body actually references an enclosing local; procedure *variables* cannot hold local procedures (report §6.5), so the link is always valid where it is used. **Verified** in `csmoke` (three-level nest, chained frame pointers, plain-signature case). |
 | R8 | `CASE` exhaustiveness on records is only a warning. | The report does not require it; Wirth's compilers report it. We warn, and the emitter always emits a trap for the no-match case **[verified]**. |
 | R9 | `LEN(v)` is defined for one-dimensional open arrays only. | Report §10.2 defines exactly that. Multi-dimensional open arrays are Oberon-2. |

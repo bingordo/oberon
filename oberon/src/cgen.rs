@@ -105,16 +105,34 @@ pub struct Emitter<'a> {
     /// Non-zero while rendering the right operand of `&&` or `||`, whose value
     /// must not be computed unless the operand is reached.
     in_conditional: usize,
+    /// Runtime checks (DESIGN §9.4, PLAN.md W3.1). On by default; `-Ochecks=n`
+    /// removes the index, `NIL` and guard checks and the type-`CASE` fallback, so
+    /// a violation becomes the program's problem instead of a located trap. The
+    /// divisor checks stay: they keep C's arithmetic *defined* rather than merely
+    /// unchecked (R4's stance), and `ASSERT` is a statement, not a check.
+    checks: bool,
 }
 
 pub fn emit_module(module: &Module, types: &Types, sema: &Sema<'_>) -> (String, String) {
+    emit_module_checked(module, types, sema, true)
+}
+
+/// The same, with the runtime checks under the caller's control (`-Ochecks=n`).
+pub fn emit_module_checked(
+    module: &Module,
+    types: &Types,
+    sema: &Sema<'_>,
+    checks: bool,
+) -> (String, String) {
     let mut e = Emitter::new(module.name.clone(), types, sema);
+    e.checks = checks;
     e.run(module)
 }
 
 impl<'a> Emitter<'a> {
     fn new(module: String, types: &'a Types, sema: &'a Sema<'a>) -> Emitter<'a> {
         Emitter {
+            checks: true,
             types,
             sema,
             module,
@@ -1066,7 +1084,7 @@ impl<'a> Emitter<'a> {
                 self.pop_scope();
                 let _ = writeln!(out, "    break; }}");
             }
-            if !default_taken {
+            if !default_taken && self.checks {
                 let _ = writeln!(
                     out,
                     "    default: rt_trap_pos(\"CASE: no matching type\", {}); break;",
@@ -1750,7 +1768,7 @@ impl<'a> Emitter<'a> {
                         ty
                     };
                     let path = self.field_path(rec, f).unwrap_or_default();
-                    if is_pointer && !volatile {
+                    if is_pointer && !volatile && self.checks {
                         // The check is part of the access, so a NIL target traps
                         // with this designator's offset (R21).
                         text = format!("rt_nil({text}, {})", d.span.lo);
@@ -1775,19 +1793,19 @@ impl<'a> Emitter<'a> {
                             // an open array used to be emitted with no check at all
                             // — the trap matrix found it (PLAN.md W7.4).
                             match open_len.take() {
-                                Some(len) => {
+                                Some(len) if self.checks => {
                                     let _ = write!(text, "[rt_index({i}, {len}, {})]", d.span.lo);
                                 }
-                                None => {
+                                _ => {
                                     let _ = write!(text, "[{i}]");
                                 }
                             }
                         } else {
                             match self.types.array_len(ty) {
-                                Some(n) => {
+                                Some(n) if self.checks => {
                                     let _ = write!(text, ".e[rt_index({i}, {n}, {})]", d.span.lo);
                                 }
-                                None => {
+                                _ => {
                                     let _ = write!(text, ".e[{i}]");
                                 }
                             }
@@ -1802,7 +1820,7 @@ impl<'a> Emitter<'a> {
                 }
                 Selector::Deref => {
                     // Same rule for `p^`: the check is inside the dereference.
-                    if is_pointer && !volatile {
+                    if is_pointer && !volatile && self.checks {
                         text = format!("rt_nil({text}, {})", d.span.lo);
                     }
                     text = format!("(*({text}))");
@@ -1837,14 +1855,18 @@ impl<'a> Emitter<'a> {
                             // every lvalue caller flushes. The cast stays unless
                             // the guard is the whole designator, because a field's
                             // offset belongs to the narrowed record (DESIGN R29).
-                            let _ = writeln!(self.prelude, "    {test};");
+                            if self.checks {
+                                let _ = writeln!(self.prelude, "    {test};");
+                            }
                             if last {
                                 text.clone()
                             } else {
                                 view
                             }
-                        } else {
+                        } else if self.checks {
                             format!("(({test}, {view}))")
+                        } else {
+                            view
                         };
                         ty = t;
                         is_pointer = true;
@@ -1867,14 +1889,18 @@ impl<'a> Emitter<'a> {
                             d.span.lo
                         );
                         text = if lvalue {
-                            let _ = writeln!(self.prelude, "    {test};");
+                            if self.checks {
+                                let _ = writeln!(self.prelude, "    {test};");
+                            }
                             if last {
                                 sub
                             } else {
                                 view
                             }
-                        } else {
+                        } else if self.checks {
                             format!("(({test}, {view}))")
+                        } else {
+                            view
                         };
                         ty = t;
                         is_pointer = false;
