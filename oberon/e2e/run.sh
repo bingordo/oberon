@@ -174,6 +174,19 @@ for form in field caret; do
         "$(grep -c 'NIL pointer dereference (at byte' "$DRV/nil$form.err")"
 done
 
+# An interface that cannot be read is explained only when the build needs it: an
+# unrelated file on the search path must not be reported (PLAN.md W3.2).
+mkdir -p "$DRV/badiface"
+printf 'MODULE Unrelated\nTYPE T = INTEGER\n' > "$DRV/badiface/Unrelated.sym"
+printf 'MODULE Quiet;\nBEGIN\nEND Quiet.\n' > "$DRV/Quiet.mod"
+"$OBC" check "$DRV/Quiet.mod" -I "$DRV/badiface" --out "$DRV" >"$DRV/quiet.out" 2>&1 || true
+check "an-unrelated-refused-interface-is-not-reported" "0" \
+    "$(grep -c 'Unrelated.sym' "$DRV/quiet.out")"
+printf 'MODULE Needs;\n  IMPORT Unrelated;\nBEGIN\nEND Needs.\n' > "$DRV/Needs.mod"
+"$OBC" check "$DRV/Needs.mod" -I "$DRV/badiface" --out "$DRV" >"$DRV/needs.out" 2>&1 || true
+check "a-refused-interface-that-is-needed-is-explained" "1" \
+    "$(grep -c 'Unrelated.sym: no VERSION line' "$DRV/needs.out")"
+
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true

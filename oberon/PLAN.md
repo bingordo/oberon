@@ -721,8 +721,14 @@ assignment to a field of a pointer target still compiles — which is the case t
 hole bit. Both spellings trap with the offset (`e2e` checks
 `nil-field-dereference-traps` and `nil-caret-dereference-traps`), an emission test
 asserts the check is present for a dereference and absent for a pointer assignment
-or a `NIL` test, and the decision the item asked for is taken: every dereference is
-checked.
+or a `NIL` test, and the decision the item asked for is taken: every dereference
+*whose operand is side-effect-free* is checked. **Remaining**: an operand with a
+side effect — `a[Next()].x`, where the index expression calls something — is not
+checked, because `rt_nil` reads its operand twice and a second evaluation would
+change which element is dereferenced (DESIGN R26). The check is left out there
+rather than emitted wrong; finishing it means hoisting the operand into a
+statement, which is the emitter's temporary machinery (R16) and wants the same
+treatment as the fold's call rule.
 
 **W7.2 a constant out-of-range index is not diagnosed — open, a decision**
 Why: `a[10]` on `ARRAY 4 OF INTEGER` compiles, and `e2e/Trap.mod` *relies* on

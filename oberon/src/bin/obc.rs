@@ -19,7 +19,7 @@
 //! emitted shape, as `oberon/e2e/Texts.c` is. `M.sym` must be findable either
 //! way, because that is what the importing module is checked against.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -181,12 +181,12 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
 
     // 1. Interfaces already on the search path (hand-written modules such as
     //    Texts and Oberon ship one with their C).
+    // An interface that is *refused* is not the same as one that is missing, but
+    // saying so has to wait until we know it is needed: an unrelated `.sym` on the
+    // search path, or one superseded by a better copy in another directory, must
+    // not be reported (PLAN.md W3.2). The reasons are kept here and printed when
+    // the check says the interface is missing.
     let (mut interfaces, refused) = find_interfaces(o);
-    // Say what could not be read before the check runs, so a version mismatch is
-    // not reported as a missing module (PLAN.md W3.2).
-    for r in &refused {
-        eprintln!("obc: {r}");
-    }
 
     // 2. Emit the module and everything it imports, depth first.
     let mut units: Vec<Unit> = Vec::new();
@@ -194,7 +194,17 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     let mut stack: Vec<String> = Vec::new();
     let root_src = read(&o.root)?;
     let root = module_name(&root_src);
-    emit_tree(o, &o.root, &root_src, &root, &mut units, &mut interfaces, &mut done, &mut stack)?;
+    emit_tree(
+        o,
+        &refused,
+        &o.root,
+        &root_src,
+        &root,
+        &mut units,
+        &mut interfaces,
+        &mut done,
+        &mut stack,
+    )?;
 
     if o.mode == Mode::Check {
         // Diagnostics only: nothing is written, not even the runtime.
@@ -260,6 +270,7 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
 #[allow(clippy::too_many_arguments)]
 fn emit_tree(
     o: &Opts,
+    refused: &HashMap<String, String>,
     path: &Path,
     src: &str,
     name: &str,
@@ -306,7 +317,7 @@ fn emit_tree(
         match find_file(o, &format!("{m}.mod")) {
             Some(mod_path) => {
                 let text = read(&mod_path)?;
-                emit_tree(o, &mod_path, &text, &m, units, interfaces, done, stack)?;
+                emit_tree(o, refused, &mod_path, &text, &m, units, interfaces, done, stack)?;
             }
             None => match find_file(o, &format!("{m}.c")) {
                 Some(c) if matches!(o.mode, Mode::Build | Mode::Run) => {
@@ -337,6 +348,13 @@ fn emit_tree(
                 }
                 None => {
                     if !interfaces.iter().any(|i| i.module == m) {
+                        // An interface that was *refused* (a version this compiler
+                        // does not read) is not a missing one, and saying which it
+                        // is here means no unrelated `.sym` on the search path is
+                        // reported (PLAN.md W3.2).
+                        if let Some(why) = refused.get(&m) {
+                            return Err(why.to_string());
+                        }
                         return Err(format!(
                             "no interface for module `{m}` on the search path (looked for {m}.sym, \
                              {m}.mod and {m}.c)"
@@ -394,13 +412,13 @@ fn write_runtime(o: &Opts) -> Result<(), String> {
     write(&o.out.join("oberon_runtime.c"), cgen::RUNTIME_SOURCE)
 }
 
-fn find_interfaces(o: &Opts) -> (Vec<sym::Interface>, Vec<String>) {
+fn find_interfaces(o: &Opts) -> (Vec<sym::Interface>, HashMap<String, String>) {
     let mut found: Vec<sym::Interface> = Vec::new();
     // An interface the loader cannot read is not the same as a missing one: it
     // exists, and saying *why* it was refused (a version this compiler does not
     // read, say) is the difference between "recompile that module" and "there is
     // no such module" (PLAN.md W3.2).
-    let mut refused: Vec<String> = Vec::new();
+    let mut refused: HashMap<String, String> = HashMap::new();
     for dir in &o.search {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
@@ -417,7 +435,15 @@ fn find_interfaces(o: &Opts) -> (Vec<sym::Interface>, Vec<String>) {
                             found.push(i);
                         }
                     }
-                    Err(e) => refused.push(format!("{}: {e}", p.display())),
+                    Err(e) => {
+                        // Keyed by module name, because that is what a missing
+                        // interface is reported as.
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            refused
+                                .entry(stem.to_string())
+                                .or_insert_with(|| format!("{}: {e}", p.display()));
+                        }
+                    }
                 }
             }
         }

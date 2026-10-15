@@ -1259,6 +1259,26 @@ impl<'a> Emitter<'a> {
         self.binary_plain(op, &a, &b, lt, rt)
     }
 
+    /// Whether evaluating this expression can call something — an Oberon call is
+    /// the only side effect an expression can have. Exhaustive, so a new
+    /// expression form has to be classified rather than defaulting to "harmless".
+    fn has_call(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Designator(d) => d.sels.iter().any(|s| match s {
+                Selector::Call(_) => true,
+                Selector::Index(ix) => ix.iter().any(|x| self.has_call(x)),
+                _ => false,
+            }),
+            ExprKind::Unary(_, x) => self.has_call(x),
+            ExprKind::Binary(_, l, r) => self.has_call(l) || self.has_call(r),
+            ExprKind::Set(elems) => elems
+                .iter()
+                .any(|el| self.has_call(&el.lo) || el.hi.as_ref().is_some_and(|h| self.has_call(h))),
+            ExprKind::TypeTest(x, _) => self.has_call(x),
+            _ => false,
+        }
+    }
+
     /// True when an expression is built only from literals, selector-free
     /// designators and operators: folding such a tree cannot skip a call, and no
     /// part of it can have a side effect. Exhaustive on purpose, so a new
@@ -1496,6 +1516,11 @@ impl<'a> Emitter<'a> {
             (None, None) => mangle(&d.base[0]),
         };
         let mut is_pointer = self.types.is_pointer(ty);
+        // `rt_nil(p, at)` reads `p` twice (that is what makes it an lvalue-
+        // preserving expression rather than a hoisted statement), so it is only
+        // sound while `p` has no side effect. An *index* expression may contain a
+        // call, so the flag is tracked selector by selector.
+        let mut volatile = false;
         for sel in &d.sels {
             match sel {
                 Selector::Field(f) => {
@@ -1505,7 +1530,7 @@ impl<'a> Emitter<'a> {
                         ty
                     };
                     let path = self.field_path(rec, f).unwrap_or_default();
-                    if is_pointer {
+                    if is_pointer && !volatile {
                         // The check is part of the access, so a NIL target traps
                         // with this designator's offset (R21).
                         text = format!("rt_nil({text}, {})", d.span.lo);
@@ -1517,6 +1542,9 @@ impl<'a> Emitter<'a> {
                     is_pointer = self.types.is_pointer(ty);
                 }
                 Selector::Index(ix) => {
+                    if ix.iter().any(|e| self.has_call(e)) {
+                        volatile = true;
+                    }
                     let mut open = matches!(self.types.get(ty), Type::OpenArray { .. });
                     for e in ix {
                         let i = self.expr(e, Some(self.types.integer()));
@@ -1543,7 +1571,7 @@ impl<'a> Emitter<'a> {
                 }
                 Selector::Deref => {
                     // Same rule for `p^`: the check is inside the dereference.
-                    if is_pointer {
+                    if is_pointer && !volatile {
                         text = format!("rt_nil({text}, {})", d.span.lo);
                     }
                     text = format!("(*({text}))");

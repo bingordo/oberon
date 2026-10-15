@@ -946,6 +946,16 @@ mod emit_tests {
         let c = c_of(src);
         assert!(c.contains("rt_nil("), "{c}");
         assert!(c.contains("rt_nil(") && c.contains(")->x"), "{c}");
+        // ... but not when the operand can have a side effect: the check reads it
+        // twice, so an index expression containing a call would be evaluated
+        // twice and could check one pointer while dereferencing another. The
+        // check is left out there (the fault remains) rather than emitted wrong.
+        let src = "MODULE M;\n  TYPE R = RECORD x: INTEGER END;\n  VAR a: ARRAY 2 OF POINTER TO R;\n\
+  PROCEDURE Next(): INTEGER; BEGIN RETURN 0 END Next;\n\
+BEGIN\n  a[Next()].x := 1\nEND M.\n";
+        let c = c_of(src);
+        assert!(!c.contains("rt_nil("), "{c}");
+
         // a plain pointer assignment and a NIL test are not dereferences
         let src = "MODULE M;\n  TYPE R = RECORD x: INTEGER END;\n  VAR p, q: POINTER TO R;\nBEGIN\n  p := q;\n  IF p # NIL THEN END\nEND M.\n";
         let c = c_of(src);
@@ -1249,8 +1259,34 @@ BEGIN Outer END M.\n";
         assert!(warnings[2].contains("the index is 7"), "{warnings:?}");
         assert!(diags.iter().all(|d| !d.is_error()), "{text}");
 
+        // A compound index of a named constant, and the classic `a[LEN(a)]`,
+        // where `LEN` is the predefined one.
+        let src = "MODULE M;\n  CONST k = 7;\n  VAR a: ARRAY 4 OF INTEGER;\nBEGIN\n  a[k + 1] := 1;\n  a[-k] := 2;\n  a[LEN(a)] := 3\nEND M.\n";
+        let (text, diags) = report(src);
+        let warnings: Vec<String> = diags
+            .iter()
+            .filter(|d| !d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(warnings.len(), 3, "{text}");
+        assert!(warnings[0].contains("the index is 8"), "{warnings:?}");
+        assert!(warnings[1].contains("the index is -7"), "{warnings:?}");
+        assert!(warnings[2].contains("the index is 4"), "{warnings:?}");
+
+        // A *shadowed* predefined name is not folded, so `ABS` here returns 0 and
+        // there is nothing to warn about: the folder recognises a builtin by its
+        // spelling, which is why calls are excluded.
+        let src = "MODULE M;\n  VAR a: ARRAY 4 OF INTEGER;\n  PROCEDURE ABS(x: INTEGER): INTEGER; BEGIN RETURN 0 END ABS;\nBEGIN\n  a[ABS(10)] := 1\nEND M.\n";
+        let (text, diags) = report(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{text}");
+        assert!(
+            !diags.iter().any(|d| !d.is_error()),
+            "a shadowed ABS is not the predefined one: {text}"
+        );
+
         // The trap is still there for every index, constants included.
-        let c = match emit_c(src, &[]) {
+        let trap_src = "MODULE M;\n  CONST k = 7;\n  VAR a: ARRAY 4 OF INTEGER; i: INTEGER;\nBEGIN\n  a[10] := 1;\n  a[(-1)] := 2;\n  a[k] := 3;\n  a[i] := 4;\n  a[3] := 5\nEND M.\n";
+        let c = match emit_c(trap_src, &[]) {
             Ok(Ok((c, _h))) => c,
             other => panic!("expected emitted C: {other:?}"),
         };

@@ -1591,10 +1591,7 @@ impl<'a> Sema<'a> {
                             for (k, e) in ix.iter().enumerate() {
                                 let v = self.expr(e);
                                 self.expect_integer(e.span, v.ty, "an array index");
-                                let constant = match const_eval::eval(e) {
-                                    Ok(c) => c.int(),
-                                    Err(_) => self.const_at(e.span).and_then(|c| c.int()),
-                                };
+                                let constant = self.const_index(e);
                                 if let (Some(idx), Some(len)) = (constant, lens.get(k)) {
                                     if idx < 0 || idx as i64 >= *len as i64 {
                                         self.warn(
@@ -1843,6 +1840,75 @@ impl<'a> Sema<'a> {
             cur = e;
         }
         n
+    }
+
+    /// The constant value of an index expression, for the bounds warning. The
+    /// folder runs with the checker's resolver, so `a[k + 1]` and `a[-k]` fold;
+    /// it never folds a *call*, because a program may legally declare `ABS` and
+    /// the folder recognises a builtin by its spelling (the rule the emitter
+    /// applies for the same reason). `LEN(v)` of a fixed-size array is the one
+    /// call worth resolving here, since `a[LEN(a)]` is the classic off-by-one.
+    fn const_index(&mut self, e: &Expr) -> Option<i32> {
+        if let Some(len) = self.len_of_fixed_array(e) {
+            return Some(len as i32);
+        }
+        if !self.call_free(e) {
+            return None;
+        }
+        const_eval::eval_with(e, &|x| self.const_at(x.span))
+            .ok()
+            .and_then(|c| c.int())
+    }
+
+    /// `LEN(v)` where `v` is a fixed-size array: the one predefined call whose
+    /// value this pass knows, and only when `LEN` is still the predefined one.
+    fn len_of_fixed_array(&self, e: &Expr) -> Option<u32> {
+        let ExprKind::Designator(d) = &e.kind else {
+            return None;
+        };
+        if d.base.as_slice() != ["LEN"] || d.sels.len() != 1 {
+            return None;
+        }
+        if !matches!(self.lookup("LEN"), Some(Sym::Predef("LEN"))) {
+            return None;
+        }
+        let Selector::Call(args) = &d.sels[0] else {
+            return None;
+        };
+        let [Expr { kind: ExprKind::Designator(inner), .. }] = args.as_slice() else {
+            return None;
+        };
+        // A bare designator: no selectors, one name.
+        if !inner.sels.is_empty() || inner.base.len() != 1 {
+            return None;
+        }
+        let arg_ty = match self.lookup(&inner.base[0]) {
+            Some(Sym::Var { ty, .. }) | Some(Sym::Param { ty, .. }) => ty,
+            _ => return None,
+        };
+        self.types.array_len(arg_ty)
+    }
+
+    /// True when no `( … )` selector in this expression could be a call the
+    /// folder would misread as a predefined one.
+    fn call_free(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Designator(d) => {
+                if !d.sels.iter().all(|s| !matches!(s, Selector::Call(_))) {
+                    return false;
+                }
+                d.sels.iter().all(|s| match s {
+                    Selector::Index(ix) => ix.iter().all(|x| self.call_free(x)),
+                    _ => true,
+                })
+            }
+            ExprKind::Unary(_, x) => self.call_free(x),
+            ExprKind::Binary(_, l, r) => self.call_free(l) && self.call_free(r),
+            ExprKind::Set(elems) => elems
+                .iter()
+                .all(|el| self.call_free(&el.lo) && el.hi.as_ref().is_none_or(|h| self.call_free(h))),
+            _ => true,
+        }
     }
 
     /// The length of each dimension of an array type, outermost first. Used to
