@@ -141,15 +141,12 @@ pub fn limit_errors(diags: &mut Vec<Diagnostic>, limit: usize) -> usize {
 
 /// A syntax error as a first-class diagnostic, so that a parse failure is
 /// located and rendered exactly like a type error (DESIGN §5 D7, §10).
-/// The note for a recovered error: what the parser threw away to carry on. The
-/// tokens are rendered the way the parser prints them, and LALRPOP's synthetic
-/// ones (`error`, `Eof`) are left out.
+/// The note for a recovered error: what the parser threw away to carry on.
+/// Every dropped token is a token of the *input*, so nothing is filtered: a
+/// program may legally declare `error` or `Eof` (report §3), and dropping those
+/// from the note would misdescribe what was skipped.
 pub fn recovery_note(tokens: &[(usize, Token<'_>, usize)]) -> Option<String> {
-    let text: Vec<String> = tokens
-        .iter()
-        .map(|(_, t, _)| t.to_string())
-        .filter(|t| t != "error" && t != "Eof" && t != "?")
-        .collect();
+    let text: Vec<String> = tokens.iter().map(|(_, t, _)| t.to_string()).collect();
     if text.is_empty() {
         return None;
     }
@@ -850,6 +847,63 @@ END M.
 }
 
 #[cfg(test)]
+mod emit_tests {
+    use super::*;
+
+    /// Emit a module's C, or panic with the diagnostics.
+    fn c_of(src: &str) -> String {
+        match emit_c(src, &[]) {
+            Ok(Ok((c, _h))) => c,
+            Ok(Err(diags)) => panic!("module did not check: {diags:#?}"),
+            Err(e) => panic!("syntax error: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_shadowed_builtin_call_is_not_folded_away() {
+        // `ABS` is a predefined name, but a nested procedure or a parameter may
+        // legally shadow it. Folding by *spelling* would remove the call and its
+        // side effect: the emitted C must contain the call.
+        // A module-level declaration shadows the predefined name (report §4:
+        // the universe of predefined identifiers is the outermost scope), and so
+        // does a nested one.
+        let src = "MODULE M;\n  VAR m0: INTEGER;\n\
+  PROCEDURE ABS(x: INTEGER): INTEGER;\n  BEGIN m0 := m0 + 1; RETURN 42 END ABS;\n\
+BEGIN\n  m0 := 0; m0 := ABS(1)\nEND M.\n";
+        let c = c_of(src);
+        assert!(c.contains("M__ABS("), "{c}");
+        assert!(!c.contains("m0 = ((int32_t)42u)"), "{c}");
+    }
+
+    #[test]
+    fn a_folded_char_keeps_its_c_type() {
+        // `Const::int()` also answers for a CHAR; taking that path would emit an
+        // `int32_t` where a `char` belongs, which `-Werror` rejects on assignment
+        // where plain `char` is signed.
+        let src = "MODULE M; VAR ch: CHAR; BEGIN ch := 0FFX END M.\n";
+        let c = c_of(src);
+        assert!(c.contains("((char)255u)"), "{c}");
+        assert!(!c.contains("((int32_t)255u)"), "{c}");
+    }
+
+    #[test]
+    fn a_self_comparison_is_folded_not_emitted() {
+        // `x = x` is a tautology the C compiler warns about, and the build line
+        // treats warnings as errors. Parsed operands carry different spans, so a
+        // span-sensitive comparison would miss it.
+        let src = "MODULE M; VAR x: INTEGER; BEGIN IF x = x THEN x := 1 END END M.\n";
+        let c = c_of(src);
+        assert!(c.contains("if (1)"), "{c}");
+        assert!(!c.contains("=="), "{c}");
+
+        // ... but a REAL is not folded: `x = x` is false for NaN.
+        let src = "MODULE M; VAR r: REAL; BEGIN IF r = r THEN r := 1.0 END END M.\n";
+        let c = c_of(src);
+        assert!(c.contains("=="), "{c}");
+    }
+}
+
+#[cfg(test)]
 mod diag_tests {
     use super::*;
 
@@ -928,6 +982,30 @@ mod diag_tests {
     }
 
     #[test]
+    fn a_legal_identifier_named_error_survives_in_the_recovery_note() {
+        // `Token` has no synthetic variants, so a dropped token is always input:
+        // filtering by display string hid the name of the statement that was
+        // discarded, and `error`/`Eof` are legal identifiers (report §3).
+        let src = "MODULE M;\n  VAR x, error: INTEGER;\nBEGIN\n  x := 1\n  error := 2\nEND M.\n";
+        let (text, _) = report(src);
+        assert!(text.contains("the parser skipped `error := 2` to carry on"), "{text}");
+    }
+
+    #[test]
+    fn one_occurrence_counts_as_one_use_even_when_resolved_twice() {
+        // A type-`CASE` label is resolved for the arm's view and again for the
+        // label check; only a new span is another use.
+        let src = "MODULE M; TYPE R = RECORD END; P = POINTER TO R; VAR p: P;\nBEGIN CASE p OF Zz: END END M.\n";
+        let (text, _) = report(src);
+        assert!(!text.contains("further use of `Zz`"), "{text}");
+
+        // Two genuine occurrences still count.
+        let src = "MODULE M; VAR x: INTEGER;\nBEGIN x := Zz; x := Zz END M.\n";
+        let (text, _) = report(src);
+        assert!(text.contains("1 further use of `Zz` is suppressed"), "{text}");
+    }
+
+    #[test]
     fn repeated_uses_of_one_undeclared_name_are_suppressed() {
         // PLAN.md W5.2: three uses of one undeclared name is one mistake, and a
         // second name is a second mistake.
@@ -991,6 +1069,67 @@ mod diag_tests {
         assert_eq!(diags.len(), 2);
         assert_eq!(limit_errors(&mut diags, 5), 0);
         assert_eq!(diags.len(), 2);
+    }
+
+    #[test]
+    fn procedure_uses_are_tracked_by_identity_not_by_name() {
+        // Two procedures of the same name at different levels: the one that is
+        // called must not warn, and the one that is not must. A name-keyed check
+        // would get this wrong in one direction or the other.
+        let src = "MODULE M;\n\
+  PROCEDURE P;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN Inner END P;\n\
+  PROCEDURE Q;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN END Q;\n\
+BEGIN P; Q END M.\n";
+        let (text, diags) = report(src);
+        let warnings: Vec<String> = diags
+            .iter()
+            .filter(|d| !d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(warnings.len(), 1, "{text}");
+        assert!(warnings[0].contains("procedure `Inner` is never used"), "{warnings:?}");
+        // Q's Inner is on line 6 (indented four spaces, so column 15), P's on
+        // line 3 — the caret has to be on the one that is not called.
+        assert!(text.contains("M.mod:6:15: warning: procedure `Inner`"), "{text}");
+    }
+
+    #[test]
+    fn the_procedure_warning_points_at_the_name_whatever_precedes_it() {
+        // A comment and a blank line before the declaration must not move the
+        // caret: `name_span` comes from the grammar, not from arithmetic on the
+        // declaration's span.
+        let src = "MODULE M;\n  (* a comment, and a blank line below *)\n\n  PROCEDURE Unused; BEGIN END Unused;\nBEGIN END M.\n";
+        let (text, _) = report(src);
+        assert!(text.contains("M.mod:4:13: warning: procedure `Unused` is never used"), "{text}");
+        assert!(text.contains("4 |   PROCEDURE Unused;"), "{text}");
+    }
+
+    #[test]
+    fn only_a_local_procedure_is_rejected_as_a_procedure_actual() {
+        // The report's rule is narrow: a globally declared procedure and a
+        // procedure *variable* are both legal actuals, and a procedure passed
+        // where an INTEGER is expected is an ordinary type error (one message).
+        let src = "MODULE M; TYPE F = PROCEDURE; VAR f: F;\n\
+  PROCEDURE P0; BEGIN END P0;\n\
+  PROCEDURE Taker(g: F); BEGIN END Taker;\n\
+  PROCEDURE TakerInt(x: INTEGER); BEGIN END TakerInt;\n\
+  PROCEDURE Outer;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN\n    Taker(P0);\n    f := P0;\n    TakerInt(P0);\n    Taker(Inner)\n  END Outer;\n\
+BEGIN Outer END M.\n";
+        let (text, diags) = report(src);
+        let errors: Vec<String> = diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(errors.len(), 2, "{text}");
+        assert!(
+            errors[0].contains("does not match the formal") || errors[0].contains("INTEGER"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].contains("cannot be passed as a procedure parameter"),
+            "{errors:?}"
+        );
     }
 
     #[test]

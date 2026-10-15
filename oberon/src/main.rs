@@ -7,6 +7,23 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = args.first().map(String::as_str).unwrap_or("-");
+    // The same error limit the driver has, so `--ferror-limit` means the same
+    // thing in both CLIs (PLAN.md W5.2). 0 is no limit.
+    let ferror_limit: usize = args
+        .iter()
+        .position(|a| a == "--ferror-limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    let report = |src: &str, diags: &mut Vec<oberon_front::Diagnostic>| {
+        let suppressed = oberon_front::limit_errors(diags, ferror_limit);
+        let text = oberon_front::render_diagnostics(path, src, diags);
+        if suppressed > 0 {
+            println!("{text}{suppressed} more error(s) were suppressed (--ferror-limit {ferror_limit})");
+        } else {
+            print!("{text}");
+        }
+    };
     let src = if path == "-" {
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -93,8 +110,8 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            Ok(Err(diags)) => {
-                print!("{}", oberon_front::render_diagnostics(path, &src, &diags));
+            Ok(Err(mut diags)) => {
+                report(&src, &mut diags);
                 ExitCode::FAILURE
             }
             Err(e) => {
@@ -106,9 +123,10 @@ fn main() -> ExitCode {
 
     let check = args.iter().any(|a| a == "-c" || a == "--check");
     if check {
-        let (_, diags) = oberon_front::check_module_recovering(&src, &[]);
-        print!("{}", oberon_front::render_diagnostics(path, &src, &diags));
-        return if diags.iter().any(|d| d.is_error()) {
+        let (_, mut diags) = oberon_front::check_module_recovering(&src, &[]);
+        let has_error = diags.iter().any(|d| d.is_error());
+        report(&src, &mut diags);
+        return if has_error {
             ExitCode::FAILURE
         } else {
             ExitCode::SUCCESS

@@ -468,6 +468,12 @@ Test cases, which are half the point of the item:
   `a_failed_type_or_constant_poisons_its_uses`. A wider `recovery_tests` table,
   one row per site as `(source, expected (line, column, kind))`, is still worth
   having if the checker's range of failures grows.
+* **a shrinker**, now the binding constraint on the residue: `--per-statement`
+  localises a mismatch to one statement, but that statement can sit inside a
+  procedure of 25 nested loops, calls and `CASE` arms. `obgen --shrink SEED` should
+  delete statements and simplify expressions while the mismatch persists (each
+  candidate re-run), which turns a seed into a minimal case the way the residue's
+  first finding became `LSL(1, 32)`.
 * `e2e` checks that assert a *ceiling* rather than an exact count for the messy
   classes (the sixty-statement flood, the six-defect file), because the ceiling
   is the property that matters.
@@ -557,6 +563,7 @@ marks and the named-`CONST` lookup landed, and each landing changed the signal:
 | after W6.5 (the shift semantics) | 0 | 23 | 2 |
 | after the named-`CONST` fold and the self-comparison fold | 1 (a self-comparison, now folded) | 22 | 2 |
 | after the mirror's `FOR` semantics was corrected | 1 | 3 | **21** |
+| after the review of those commits (fold limits, `rt_abs`, the universe scope, initialise-with-literals, `-O2`) | 0 | 3 | **22** |
 
 The jump is the interesting part, and it was a *generator* bug that the report
 settles: §9.8 defines `FOR v := beg TO end … DO S END` as equivalent to
@@ -569,7 +576,14 @@ top-level body statement) is what found it: it showed the mirror's value becomin
 the expected one inside a `CASE` whose taken arm ran a `FOR`, and the control
 variable was in the expression that followed.
 
-The residue is now four seeds, each located:
+The residue is down to three seeds, all self-check traps, and their divergence is
+*inside* the recursive function `R`: `m0 := m0 + R(3)` is the statement that moves
+the variable whose check traps, `--per-statement m0` narrows it to that single
+statement, and the mirror's `R(3)` is 0 while the compiled value differs. `F1`'s
+body — 25 lines of nested loops, calls and `CASE` arms — is the suspect, and
+reading it has stopped paying: the next step is a shrinker (below).
+
+Earlier in the residue, four seeds were located:
 * one is still a C rejection: a self-comparison whose operands contain *calls*
   (`f() = f()`), which `is_plain` deliberately does not fold because a call may
   differ per call and may have side effects, and which gcc warns about anyway

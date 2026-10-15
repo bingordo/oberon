@@ -743,6 +743,7 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 |---|---|---|---|
 | 1 | identifier used but not declared, and not predefined | §4 | E |
 | 2 | identifier declared twice in one scope | §4 | E |
+| 2b | a declaration in an *inner* scope hides the outer one instead — the universe of predefined identifiers is the outermost scope (§10.2), so a module or procedure may declare `ABS` and have it hide the predefined one | §4 | — |
 | 3 | qualifying module not in the import list | §11 | E |
 | 4 | object referenced through a module qualifier is not exported | §11 | E |
 | 5 | import alias declared twice / module imports itself | §11 | E |
@@ -780,13 +781,12 @@ Each row is one diagnostic with one span. `E` = error, `W` = warning.
 implemented in `src/sema.rs` and driven by
 `check_tests::catalogue_rows_report_what_they_should`, which has a case per row
 (each naming the row number, so a failure points at the rule; rows with two
-shapes have two cases). Two things are *not* checked yet, listed here rather than
+shapes have two cases). One thing is *not* checked yet, listed here rather than
 implied: field **visibility** across modules (rows 4 and 14's private-field
-halves — a field's `*` is accepted, but who may read it is an interface-layer
-rule this pass does not model), and row 50's locality half for a procedure
-*value* passed to a procedure type (the report's two ways to obtain one are
-declaration and a variable; assigning a *local* procedure is an error, and so is
-passing one). Row 54's unused-*procedure* half is checked: a procedure this
+halves — a field's `*` is accepted and the interface carries it, but who may read
+it is the remaining piece; `PLAN.md` W1.1). Row 50 is checked on both sides now:
+assigning a *local* procedure to a procedure variable is an error, and so is
+passing one as an actual. Row 54's unused-*procedure* half is checked too: a procedure this
 unit declares and never uses is a warning, with the use recorded where a
 designator resolves to a procedure (so a call, a use as a value and an exported
 procedure all count), and a self-recursive one counting as used, which is the
@@ -1251,6 +1251,8 @@ section or risk each item comes from.
 | R18 | `--cflags "…"` is split on whitespace, so a single flag whose own argument contains a space cannot be written that way. | Mitigated by `--cflag ARG`, which appends one argument verbatim and is repeatable; both are in the driver's usage. A path with spaces is passed correctly as a *file* argument, because the driver never goes through a shell. |
 | R19 | Declaration-level and module-level syntax errors get no recovery: every shape that would express it is rejected by LALRPOP with a local ambiguity on the error token, because the report lets each declaration section be empty and the section's ε production then competes with the error token. | **Measured**, not assumed: four shapes were tried, all four rejected (D7). The outcome is one located diagnostic instead of a cascade, and statement-level recovery covers the common case. |
 | R20 | The emitted C is not warning-clean for *legal* programs: a constant subexpression that overflows (106 messages), a parameter the body never reads (13), and a comparison of two constants (1) all trip the documented `-Werror` build line, so a program the checker accepts can fail to build. | **Found by the generator on its first run** (25/25 seeds, none of them rejected by the front end — see PLAN.md W6.2 for the fixes and the seeds). The value C computes is right in the overflow case, so this is a contract violation rather than a miscompile; the e2e suite uses that build line as its guarantee, which is why it has to be fixed rather than documented. |
+| R24 | `ABS(x)` used to be emitted as `((x) < 0 ? -(x) : (x))`, so an operand containing a call was evaluated twice, possibly with two different results. | **Found by review** of the fold work and fixed: `rt_abs` takes its operand once. The same duplication class is worth watching wherever an operand is emitted more than once; the fold now refuses any tree containing a call, which is also what keeps a *shadowed* builtin (`ABS` declared by the program) from being folded away with its side effects. |
+| R25 | The checker declared the predefined identifiers and the module's own declarations in *one* scope, so a module-level `ABS` was rejected as a duplicate instead of hiding the predefined one, although report §4 makes the universe the outermost scope. | **Found while fixing R24's review finding** — the reviewer's shadowed-builtin example could not even be written. Fixed by opening the universe as its own scope; `emit_tests::a_shadowed_builtin_call_is_not_folded_away` pins both halves. |
 | R23 | The emitted C relies on the C compiler evaluating operands in source order, which C does not guarantee, while Oberon's own reference compilers read left to right: an expression where one operand is a call that writes a variable another operand reads can therefore differ. | **Not demonstrated**: a minimal reproduction (a recursive function whose body calls a procedure that increments a module variable, multiplied by an operand that reads it) gives the left-to-right answer under gcc at `-O0`, `-O1`, `-O2` and `-O3`. The fuzzer's remaining mismatches are *inside* such a function (`m0 := m0 + R(3)`), so this is the next thing to test there — and if it is the cause, the fix is to evaluate call-containing operands into temporaries in source order, which is the mechanism §9.5 already uses for structured value arguments (R16). Until then the risk is real but unproven, and the fuzzer builds at `-O0` while the documented build line is `-O2`, which is itself worth closing. |
 | R22 | `LSL` and `ASR` masked their shift count with `& 31`, which is what `ROR` does but not what the report defines: §8.2.2's table gives `LSL(x,n) = x * 2^n` and `ASR(x,n) = x DIV 2^n`, so a count of 32 is *defined* (0, or 0/-1) rather than a no-op. The constant folder and the runtime helpers agreed with each other and both disagreed with the report, and four places documented the masking as intended. | **Found by the generator** (PLAN.md W6.5): a generated program's self-check trapped, and the mirror — which follows the report — was right. Fixed in the runtime header, the folder, `csmoke` (whose spec had encoded the masking, as R11's did before it), `golden`'s case list and the second-pass table, plus the four document mentions. |
 | R21 | A plain pointer dereference is not `NIL`-checked: `p := NIL; p.x := 1` emits `Mem3__p->x = 1` and dies of SIGSEGV with no message, although the emitted runtime header lists `NIL` among `rt_trap`'s reasons and the *guard* path does test `v != NULL` first. | **Found while auditing memory safety** (PLAN.md W7.1), with a three-line program as evidence. Every other violation of the same class reports a located trap, so this is a hole in the guarantee §9.4 states rather than a design choice; the fix and the decision it needs (check every dereference, or none) are itemised there. |

@@ -182,7 +182,9 @@ pub struct Sema<'a> {
     used_procs: Vec<usize>,
     /// For a name reported as undeclared: the index of that first diagnostic, so
     /// further uses of the same name can be counted onto it instead of repeated.
-    undeclared: HashMap<String, (usize, usize)>,
+    /// Per undeclared name: the index of its first diagnostic, how many further
+    /// *distinct* uses were suppressed, and the span of the last one counted.
+    undeclared: HashMap<String, (usize, usize, u64)>,
     /// Where a constant was used, and what it was worth: `const_at` reads this.
     const_uses: HashMap<u64, Const>,
     next_proc_id: usize,
@@ -257,8 +259,14 @@ impl<'a> Sema<'a> {
         if let Err(e) = reclassify(module, &names) {
             sema.error(e.span, e.message);
         }
+        // The report's outermost scope is the *universe* of predefined
+        // identifiers (§10.2), and a module declares its own scope inside it —
+        // which is what lets a module or procedure declare `ABS` and have it hide
+        // the predefined one (§4). Declaring both in one scope made that a
+        // duplicate-declaration error instead.
         sema.push_scope();
         sema.predefine();
+        sema.push_scope();
         sema.imports(module);
         sema.decls(&module.decls, true);
         for s in &module.body {
@@ -399,12 +407,21 @@ impl<'a> Sema<'a> {
                     // Report a name once. Later uses of the same undeclared
                     // name add nothing but noise, so they are counted onto the
                     // first diagnostic instead (PLAN.md W5.2).
+                    // The same occurrence is resolved more than once in places
+                    // (a type-`CASE` label is looked up for its arm's view and
+                    // again for the label check), so only a *new* span is another
+                    // use: counting every failed lookup reports uses that do not
+                    // exist.
                     match self.undeclared.get_mut(&q[0]) {
-                        Some((_, count)) => *count += 1,
+                        Some((_, _, last)) if *last == span_key(span) => {}
+                        Some((_, count, last)) => {
+                            *count += 1;
+                            *last = span_key(span);
+                        }
                         None => {
                             let at = self.diags.len();
                             self.error(span, format!("`{}` is not declared (report 4)", q[0]));
-                            self.undeclared.insert(q[0].clone(), (at, 0));
+                            self.undeclared.insert(q[0].clone(), (at, 0, span_key(span)));
                         }
                     }
                     None
@@ -530,12 +547,12 @@ impl<'a> Sema<'a> {
     /// Attaches `N further uses are suppressed` to each undeclared name's first
     /// diagnostic. Called once, at the end.
     fn finish_undeclared_notes(&mut self) {
-        let entries: Vec<(String, (usize, usize))> = self
+        let entries: Vec<(String, (usize, usize, u64))> = self
             .undeclared
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        for (name, (at, count)) in entries {
+        for (name, (at, count, _)) in entries {
             if count == 0 || at >= self.diags.len() {
                 continue;
             }

@@ -260,11 +260,11 @@ enum Stmt {
     Repeat(Vec<Stmt>, Cond),
     /// `FOR v := lo TO hi DO body END`; `v` is read-only inside the body.
     For(usize, i32, i32, Vec<Stmt>),
-    /// `CASE e OF label: body | … END`. Oberon-07 has no `ELSE` in a case
-    /// statement: the default arm is an arm with an empty label list (report
-    /// appendix: `case = [CaseLabelList ":" StatementSequence]`). The generator
-    /// emits cases whose subject is a constant that one of the labels matches,
-    /// so no default arm is needed and every program is defined.
+    /// `CASE e OF label: body | … END`. Oberon-07 has no `ELSE`, and the report's
+    /// *default* arm — an empty label list followed by a statement sequence —
+    /// cannot be written in LALR(1) at all (PLAN.md W6.4). The generator sidesteps
+    /// both: the subject is a constant and one label always matches it, so no
+    /// default arm is needed and every generated program is defined.
     Case(Expr, Vec<(i32, Vec<Stmt>)>),
     Call(usize, Vec<Expr>),
 }
@@ -504,6 +504,10 @@ impl Gen {
 struct Program {
     g: Gen,
     body: Vec<Stmt>,
+    /// When set, a self-check after *every* top-level body statement, for that
+    /// variable: the first trap then names the statement that diverged, which is
+    /// how a failing seed is triaged.
+    per_statement: Option<usize>,
 }
 
 impl Program {
@@ -560,8 +564,21 @@ impl Program {
         }
 
         let _ = writeln!(out, "BEGIN");
-        for s in &self.body {
+        let trace = self.per_statement.map(|v| self.explain(v));
+        for (i, s) in self.body.iter().enumerate() {
             s.render(g, &[], 1, &mut out);
+            if let Some(trace) = &trace {
+                let v = self.per_statement.expect("trace implies a variable");
+                if let Some((_, value)) = trace.get(i) {
+                    let name = &g.mvars[v];
+                    let _ = writeln!(
+                        out,
+                        "  IF {name} # {} THEN fail[1] := 0 END;  (* after stmt {i}: {name} expected {} *)",
+                        literal(*value),
+                        value
+                    );
+                }
+            }
         }
         let expected = self.expectations();
         for (k, name) in g.mvars.iter().enumerate() {
@@ -695,11 +712,14 @@ fn generate(seed: u64) -> Program {
         frozen: vec![false; nmvars],
     };
 
-    // The module body: define every variable, then a handful of statements.
+    // The module body: define every variable, then a handful of statements. Each
+    // initial value is a *literal*: the report leaves a variable undefined until
+    // it is assigned, so an initialiser that read another variable would make the
+    // mirror depend on the C back end's static zero-initialisation.
     let mut body: Vec<Stmt> = Vec::new();
     for k in 0..g.mvars.len() {
-        let e = gen_expr(&mut g, 2);
-        body.push(Stmt::SetM(k, e));
+        let v = *g.rng.pick(&[0, 1, 2, -1, 7, 1000]);
+        body.push(Stmt::SetM(k, Expr::Int(v)));
     }
     // Every procedure except `R`, which is reached only through the
     // hand-written recursive call below: a random argument would make both the
@@ -767,7 +787,11 @@ fn generate(seed: u64) -> Program {
         g.funcs[f].body = fbody;
     }
 
-    Program { g, body }
+    Program {
+        g,
+        body,
+        per_statement: None,
+    }
 }
 
 /// A random expression. `depth` bounds the tree.
@@ -990,6 +1014,7 @@ fn main() {
     let mut base = 1u64;
     let mut print_only = false;
     let mut explain: Option<String> = None;
+    let mut per_statement: Option<String> = None;
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
@@ -1013,6 +1038,10 @@ fn main() {
                 work = PathBuf::from(&args[i]);
             }
             "--print" => print_only = true,
+            "--per-statement" => {
+                i += 1;
+                per_statement = Some(args[i].clone());
+            }
             "--explain" => {
                 i += 1;
                 explain = Some(args[i].clone());
@@ -1037,6 +1066,19 @@ fn main() {
         for (text, value) in program.explain(index) {
             println!("{value:>12}  {text}");
         }
+        return;
+    }
+    if let Some(var) = &per_statement {
+        let mut program = generate(base);
+        program.per_statement = Some(
+            program
+                .g
+                .mvars
+                .iter()
+                .position(|n| n == var)
+                .unwrap_or_else(|| panic!("no variable named `{var}` in seed {base}")),
+        );
+        print!("{}", program.render());
         return;
     }
     if print_only {
@@ -1091,8 +1133,6 @@ fn one(seed: u64, obc: &Path, work: &Path, keep: bool) -> Result<(), String> {
         .arg(&dir)
         .arg("-o")
         .arg(dir.join("Fuzz"))
-        .arg("--cflag")
-        .arg("-O0")
         .output()
         .map_err(|e| format!("cannot run {}: {e}", obc.display()))?;
     if !out.status.success() {

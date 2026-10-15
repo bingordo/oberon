@@ -109,6 +109,12 @@ static inline int32_t rt_ror(int32_t x, int32_t n) {
                      (uint32_t)x << ((32u - ((uint32_t)n & 31u)) & 31u));
 }
 
+/* `ABS(x)` takes its operand once: written as a conditional expression the
+ * operand would appear three times and a call in it would run twice. */
+static inline int32_t rt_abs(int32_t x) {
+    return (x < 0) ? -x : x;
+}
+
 static inline float rt_floor(float x) {
     int32_t t = (int32_t)x;
     return (float)((x < (float)t) ? (t - 1) : t);

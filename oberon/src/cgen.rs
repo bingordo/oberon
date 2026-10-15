@@ -1089,12 +1089,21 @@ impl<'a> Emitter<'a> {
         // The resolver is the checker's use-site table: a designator that names a
         // constant is folded to its value, which is what lets `MAX * (1 + c0)`
         // become one literal instead of a C expression that overflows.
-        if let Ok(c) = const_eval::eval_with(e, &|x| self.sema.const_at(x.span)) {
-            if let Some(v) = c.int() {
-                return format!("((int32_t){}u)", v);
-            }
-            if let Some(b) = c.bool() {
-                return if b { "1".to_string() } else { "0".to_string() };
+        // Two limits on what may be folded, both of them correctness rather than
+        // taste: only *structurally* constant trees (`foldable`), because the
+        // folder recognises a builtin such as `ABS` by its spelling and a nested
+        // procedure or a parameter may legally shadow that name — and a call may
+        // have side effects, so it has to reach the emitted C; and only values
+        // that are INTEGER or BOOLEAN, emitted in their own C type, because a
+        // CHAR taken through `Const::int()` would come out as an `int32_t` and
+        // the narrowing assignment is a `-Werror` failure where `char` is signed.
+        if self.foldable(e) {
+            match const_eval::eval_with(e, &|x| self.sema.const_at(x.span)) {
+                Ok(const_eval::Const::Int(v)) => return format!("((int32_t){}u)", v),
+                Ok(const_eval::Const::Bool(b)) => {
+                    return if b { "1".to_string() } else { "0".to_string() }
+                }
+                _ => {}
             }
         }
         match &e.kind {
@@ -1188,8 +1197,7 @@ impl<'a> Emitter<'a> {
         if self.types.same_type(lt, rt)
             && !matches!(self.types.get(lt), Type::Basic(Basic::Real))
             && matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
-            && l == r
-            && self.is_plain(l)
+            && self.same_plain(l, r)
         {
             let truth = matches!(op, BinOp::Eq | BinOp::Le | BinOp::Ge);
             return if truth { "1".into() } else { "0".into() };
@@ -1247,12 +1255,42 @@ impl<'a> Emitter<'a> {
         self.binary_plain(op, &a, &b, lt, rt)
     }
 
-    /// A literal, or a designator with no selectors: reading one has no side
-    /// effect, so a comparison of two identical ones is a constant.
-    fn is_plain(&self, e: &Expr) -> bool {
+    /// True when an expression is built only from literals, selector-free
+    /// designators and operators: folding such a tree cannot skip a call, and no
+    /// part of it can have a side effect. Exhaustive on purpose, so a new
+    /// expression form has to be classified rather than defaulting to "safe".
+    fn foldable(&self, e: &Expr) -> bool {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Char(_) | ExprKind::Bool(_) | ExprKind::Set(_) => true,
+            ExprKind::Int(_)
+            | ExprKind::Real(_)
+            | ExprKind::Char(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Set(_) => true,
             ExprKind::Designator(d) => d.sels.is_empty(),
+            ExprKind::Unary(_, x) => self.foldable(x),
+            ExprKind::Binary(_, l, r) => self.foldable(l) && self.foldable(r),
+            ExprKind::Nil | ExprKind::TypeTest(..) => false,
+        }
+    }
+
+    /// Whether two operands are the same literal or the same selector-free
+    /// designator. `Expr`'s derived `PartialEq` includes source *spans*, so two
+    /// occurrences of `x` in `x = x` never compare equal as parsed — which is why
+    /// this compares the structure that matters and nothing else.
+    fn same_plain(&self, l: &Expr, r: &Expr) -> bool {
+        match (&l.kind, &r.kind) {
+            (ExprKind::Int(a), ExprKind::Int(b)) => a == b,
+            (ExprKind::Char(a), ExprKind::Char(b)) => a == b,
+            (ExprKind::Bool(a), ExprKind::Bool(b)) => a == b,
+            (ExprKind::Str(a), ExprKind::Str(b)) => a == b,
+            (ExprKind::Designator(a), ExprKind::Designator(b)) => {
+                a.base == b.base && a.sels.is_empty() && b.sels.is_empty()
+            }
+            (ExprKind::Set(_), ExprKind::Set(_)) => matches!(
+                (const_eval::eval(l), const_eval::eval(r)),
+                (Ok(x), Ok(y)) if x == y
+            ),
             _ => false,
         }
     }
@@ -1825,8 +1863,10 @@ impl<'a> Emitter<'a> {
                     .first()
                     .and_then(|a| self.sema.type_at(a.span, self.types))
                     .unwrap_or(TypeId(0));
-                let x = one(self, 0, Some(t));
-                format!("(({x}) < 0 ? -({x}) : ({x}))")
+                // Through a helper: written inline, the operand appears three
+                // times and a call in it would run twice, possibly with two
+                // different results.
+                format!("rt_abs({})", one(self, 0, Some(t)))
             }
             "ODD" => {
                 let x = one(self, 0, None);
