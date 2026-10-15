@@ -579,11 +579,17 @@ The residue is now four seeds, each located:
   order is unspecified. That is the same temporary mechanism §9.5 already uses for
   structured value arguments (R16).
 * three are self-check traps whose divergence is inside the recursive function
-  `R` (`m0 := m0 + R(3)` is the statement that moves the variable the check
-  traps on). The next step is to trace *inside* the call — extend `--explain` to
-  follow a call into its body, or print the compiled value by rewriting the check
-  into an `Out.WriteInt` — because the mirror and the emitted C should agree there
-  and one of them is wrong.
+  `R` (`m0 := m0 + R(3)` is the statement that moves the variable the check traps
+  on), and `R`'s body is `acc := F0(...) * (m2 * m11) + R(n - 1)` where `F0`
+  *writes* `m2` — which the mirror reads left to right after the call. The
+  hypothesis, now DESIGN **R23**, is operand evaluation order: C does not fix it
+  and Oberon's reference compilers read left to right. A minimal reproduction
+  (a recursive function calling a procedure that increments a module variable,
+  multiplied by an operand that reads it) gives the left-to-right answer under gcc
+  at `-O0`, `-O1`, `-O2` and `-O3`, so the hypothesis is *not* demonstrated yet —
+  the next step is to make the fuzzer trace *inside* a call (`--explain` follows
+  the module body only), and to run the fuzzer against the documented `-O2` build
+  line rather than the `-O0` it uses for speed.
 
 `(b)` in the earlier list is *not* a cause: `(void)p;` marks a parameter used even
 when the body only assigns it (verified in C, gcc accepts both orders).
