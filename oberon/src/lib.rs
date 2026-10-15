@@ -26,9 +26,73 @@ use lalrpop_util::{ErrorRecovery, ParseError};
 pub type ParseErr<'input> = ParseError<usize, Token<'input>, LexicalError>;
 
 /// Parse a module, failing at the first syntax error.
+/// Which dialect the front end accepts (DESIGN §5: a dialect is a *gated* grammar,
+/// not a second grammar). `Report` is the report's Oberon-07. `Lower` additionally
+/// accepts reserved words spelled in lower case (PLAN.md W8.10) — the one extension
+/// that cannot be additive, because the report makes capital and lower-case letters
+/// distinct (report §3), so a report program that used `Begin` as a name would
+/// tokenise differently.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Dialect {
+    #[default]
+    Report,
+    Lower,
+}
+
+impl Dialect {
+    /// The name the interface header records, and the driver accepts.
+    pub fn name(self) -> &'static str {
+        match self {
+            Dialect::Report => "report",
+            Dialect::Lower => "lower",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Dialect> {
+        match name {
+            "report" => Some(Dialect::Report),
+            "lower" => Some(Dialect::Lower),
+            _ => None,
+        }
+    }
+
+    fn lexer<'input>(self, input: &'input str) -> Lexer<'input> {
+        match self {
+            Dialect::Report => Lexer::new(input),
+            Dialect::Lower => Lexer::with_folded_keywords(input),
+        }
+    }
+
+    /// A note for a token that is a reserved word *only* because this dialect folds
+    /// keyword case: without it a reader sees "unexpected `BEGIN`" where the program
+    /// wrote `begin`, and has no way to tell why. The spelling is checked, so an
+    /// honestly upper-case `BEGIN` — a reserved word in either dialect — gets no note.
+    fn collision_note(self, tok: &Token<'_>, text: &str) -> Option<String> {
+        if self != Dialect::Lower {
+            return None;
+        }
+        let spelling = lexer::keyword_spelling(tok)?;
+        if text == spelling {
+            return None;
+        }
+        Some(format!(
+            "this dialect folds reserved-word case, so `{text}` is the reserved word \
+             `{spelling}` here; an identifier needs a spelling that is not a reserved word \
+             in any case (W8.10)"
+        ))
+    }
+}
+
 pub fn parse_module<'input>(input: &'input str) -> Result<Module, ParseErr<'input>> {
+    parse_module_dialect(input, Dialect::Report)
+}
+
+pub fn parse_module_dialect<'input>(
+    input: &'input str,
+    dialect: Dialect,
+) -> Result<Module, ParseErr<'input>> {
     let mut errors = Vec::new();
-    let module = oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input))?;
+    let module = oberon::CompilationUnitParser::new().parse(&mut errors, dialect.lexer(input))?;
     match errors.into_iter().next() {
         // The grammar recovers so that one run can report every syntax error;
         // this entry point keeps the fail-fast contract its callers expect.
@@ -47,8 +111,18 @@ pub fn parse_module_recovering<'input>(
     Option<Module>,
     Vec<ErrorRecovery<usize, Token<'input>, LexicalError>>,
 ) {
+    parse_module_recovering_dialect(input, Dialect::Report)
+}
+
+pub fn parse_module_recovering_dialect<'input>(
+    input: &'input str,
+    dialect: Dialect,
+) -> (
+    Option<Module>,
+    Vec<ErrorRecovery<usize, Token<'input>, LexicalError>>,
+) {
     let mut errors = Vec::new();
-    match oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input)) {
+    match oberon::CompilationUnitParser::new().parse(&mut errors, dialect.lexer(input)) {
         Ok(module) => (Some(module), errors),
         Err(_) => (None, errors),
     }
@@ -63,12 +137,20 @@ use std::fmt::Write as _;
 /// emitter assumes the checks passed and would otherwise emit nonsense.
 /// The interface file text for a module, or `None` when it does not check.
 pub fn emit_interface(input: &str, interfaces: &[sym::Interface]) -> Option<String> {
-    let mut m = parse_module(input).ok()?;
+    emit_interface_dialect(input, interfaces, Dialect::Report)
+}
+
+pub fn emit_interface_dialect(
+    input: &str,
+    interfaces: &[sym::Interface],
+    dialect: Dialect,
+) -> Option<String> {
+    let mut m = parse_module_dialect(input, dialect).ok()?;
     let sema = sema::Sema::check_owned(&mut m, interfaces);
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return None;
     }
-    Some(sym::render(&cgen::interface_of(&m, &sema.types, &sema)))
+    Some(sym::render_dialect(&cgen::interface_of(&m, &sema.types, &sema), dialect))
 }
 
 pub fn emit_c<'input>(
@@ -86,7 +168,17 @@ pub fn emit_c_with_checks<'input>(
     interfaces: &[sym::Interface],
     checks: cgen::Checks,
 ) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
-    let mut m = parse_module(input)?;
+    emit_c_full(input, interfaces, checks, Dialect::Report)
+}
+
+/// The same, in a chosen dialect (PLAN.md W8.10).
+pub fn emit_c_full<'input>(
+    input: &'input str,
+    interfaces: &[sym::Interface],
+    checks: cgen::Checks,
+    dialect: Dialect,
+) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
+    let mut m = parse_module_dialect(input, dialect)?;
     let sema = sema::Sema::check_owned(&mut m, interfaces);
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return Ok(Err(sema.diags.clone()));
@@ -281,6 +373,13 @@ pub fn render_diagnostics(path: &str, src: &str, diags: &[Diagnostic]) -> String
 /// `END`, or a lexical error). The module comes back when the parser got far
 /// enough to build one.
 pub fn parse_with_diagnostics(input: &str) -> (Option<Module>, Vec<Diagnostic>) {
+    parse_with_diagnostics_dialect(input, Dialect::Report)
+}
+
+pub fn parse_with_diagnostics_dialect(
+    input: &str,
+    dialect: Dialect,
+) -> (Option<Module>, Vec<Diagnostic>) {
     let mut errors = Vec::new();
     let recovered = |errors: &Vec<ErrorRecovery<usize, Token<'_>, LexicalError>>| -> Vec<Diagnostic> {
         errors
@@ -290,11 +389,19 @@ pub fn parse_with_diagnostics(input: &str) -> (Option<Module>, Vec<Diagnostic>) 
                 if let Some(n) = recovery_note(&r.dropped_tokens) {
                     d = d.with_note(n);
                 }
+                // A reserved word the program spelled in lower case is only one
+                // because this dialect folds case; say so (W8.10).
+                if let ParseError::UnrecognizedToken { token: (start, tok, end), .. } = &r.error {
+                    let text = input.get(*start..*end).unwrap_or("");
+                    if let Some(n) = dialect.collision_note(tok, text) {
+                        d = d.with_note(n);
+                    }
+                }
                 d
             })
             .collect()
     };
-    match oberon::CompilationUnitParser::new().parse(&mut errors, Lexer::new(input)) {
+    match oberon::CompilationUnitParser::new().parse(&mut errors, dialect.lexer(input)) {
         Ok(module) => (Some(module), recovered(&errors)),
         Err(fatal) => {
             let mut diags = recovered(&errors);
@@ -311,7 +418,15 @@ pub fn check_module_recovering(
     input: &str,
     interfaces: &[sym::Interface],
 ) -> (Option<Module>, Vec<Diagnostic>) {
-    let (module, mut diags) = parse_with_diagnostics(input);
+    check_module_recovering_dialect(input, interfaces, Dialect::Report)
+}
+
+pub fn check_module_recovering_dialect(
+    input: &str,
+    interfaces: &[sym::Interface],
+    dialect: Dialect,
+) -> (Option<Module>, Vec<Diagnostic>) {
+    let (module, mut diags) = parse_with_diagnostics_dialect(input, dialect);
     match module {
         Some(mut m) => {
             let (_, mut sem) = sema::Sema::check(&mut m, interfaces);
@@ -1629,6 +1744,70 @@ END M.\n";
         assert!(e.is_empty(), "the report's SYSTEM entries must check: {e:#?}");
         let w = warnings(src, &[]);
         assert!(w.is_empty(), "every import is used, and so is P0: {w:#?}");
+    }
+
+    /// W8.10: the default dialect is the report's, so a reserved word spelled in
+    /// lower case is an identifier there — which is what makes the switch, rather
+    /// than the change, the safe direction.
+    #[test]
+    fn lower_case_keywords_need_the_dialect() {
+        let src = "module M;\n  var i: INTEGER;\nbegin\n  i := 1\nend M.\n";
+        let (parsed, report) = parse_with_diagnostics(src);
+        assert!(parsed.is_none(), "the report dialect cannot read `module`");
+        assert!(
+            report
+                .iter()
+                .any(|d| d.notes.iter().any(|n| n.contains("MODULE"))),
+            "and the note names what it wanted: {report:#?}"
+        );
+
+        let lower = parse_module_dialect(src, Dialect::Lower);
+        assert!(lower.is_ok(), "the lower dialect accepts it: {lower:?}");
+
+        // Identifiers stay case-sensitive...
+        let mixed = parse_module_dialect(
+            "module M;\n  var Foo, foo: INTEGER;\nbegin\n  Foo := 1; foo := 2\nend M.\n",
+            Dialect::Lower,
+        );
+        assert!(mixed.is_ok(), "Foo and foo remain distinct: {mixed:?}");
+
+        // ... and the predeclared *identifiers* are not folded with them: a
+        // declaration named `integer` is a different name from `INTEGER`, in
+        // either dialect. (Aliasing those is the separate, additive half W8.10
+        // describes; it is not in this change.)
+        let shadow = parse_module_dialect(
+            "module M;\n  var integer: INTEGER;\nbegin\n  integer := 1\nend M.\n",
+            Dialect::Lower,
+        );
+        assert!(shadow.is_ok(), "a lowercase `integer` is an identifier: {shadow:?}");
+    }
+
+    /// W8.10: when a reserved word *is* a collision — the dialect folds case, and an
+    /// identifier was spelled like a keyword — the diagnostic says why, because
+    /// otherwise "unexpected `BEGIN`" is a puzzle.
+    #[test]
+    fn a_folded_collision_explains_itself() {
+        let src = "module M;\n  var begin: INTEGER;\nbegin\n  begin := 1\nend M.\n";
+        let (_, diags) = parse_with_diagnostics_dialect(src, Dialect::Lower);
+        let noted = diags.iter().any(|d| {
+            d.notes.iter().any(|n| n.contains("folds reserved-word case"))
+        });
+        assert!(noted, "a folded collision must name the dialect: {diags:#?}");
+
+        // An honestly upper-case keyword gets no such note: it is a reserved word
+        // in either dialect, so nothing about the dialect explains it.
+        // Spelled the way the report spells it: a reserved word in either dialect,
+        // so nothing about the dialect explains it.
+        let (_, upper) = parse_with_diagnostics_dialect(
+            "MODULE M;\n  VAR BEGIN: INTEGER;\nBEGIN\n  BEGIN := 1\nEND M.\n",
+            Dialect::Lower,
+        );
+        assert!(
+            !upper
+                .iter()
+                .any(|d| d.notes.iter().any(|n| n.contains("folds reserved-word case"))),
+            "{upper:#?}"
+        );
     }
 
     /// W8.2: `MIN(T)`/`MAX(T)` name the extreme of an ordinal type, and the value

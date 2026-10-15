@@ -15,6 +15,24 @@ fn main() -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(20);
+    // The dialect, spelled the way the driver spells it (PLAN.md W8.10): the
+    // report's Oberon-07 unless asked for the case-folding one.
+    let dialect = match args.iter().position(|a| a.starts_with("-Odialect=")) {
+        Some(i) => {
+            let name = &args[i]["-Odialect=".len()..];
+            match oberon_front::Dialect::from_name(name) {
+                Some(d) => d,
+                None => {
+                    eprintln!(
+                        "`-Odialect={name}` is not a dialect this compiler knows; expected \
+                         report or lower"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => oberon_front::Dialect::Report,
+    };
     let report = |src: &str, diags: &mut Vec<oberon_front::Diagnostic>| {
         let suppressed = oberon_front::limit_errors(diags, ferror_limit);
         let text = oberon_front::render_diagnostics(path, src, diags);
@@ -80,15 +98,20 @@ fn main() -> ExitCode {
                 }
             }
         }
-        return match oberon_front::emit_c(&src, &ifaces) {
+        return match oberon_front::emit_c_full(
+            &src,
+            &ifaces,
+            oberon_front::cgen::Checks::ALL,
+            dialect,
+        ) {
             Ok(Ok((c, h))) => {
-                let name = oberon_front::parse_module(&src)
+                let name = oberon_front::parse_module_dialect(&src, dialect)
                     .map(|m| m.name)
                     .unwrap_or_else(|_| "module".to_string());
                 let write = |file: String, text: &str| -> std::io::Result<()> {
                     std::fs::write(std::path::Path::new(&dir).join(file), text)
                 };
-                let sym_text = oberon_front::emit_interface(&src, &ifaces);
+                let sym_text = oberon_front::emit_interface_dialect(&src, &ifaces, dialect);
                 let r = write(format!("{name}.c"), &c)
                     .and_then(|_| write(format!("{name}.h"), &h))
                     .and_then(|_| write("oberon.h".into(), oberon_front::cgen::RUNTIME_HEADER))
@@ -123,7 +146,8 @@ fn main() -> ExitCode {
 
     let check = args.iter().any(|a| a == "-c" || a == "--check");
     if check {
-        let (_, mut diags) = oberon_front::check_module_recovering(&src, &[]);
+        let (_, mut diags) =
+            oberon_front::check_module_recovering_dialect(&src, &[], dialect);
         let has_error = diags.iter().any(|d| d.is_error());
         report(&src, &mut diags);
         return if has_error {
@@ -132,7 +156,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         };
     }
-    match oberon_front::parse_module(&src) {
+    match oberon_front::parse_module_dialect(&src, dialect) {
         Ok(m) => {
             println!("{m:#?}");
             ExitCode::SUCCESS

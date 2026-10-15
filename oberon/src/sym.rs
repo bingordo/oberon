@@ -52,9 +52,21 @@ pub struct Interface {
 }
 
 pub fn render(i: &Interface) -> String {
+    render_dialect(i, crate::Dialect::Report)
+}
+
+/// The same, recording the dialect the module was compiled in (PLAN.md W8.10). An
+/// interface means the same thing to either dialect — its names are user
+/// identifiers, and those stay case-sensitive — so the line is there for the reader
+/// rather than enforced, and the default writes no line at all, which keeps a report
+/// interface byte-identical to what it was.
+pub fn render_dialect(i: &Interface, dialect: crate::Dialect) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "MODULE {}", i.module);
     let _ = writeln!(s, "VERSION {FORMAT_VERSION}");
+    if dialect != crate::Dialect::Report {
+        let _ = writeln!(s, "DIALECT {}", dialect.name());
+    }
     if !i.imports.is_empty() {
         let _ = writeln!(s, "IMPORT {}", i.imports.join(", "));
     }
@@ -139,6 +151,18 @@ pub fn parse(text: &str) -> Result<Interface, String> {
                 ));
             }
             seen_version = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("DIALECT ") {
+            // Accepted and validated, not enforced: a client does not need to share
+            // its producer's dialect to read its names.
+            let name = rest.trim();
+            if crate::Dialect::from_name(name).is_none() {
+                return Err(format!(
+                    "line {lineno}: this interface names a dialect `{name}` that this compiler \
+                     does not know: recompile the module"
+                ));
+            }
             continue;
         }
         if let Some(rest) = line.strip_prefix("IMPORT ") {

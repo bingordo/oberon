@@ -203,6 +203,13 @@ impl fmt::Display for Token<'_> {
     }
 }
 
+/// The report's spelling of a reserved word, when `t` is one: what a
+/// case-folding dialect needs to explain that an identifier is not one here
+/// (PLAN.md W8.10).
+pub fn keyword_spelling(t: &Token<'_>) -> Option<&'static str> {
+    KEYWORDS.iter().find(|(_, tok)| tok == t).map(|(kw, _)| *kw)
+}
+
 /// Reserved words, with the spelling the report fixes (all upper case).
 const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("ARRAY", Token::Array),

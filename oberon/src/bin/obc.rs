@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use oberon_front::{
-    cgen, check_module_recovering, emit_c_with_checks, emit_interface, limit_errors, parse_module,
-    parse_with_diagnostics, render_diagnostics, sym, Diagnostic,
+    cgen, check_module_recovering_dialect, emit_c_full, emit_interface_dialect, limit_errors,
+    parse_with_diagnostics_dialect, render_diagnostics, sym, Diagnostic,
+    Dialect,
 };
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
@@ -60,6 +61,9 @@ struct Opts {
     /// Which runtime checks to write: all of them unless `-Ochecks=…` narrows the
     /// set (DESIGN §9.4, PLAN.md W3.1 and W8.3).
     checks: cgen::Checks,
+    /// Which dialect to accept: the report's Oberon-07 unless `-Odialect=lower`
+    /// (DESIGN §5, PLAN.md W8.10).
+    dialect: Dialect,
 }
 
 /// One module in the link: source this build emitted, or C found on disk.
@@ -84,7 +88,8 @@ fn usage() -> ExitCode {
          \x20 --keep            keep the temporary build directory\n\
          \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)
          \x20 -Ochecks[=LIST]   runtime checks: all (default), none, or a list of
-         \x20                   index, nil, guard and case)"
+         \x20                   index, nil, guard and case
+         \x20 -Odialect=NAME    report (default) or lower, which folds reserved-word case)"
     );
     ExitCode::FAILURE
 }
@@ -143,6 +148,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         keep: false,
         ferror_limit: 20,
         checks: cgen::Checks::ALL,
+        dialect: Dialect::Report,
     };
     let mut i = 2;
     while i < args.len() {
@@ -167,6 +173,19 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
+            other if other.starts_with("-Odialect=") => {
+                let name = &other["-Odialect=".len()..];
+                match Dialect::from_name(name) {
+                    Some(d) => o.dialect = d,
+                    None => {
+                        eprintln!(
+                            "obc: `-Odialect={name}` is not a dialect this compiler knows; \
+                             expected report or lower"
+                        );
+                        return None;
+                    }
+                }
+            }
             "-Ochecks" => o.checks = cgen::Checks::ALL,
             other if other.starts_with("-Ochecks=") => {
                 let list = &other["-Ochecks=".len()..];
@@ -214,7 +233,7 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     let mut done: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = Vec::new();
     let root_src = read(&o.root)?;
-    let root = module_name(&root_src);
+    let root = module_name(&root_src, o.dialect);
     emit_tree(
         o,
         &refused,
@@ -311,7 +330,7 @@ fn emit_tree(
     // Parse with recovery: the imports are needed to resolve dependencies even
     // when the module has syntax errors, and the errors themselves are reported
     // below together with the semantic ones.
-    let (parsed, syntax) = parse_with_diagnostics(src);
+    let (parsed, syntax) = parse_with_diagnostics_dialect(src, o.dialect);
     let parsed = match parsed {
         Some(m) => m,
         None => {
@@ -402,7 +421,7 @@ fn emit_tree(
     // Now the imports' interfaces exist, so this module can be checked. The
     // parser recovers at statement level, so one run reports syntax errors *and*
     // type errors rather than stopping at the first of either.
-    let (parsed, mut diags) = check_module_recovering(src, interfaces);
+    let (parsed, mut diags) = check_module_recovering_dialect(src, interfaces, o.dialect);
     // An interface the checker reports as missing may have been *refused* rather
     // than absent — a version this compiler does not read — and the reason is
     // worth more than "no interface". This is the place that knows an interface is
@@ -428,7 +447,7 @@ fn emit_tree(
         return Err(format!("`{name}` does not check"));
     }
     let _ = parsed;
-    let (c, h) = emit_c_with_checks(src, interfaces, o.checks)
+    let (c, h) = emit_c_full(src, interfaces, o.checks, o.dialect)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .map_err(|diags| {
             print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
@@ -436,7 +455,7 @@ fn emit_tree(
         })?;
     write(&o.out.join(format!("{name}.c")), &c)?;
     write(&o.out.join(format!("{name}.h")), &h)?;
-    if let Some(text) = emit_interface(src, interfaces) {
+    if let Some(text) = emit_interface_dialect(src, interfaces, o.dialect) {
         write(&o.out.join(format!("{name}.sym")), &text)?;
         if let Ok(iface) = sym::parse(&text) {
             // Every module in the build sees this interface from now on.
@@ -544,13 +563,12 @@ fn loader_source(units: &[Unit], command: Option<&(String, String)>) -> String {
 /// The module's name, from whatever parsed. A file too broken to parse still has
 /// to reach the diagnostics, so this never fails: the name is only used for
 /// output file names, which nothing reaches when the module does not parse.
-fn module_name(src: &str) -> String {
-    match parse_with_diagnostics(src).0 {
+fn module_name(src: &str, dialect: Dialect) -> String {
+    let (parsed, _) = parse_with_diagnostics_dialect(src, dialect);
+    match parsed {
         Some(m) => m.name,
         // Nothing parsed: name it after the file, so the message reads naturally.
-        None => parse_module(src)
-            .map(|m| m.name)
-            .unwrap_or_else(|_| "the module".to_string()),
+        None => "the module".to_string(),
     }
 }
 
