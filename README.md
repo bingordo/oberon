@@ -35,18 +35,22 @@ Every change keeps these green (PLAN.md's preamble is the same list):
 cargo test --manifest-path oberon/Cargo.toml
 bash oberon/golden/run.sh      # 67 cases, plain and under ASan/UBSan
 bash oberon/csmoke/run.sh      # 67 C-level cases
-bash oberon/e2e/run.sh         # 55 checks, end to end through the driver
-bash oberon/fuzz/run.sh        # the seeds that once found a defect, then 100 more
+bash oberon/e2e/run.sh         # 101 checks, end to end through the driver
+bash oberon/fuzz/run.sh        # the regression list in four modes, then coverage
 cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings
 ```
 
 That list is what CI runs (`.github/workflows/gate.yml`), on a clean checkout.
 
 `bash oberon/fuzz/run.sh` runs `oberon/fuzz/regressions.txt` — every seed that once
-found a defect, each with the reason it is listed — and then a coverage block;
-`SEEDS`/`BASE` select one contiguous range instead. A seed reproduces a random
-program exactly, together with the values it must compute, so the list is a
-regression suite rather than a memory of one.
+found a defect, each with the reason it is listed — as a value oracle, as a trap
+oracle, against the collector with a collection forced on every allocation, and in
+the `-Odialect=lower` dialect; then a coverage block and an adversarial one, where
+each program ends in a deliberate violation and the run must produce the exact trap
+line, source byte included. `SEEDS`/`BASE`/`COVER`/`ADVCOVER`/`SAN` select other runs,
+and `BACKEND=clif` runs the corpus against the Cranelift back end instead of the C
+one. A seed reproduces a random program exactly, together with the values it must
+compute, so the list is a regression suite rather than a memory of one.
 
 ## Using it
 
@@ -56,6 +60,7 @@ obc emit  Foo.mod --out DIR     # Foo.c, Foo.h and the runtime header
 obc build Foo.mod -o Foo        # resolve the import graph, emit, and call cc
 obc build Foo.mod -o Foo -Ochecks=nil   # runtime checks: all (default), none, or a list
 obc run   Foo.mod --command Foo.Run
+obc build Foo.mod -o Foo --backend=clif  # emit an ELF object with Cranelift, then link
 ```
 
 The emitted C is written to compile with
