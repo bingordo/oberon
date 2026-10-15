@@ -501,6 +501,25 @@ struct Program {
 }
 
 impl Program {
+    /// The mirror's value of one module variable after each top-level statement
+    /// of the module body, with the statement as Oberon. A failing seed names the
+    /// variable (`(* check m1 expected 2 *)`), so this says which statement moved
+    /// it away from that expectation.
+    fn explain(&self, var: usize) -> Vec<(String, i32)> {
+        let mut m = vec![0i32; self.g.mvars.len()];
+        let mut l: Vec<i32> = Vec::new();
+        let mut out = Vec::new();
+        for s in &self.body {
+            s.exec(&self.g, &mut m, &mut l, 0);
+            let mut text = String::new();
+            s.render(&self.g, &[], 1, &mut text);
+            // One line per statement, however deeply nested its own text is.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push((flat, m[var]));
+        }
+        out
+    }
+
     /// The expected value of every module variable, from the mirror.
     fn expectations(&self) -> Vec<i32> {
         let mut m = vec![0i32; self.g.mvars.len()];
@@ -964,6 +983,7 @@ fn main() {
     let mut seeds = 25u64;
     let mut base = 1u64;
     let mut print_only = false;
+    let mut explain: Option<String> = None;
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
@@ -987,6 +1007,10 @@ fn main() {
                 work = PathBuf::from(&args[i]);
             }
             "--print" => print_only = true,
+            "--explain" => {
+                i += 1;
+                explain = Some(args[i].clone());
+            }
             "--keep" => keep = true,
             other => {
                 eprintln!("obgen: unknown argument {other}");
@@ -996,6 +1020,19 @@ fn main() {
         i += 1;
     }
 
+    if let Some(var) = &explain {
+        let program = generate(base);
+        let index = program
+            .g
+            .mvars
+            .iter()
+            .position(|n| n == var)
+            .unwrap_or_else(|| panic!("no variable named `{var}` in seed {base}"));
+        for (text, value) in program.explain(index) {
+            println!("{value:>12}  {text}");
+        }
+        return;
+    }
     if print_only {
         print!("{}", generate(base).render());
         return;
