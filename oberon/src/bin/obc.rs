@@ -352,9 +352,6 @@ fn emit_tree(
                         // does not read) is not a missing one, and saying which it
                         // is here means no unrelated `.sym` on the search path is
                         // reported (PLAN.md W3.2).
-                        if let Some(why) = refused.get(&m) {
-                            return Err(why.to_string());
-                        }
                         return Err(format!(
                             "no interface for module `{m}` on the search path (looked for {m}.sym, \
                              {m}.mod and {m}.c)"
@@ -370,6 +367,19 @@ fn emit_tree(
     // parser recovers at statement level, so one run reports syntax errors *and*
     // type errors rather than stopping at the first of either.
     let (parsed, mut diags) = check_module_recovering(src, interfaces);
+    // An interface the checker reports as missing may have been *refused* rather
+    // than absent — a version this compiler does not read — and the reason is
+    // worth more than "no interface". This is the place that knows an interface is
+    // needed, whatever backs it: a `.sym`, a `.mod`, or C (PLAN.md W3.2).
+    for d in &diags {
+        if let Some(rest) = d.message.split("no interface for module `").nth(1) {
+            if let Some(name) = rest.split('`').next() {
+                if let Some(why) = refused.get(name) {
+                    eprintln!("{why}");
+                }
+            }
+        }
+    }
     let suppressed = limit_errors(&mut diags, o.ferror_limit);
     print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
     if suppressed > 0 {
@@ -436,11 +446,21 @@ fn find_interfaces(o: &Opts) -> (Vec<sym::Interface>, HashMap<String, String>) {
                         }
                     }
                     Err(e) => {
-                        // Keyed by module name, because that is what a missing
-                        // interface is reported as.
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        // Keyed by the module its own header names, because that is
+                        // what a missing interface is reported as: a hand-renamed
+                        // `Alias.sym` holding `MODULE M` must be found under `M`.
+                        // The header is readable even when the rest is not.
+                        let named = text
+                            .lines()
+                            .find_map(|l| l.trim().strip_prefix("MODULE "))
+                            .and_then(|rest| rest.split_whitespace().next())
+                            .map(str::to_string);
+                        let key = named.or_else(|| {
+                            p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+                        });
+                        if let Some(key) = key {
                             refused
-                                .entry(stem.to_string())
+                                .entry(key)
                                 .or_insert_with(|| format!("{}: {e}", p.display()));
                         }
                     }

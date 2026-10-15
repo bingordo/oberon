@@ -96,6 +96,9 @@ pub struct Emitter<'a> {
     /// for structured value parameters). Flushed exactly where the construct is
     /// evaluated once — never out of a loop.
     prelude: String,
+    /// Set while rendering an assignment's target: a guard there has to be
+    /// hoisted, because its comma form is not an lvalue.
+    hoist_guards: bool,
     anon: usize,
 }
 
@@ -123,6 +126,7 @@ impl<'a> Emitter<'a> {
             scopes: vec![HashMap::new()],
             frames: Vec::new(),
             prelude: String::new(),
+            hoist_guards: false,
             anon: 0,
         }
     }
@@ -790,7 +794,9 @@ impl<'a> Emitter<'a> {
     fn stmt(&mut self, s: &Stmt, out: &mut String, level: usize) {
         match &s.kind {
             StmtKind::Assign { target, value } => {
+                self.hoist_guards = true;
                 let dst = self.designator(target, level);
+                self.hoist_guards = false;
                 let dst_ty0 = self.sema.type_at(target.span, self.types);
                 let src_ty0 = self.sema.type_at(value.span, self.types);
                 let pre = self.take_prelude();
@@ -1370,6 +1376,23 @@ impl<'a> Emitter<'a> {
     /// How a symbol is written where it is used: a plain name, a frame field
     /// reached through the static links, and for a `VAR` parameter a deref of
     /// whichever of those holds the pointer.
+    /// The hidden length that accompanies an open-array formal, named the way
+    /// `access` names the array itself (through the static links when the
+    /// parameter belongs to an enclosing procedure).
+    fn access_len(&self, s: &Sym, level: usize) -> String {
+        let place = if s.level == 0 || s.level >= level {
+            s.cname.clone()
+        } else {
+            let mut link = String::from("sl");
+            for _ in 0..(level - s.level - 1) {
+                link = format!("(*(void **)({link}))");
+            }
+            let frame = self.frame_at(s.level);
+            format!("(({frame} *){link})->{}", s.cname.trim_start_matches("f."))
+        };
+        format!("{place}__len")
+    }
+
     fn access(&self, s: &Sym, level: usize) -> String {
         let place = if s.level == 0 || s.level >= level {
             s.cname.clone()
@@ -1385,7 +1408,12 @@ impl<'a> Emitter<'a> {
             let frame = self.frame_at(s.level);
             format!("(({frame} *){link})->{}", s.cname.trim_start_matches("f."))
         };
-        if s.by_var {
+        // A `VAR` parameter is a pointer to the actual, so the access dereferences
+        // it — except an *open array*, whose parameter is already the pointer to
+        // the first element (§9.2), in both modes. Dereferencing that one produced
+        // `(*v)[i]`, which does not compile: found by the trap matrix's open-array
+        // case (PLAN.md W7.4).
+        if s.by_var && !matches!(self.types.get(s.ty), Type::OpenArray { .. }) {
             format!("(*{place})")
         } else {
             place
@@ -1521,6 +1549,13 @@ impl<'a> Emitter<'a> {
         // sound while `p` has no side effect. An *index* expression may contain a
         // call, so the flag is tracked selector by selector.
         let mut volatile = false;
+        // An open-array formal's length is a hidden companion parameter (§9.2),
+        // and the *index* check needs it — only the base of a designator can be an
+        // open array, so it is captured once here.
+        let mut open_len: Option<String> = base_sym
+            .as_ref()
+            .filter(|s| matches!(self.types.get(s.ty), Type::OpenArray { .. }))
+            .map(|s| self.access_len(s, level));
         for sel in &d.sels {
             match sel {
                 Selector::Field(f) => {
@@ -1549,8 +1584,19 @@ impl<'a> Emitter<'a> {
                     for e in ix {
                         let i = self.expr(e, Some(self.types.integer()));
                         if open {
-                            // An open-array parameter is a pointer (report §10.1).
-                            let _ = write!(text, "[{i}]");
+                            // An open-array parameter is a pointer (report §10.1)
+                            // and its length is that companion parameter, so the
+                            // bounds check has something to check against. Indexing
+                            // an open array used to be emitted with no check at all
+                            // — the trap matrix found it (PLAN.md W7.4).
+                            match open_len.take() {
+                                Some(len) => {
+                                    let _ = write!(text, "[rt_index({i}, {len}, {})]", d.span.lo);
+                                }
+                                None => {
+                                    let _ = write!(text, "[{i}]");
+                                }
+                            }
                         } else {
                             match self.types.array_len(ty) {
                                 Some(n) => {
@@ -1597,11 +1643,18 @@ impl<'a> Emitter<'a> {
                         let dyn_test = format!(
                             "(({text}) != NULL && rt_is((*(const ObDesc *const *)(const void *)({text})), {desc}))"
                         );
-                        text = format!(
-                            "((rt_guard_is({dyn_test}, \"type guard failed at byte {}\"), (({}){text})))",
-                            d.span.lo,
-                            self.c_type(t)
-                        );
+                        let view = format!("(({}){text})", self.c_type(t));
+                        let test = format!("rt_guard_is({dyn_test}, \"type guard failed at byte {}\")", d.span.lo);
+                        text = if self.hoist_guards {
+                            // An assignment's target has to be an *lvalue*, and a
+                            // comma expression is not one, so the check is hoisted
+                            // to a statement before the assignment — which the
+                            // assignment emitter already flushes.
+                            let _ = writeln!(self.prelude, "    {test};");
+                            view
+                        } else {
+                            format!("(({test}, {view}))")
+                        };
                         ty = t;
                         is_pointer = true;
                     } else {
@@ -1617,11 +1670,17 @@ impl<'a> Emitter<'a> {
                         };
                         let desc = self.descriptor_name(t);
                         let dyn_test = self.dyn_of(&sub, sub_ty);
-                        text = format!(
-                            "((rt_guard_is(rt_is({dyn_test}, {desc}), \"type guard failed at byte {}\"), (*(({} *)(void *)&({sub})))))",
-                            d.span.lo,
-                            self.c_type(t)
+                        let view = format!("(*(({} *)(void *)&({sub})))", self.c_type(t));
+                        let test = format!(
+                            "rt_guard_is(rt_is({dyn_test}, {desc}), \"type guard failed at byte {}\")",
+                            d.span.lo
                         );
+                        text = if self.hoist_guards {
+                            let _ = writeln!(self.prelude, "    {test};");
+                            view
+                        } else {
+                            format!("(({test}, {view}))")
+                        };
                         ty = t;
                         is_pointer = false;
                     }

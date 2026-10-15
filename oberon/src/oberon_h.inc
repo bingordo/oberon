@@ -192,8 +192,15 @@ static inline int32_t rt_is(const ObDesc *d, const ObDesc *target) {
 
 /* NEW(p): the block carries the descriptor of p's static base type in its first
  * word, and failure yields NULL, which is what the report says (6.4). */
+/* `OB_ALLOC_FAIL_AT=n` makes the n-th allocation fail, so that `NEW`'s specified
+ * failure (report §6.4: the pointer becomes NIL) is testable at all — otherwise
+ * it needs an exhausted heap, which no suite should arrange (PLAN.md W7.4). */
 static inline void *rt_new(int32_t size, const ObDesc *d) {
     void *p;
+    static int32_t allocations = 0;
+    const char *fail_at = getenv("OB_ALLOC_FAIL_AT");
+    allocations += 1;
+    if (fail_at != NULL && atoi(fail_at) == allocations) return NULL;
     if (size < (int32_t)sizeof(const ObDesc *)) size = (int32_t)sizeof(const ObDesc *);
     p = malloc((size_t)size);
     if (p == NULL) return NULL;

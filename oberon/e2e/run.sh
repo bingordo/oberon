@@ -187,6 +187,98 @@ printf 'MODULE Needs;\n  IMPORT Unrelated;\nBEGIN\nEND Needs.\n' > "$DRV/Needs.m
 check "a-refused-interface-that-is-needed-is-explained" "1" \
     "$(grep -c 'Unrelated.sym: no VERSION line' "$DRV/needs.out")"
 
+# The trap matrix: one deliberate violation per kind, each in its own module (the
+# first trap aborts the process), each asserting the message and the offset rather
+# than merely that something went wrong (PLAN.md W7.4).
+trap_case() { # name source expected-message
+    printf '%s' "$2" > "$DRV/$1.mod"
+    "$OBC" build "$DRV/$1.mod" --out "$DRV" -o "$DRV/$1" >/dev/null 2>&1 || {
+        echo "FAIL trap-$1: did not build"
+        fail=$((fail + 1))
+        return
+    }
+    sh -c '"$0" >/dev/null 2>"$1"' "$DRV/$1" "$DRV/$1.err" || true
+    check "trap-$1" "1" "$(grep -c "$3" "$DRV/$1.err")"
+}
+
+trap_case index-below-zero 'MODULE T1;
+  VAR a: ARRAY 4 OF INTEGER; i: INTEGER;
+BEGIN
+  i := (-1);
+  a[i] := 1
+END T1.
+' 'index out of range (at byte'
+trap_case index-at-len 'MODULE T2;
+  VAR a: ARRAY 4 OF INTEGER;
+BEGIN
+  a[4] := 1
+END T2.
+' 'index out of range (at byte'
+trap_case index-in-open-array 'MODULE T3;
+  VAR a: ARRAY 4 OF INTEGER;
+  PROCEDURE Fill(VAR v: ARRAY OF INTEGER);
+  BEGIN
+    v[4] := 1
+  END Fill;
+BEGIN
+  Fill(a)
+END T3.
+' 'index out of range (at byte'
+# A failed guard traps. The *record* spelling is covered here through a record
+# copy from the guarded view — reading a derived *field* through the view is the
+# static-analysis problem R15 records, where gcc sees the read is out of the
+# allocation's bounds and -Werror rejects the program although the guard's trap
+# fires first. The *pointer* spelling is the pre-existing `failed-guard-traps` row.
+trap_case guard-record-spelling 'MODULE T4;
+  TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R;
+  VAR p: P; s: S;
+BEGIN
+  NEW(p);
+  s := p(S)
+END T4.
+' 'type guard failed at byte'
+trap_case case-no-match 'MODULE T6;
+  TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
+  VAR p: P;
+BEGIN
+  NEW(p);
+  CASE p OF PS: END
+END T6.
+' 'no matching type'
+trap_case div-by-zero 'MODULE T7;
+  VAR i, j: INTEGER;
+BEGIN
+  j := 0;
+  i := 7 DIV j
+END T7.
+' 'DIV by zero'
+trap_case mod-by-zero 'MODULE T8;
+  VAR i, j: INTEGER;
+BEGIN
+  j := 0;
+  i := 7 MOD j
+END T8.
+' 'MOD by zero'
+trap_case failing-assert 'MODULE T9;
+BEGIN
+  ASSERT(1 = 2)
+END T9.
+' 'assertion failed'
+
+# `NEW` failing is *specified* to yield NIL (report §6.4), so the hook makes it
+# observable: the program traps itself if the allocation did not fail.
+printf 'MODULE T10;
+  TYPE R = RECORD x: INTEGER END;
+  VAR p: POINTER TO R; fail: ARRAY 1 OF INTEGER;
+BEGIN
+  NEW(p);
+  IF p # NIL THEN fail[1] := 0 END
+END T10.
+' > "$DRV/T10.mod"
+"$OBC" build "$DRV/T10.mod" --out "$DRV" -o "$DRV/T10" >/dev/null 2>&1 || true
+OB_ALLOC_FAIL_AT=1 sh -c '"$0" >/dev/null 2>&1' "$DRV/T10"
+check "a-failing-new-yields-nil" "0" "$?"
+
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true

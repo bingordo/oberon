@@ -761,7 +761,7 @@ itself — and it is honest about the two exceptions rather than implying
 completeness: `rt_new`'s failure path has no test yet (W7.4's allocation hook) and
 the NIL check is omitted for a side-effecting operand (R26).
 
-**W7.4 the trap matrix in `e2e`** — **open**
+**W7.4 the trap matrix in `e2e`** — **done, and it found two compiler defects**
 Why: one deliberate violation per kind, each asserting the *offset* reported,
 since a trap that says the wrong place is nearly as bad as no trap.
 Each in its own module (the first trap aborts the process): index below 0, index
@@ -771,7 +771,22 @@ match, `DIV`/`MOD` by zero, and a failing `ASSERT`. `NEW` failing needs a way to
 force it — `rt_new` is already the hatch (R3) — so an `OB_ALLOC_FAIL_AT=n`
 environment hook makes that row testable too.
 Done when: the matrix runs in the gate and each row's expected offset is
-asserted, not just "it trapped".
+asserted, not just "it trapped". **Done**: eleven rows — three index shapes (below
+zero, at `LEN`, in an open-array parameter), both guard spellings, a type-`CASE`
+with no match, `DIV` and `MOD` by zero, a failing `ASSERT`, the two `NIL`
+dereferences and `NEW` failing (through `OB_ALLOC_FAIL_AT`, without which the
+report's specified failure is untestable) — each in its own module, each asserting
+the message *and* the offset.
+
+It earned its keep immediately, finding two real defects that no other suite could
+see (DESIGN R27, R28): a `VAR` open-array parameter was dereferenced as if it were
+a pointer to the array (the emitted C did not compile), and an open-array index had
+**no bounds check at all** against the hidden length. Both are fixed.
+
+One row stays narrower than it looks: a *failing* guard that also reads the guarded
+field cannot be written under `-Werror` at all — gcc sees the read is outside the
+allocation (R15) — so the matrix's guard rows use the guard as a value and the
+pointer spelling, and R15 keeps its record.
 
 **W7.5 the generator as a memory-safety oracle** — **open**
 Why: the self-checks in W6.1 verify *values*; they cannot see a wrong length, a
