@@ -136,6 +136,22 @@ check "clean-module-shows-its-warning" "1" \
     "$(grep -c 'warning: import `Texts` is never used' "$DRV/warn.out")"
 check "a-warning-does-not-fail-the-build" "0" "$warn_status"
 
+# A file with sixty broken statements prints twenty errors and says how many it
+# suppressed; `--ferror-limit 0` means no limit (PLAN.md W5.2).
+{
+    printf 'MODULE Flood;\n  VAR x: INTEGER;\nBEGIN\n'
+    for _ in $(seq 60); do printf '  x := ;\n'; done
+    printf 'END Flood.\n'
+} > "$DRV/Flood.mod"
+"$OBC" check "$DRV/Flood.mod" --out "$DRV" >"$DRV/flood.out" 2>&1 || true
+check "the-error-limit-caps-a-flood" "20" \
+    "$(grep -c 'error:' "$DRV/flood.out")"
+check "and-says-how-many-it-suppressed" "1" \
+    "$(grep -c '40 more error(s) were suppressed' "$DRV/flood.out")"
+"$OBC" check "$DRV/Flood.mod" --out "$DRV" --ferror-limit 0 >"$DRV/flood0.out" 2>&1 || true
+check "zero-means-no-limit" "60" \
+    "$(grep -c 'error:' "$DRV/flood0.out")"
+
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true

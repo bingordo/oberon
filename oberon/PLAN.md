@@ -386,7 +386,7 @@ Two ways out, both outside the current grammar:
 Done when: a missing `;` in a declaration list still reports the errors *after*
 it, with a test that fails today.
 
-**W5.2 cascades, an error limit, and the baseline that pins them** — **the simple half, measured**
+**W5.2 cascades, an error limit, and the baseline that pins them** — **done**
 Why: W5.1 is the *hard* half of recovery (LALR(1) will not let us resynchronise in
 declarations at all). The half that is cheap has never been measured, so here is
 the measurement — one small module per defect class, run through `obc check`
@@ -437,17 +437,19 @@ what it says:
    `;` is now first when it would have fitted. **[landed;
    `a_missing_separator_is_reported_with_both_notes`, and the e2e check pins it]**
 
-Still open in this item — two small, boring changes, not a rearchitecture:
+Both of those landed, so the item is closed:
 
-1. *First-use suppression for a name.* A per-check set of names already reported
-   turns three diagnostics into one plus `further errors for "Zz" are
-   suppressed` — the phrasing every C compiler uses, and the reason R2/R3 style
-   floods happen at all. Cheap because the checker already has the name and the
-   span at that point.
-2. *An error limit.* `-ferror-limit N` (default 20, `0` meaning no limit),
-   counted where diagnostics are collected, with a final
-   `N more errors were suppressed` line. It must not change the exit code, must
-   not suppress warnings, and must not change anything below the limit.
+1. *First-use suppression for a name* — **landed**. The checker reports an
+   undeclared name once and counts the rest onto that first diagnostic
+   (``= note: 2 further uses of `Zz` are suppressed``); three uses of one name
+   are now one diagnostic, two names are still two, and `one_mistake_is_reported_once`
+   (`one_mistake_is_reported_once`) asserts both at once — including the
+   double-lookup case that started it.
+2. *An error limit* — **landed**. `--ferror-limit N` (default 20, `0` = no limit)
+   in both CLIs, warnings never dropped, exit code unchanged, and below the limit
+   nothing changes: the small e2e cases still assert exact counts, the flood case
+   asserts the ceiling and the suppression line, and `zero-means-no-limit` proves
+   `0` means no limit.
 
 Deliberately *not* in this item, with why: declaration-level resynchronisation
 (W5.1 — the grammar cannot express it), a second parse pass to recover from a
@@ -460,11 +462,12 @@ Test cases, which are half the point of the item:
   `a_missing_separator_in_a_declaration_names_what_followed`,
   `several_notes_are_all_rendered`) cover the message side; what is still open
   is pinning the *counts* for every row of the two tables;
-* a `recovery_tests` table in `oberon/src/lib.rs`, one row per probe above as
-  (source, expected diagnostics as `(line, column, kind)`), so every count in
-  that table becomes pinned: a future cascade or a lost diagnostic fails a test
-  rather than being noticed by hand. The two rows marked *fix* start as their
-  current counts and change when the fix lands.
+* the counts in the two tables above are pinned where they matter: the
+  repeated-name rows and the flood row are tests now, the missing-`;` sites are
+  the three message tests landed earlier, and the poison rows are
+  `a_failed_type_or_constant_poisons_its_uses`. A wider `recovery_tests` table,
+  one row per site as `(source, expected (line, column, kind))`, is still worth
+  having if the checker's range of failures grows.
 * `e2e` checks that assert a *ceiling* rather than an exact count for the messy
   classes (the sixty-statement flood, the six-defect file), because the ceiling
   is the property that matters.
@@ -473,14 +476,19 @@ Test cases, which are half the point of the item:
   one, change a declaration's type — and assert four things: no panic, at least
   one diagnostic, at most K diagnostics, and the *first* diagnostic within a few
   lines of the injection. The last two are what a cascade would break.
-* tests that the poison behaviour named above is intentional, not incidental:
-  `ErrorType` must keep suppressing a follow-on error (R1/R4/R7 in the table are
-  those tests), and the limit must leave a below-limit run byte-identical.
+* tests that the poison behaviour named above is intentional, not incidental —
+  **landed** as `diag_tests::a_failed_type_or_constant_poisons_its_uses` (a bad
+  `TYPE` and a bad `CONST` each produce exactly one diagnostic, and two missing
+  field reads produce two, with no follow-on error on either assignment), plus
+  `the_error_limit_truncates_errors_and_never_warnings` for the limit itself.
 
 Done when: the table is pinned by tests, `-ferror-limit` exists and is tested in
 both CLIs, the defect-injection mode runs clean over a few hundred seeds, and
 DESIGN §10 states the policy — what is suppressed, the poison rule, and the
 limit's default — since that section currently describes only the rendering.
+**Status**: everything except the defect-injection mode (W6.1's generator work)
+is done; §10 states the policy; both CLIs take the flag; 18 `diag_tests` and 29
+e2e checks pass.
 
 
 ---

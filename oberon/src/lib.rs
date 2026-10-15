@@ -115,6 +115,30 @@ fn severity_name(severity: sema::Severity) -> &'static str {
     }
 }
 
+/// Keeps at most `limit` errors (warnings are never dropped) and returns how
+/// many were suppressed, so a caller can say so. `0` means no limit: a file with
+/// sixty broken statements should not print sixty diagnostics, but below the
+/// limit nothing changes at all (PLAN.md W5.2).
+pub fn limit_errors(diags: &mut Vec<Diagnostic>, limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    let mut suppressed = 0;
+    diags.retain(|d| {
+        if !d.is_error() {
+            return true;
+        }
+        seen += 1;
+        if seen > limit {
+            suppressed += 1;
+            return false;
+        }
+        true
+    });
+    suppressed
+}
+
 /// A syntax error as a first-class diagnostic, so that a parse failure is
 /// located and rendered exactly like a type error (DESIGN §5 D7, §10).
 /// The note for a recovered error: what the parser threw away to carry on. The
@@ -904,6 +928,72 @@ mod diag_tests {
     }
 
     #[test]
+    fn repeated_uses_of_one_undeclared_name_are_suppressed() {
+        // PLAN.md W5.2: three uses of one undeclared name is one mistake, and a
+        // second name is a second mistake.
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  Zz := 1;\n  Zz := 2;\n  x := Zz\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{text}");
+        assert!(text.contains("M.mod:4:3: error: `Zz` is not declared"), "{text}");
+        assert!(
+            text.contains("= note: 2 further uses of `Zz` are suppressed"),
+            "{text}"
+        );
+
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  x := Aa;\n  x := Bb;\n  x := Aa\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 2, "{text}");
+        assert!(text.contains("1 further use of `Aa` is suppressed"), "{text}");
+        assert!(!text.contains("further use of `Bb`"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_type_or_constant_poisons_its_uses() {
+        // The poison rule is deliberate, not incidental (DESIGN §10, PLAN.md
+        // W5.2): a type that failed to resolve must not produce one error per
+        // use of it.
+        let src = "MODULE M;\n  TYPE T = Unknown;\n  VAR a: T;\nBEGIN\n  a := 1\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{text}");
+        assert!(text.contains("`Unknown` is not declared"), "{text}");
+
+        let src = "MODULE M;\n  CONST c = Zz;\n  VAR a: INTEGER;\n       TYPE U = ARRAY c OF INTEGER;\nBEGIN\n  a := c\nEND M.\n";
+        let (_, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{diags:?}");
+
+        // A missing field read twice is two mistakes, but neither assignment
+        // adds a second error of its own.
+        let src = "MODULE M;\n  TYPE R = RECORD n: INTEGER END;\n  VAR r: R;\nBEGIN\n  r.m := 1;\n  r.n := r.m\nEND M.\n";
+        let (text, diags) = report(src);
+        let msgs = messages(&diags);
+        assert_eq!(msgs.len(), 2, "{text}");
+        assert!(msgs.iter().all(|m| m.contains("has no field `m`")), "{msgs:?}");
+    }
+
+    #[test]
+    fn the_error_limit_truncates_errors_and_never_warnings() {
+        let mut diags = vec![
+            Diagnostic::error(span_of(0, 1), "e1"),
+            Diagnostic::new(sema::Severity::Warning, span_of(1, 2), "w1"),
+            Diagnostic::error(span_of(2, 3), "e2"),
+            Diagnostic::error(span_of(3, 4), "e3"),
+        ];
+        assert_eq!(limit_errors(&mut diags, 2), 1);
+        let kept: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(kept, vec!["e1", "w1", "e2"], "warnings survive, order holds");
+
+        // 0 is no limit, and a below-limit run is untouched.
+        let mut diags = vec![
+            Diagnostic::error(span_of(0, 1), "e1"),
+            Diagnostic::error(span_of(1, 2), "e2"),
+        ];
+        assert_eq!(limit_errors(&mut diags, 0), 0);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(limit_errors(&mut diags, 5), 0);
+        assert_eq!(diags.len(), 2);
+    }
+
+    #[test]
     fn an_uncalled_procedure_warns_and_a_used_one_does_not() {
         // ✔ row 54, the other half: the report has no way to mark a procedure as
         // deliberately unused. A call, a use as a value, an exported procedure
@@ -1028,11 +1118,18 @@ mod diag_tests {
     #[test]
     fn one_mistake_is_reported_once() {
         // A call statement used to be looked up twice, so an unknown callee was
-        // reported twice.
-        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  Get(x);\n  Get(x)\nEND M.\n";
+        // reported twice; and until PLAN.md W5.2 every *use* of an undeclared
+        // name was reported, so two statements meant two diagnostics. Both
+        // properties now hold at once: one name, one diagnostic, with the count
+        // of the rest on it.
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  Get(x)\nEND M.\n";
         let msgs = messages(&report(src).1);
-        // Two *statements*, so two errors - but not four.
-        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+
+        let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  Get(x);\n  Get(x)\nEND M.\n";
+        let (text, diags) = report(src);
+        assert_eq!(messages(&diags).len(), 1, "{text}");
+        assert!(text.contains("1 further use of `Get` is suppressed"), "{text}");
     }
 
     #[test]

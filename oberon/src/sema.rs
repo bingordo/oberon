@@ -180,6 +180,9 @@ pub struct Sema<'a> {
     declared_procs: Vec<(usize, String, Span, bool)>,
     /// Ids of procedures that were used: called, or referenced as a value.
     used_procs: Vec<usize>,
+    /// For a name reported as undeclared: the index of that first diagnostic, so
+    /// further uses of the same name can be counted onto it instead of repeated.
+    undeclared: HashMap<String, (usize, usize)>,
     next_proc_id: usize,
     imports: Vec<(String, Span)>,
     /// Built type environments of imported modules, by interface index.
@@ -223,6 +226,7 @@ impl<'a> Sema<'a> {
             used: Vec::new(),
             declared_procs: Vec::new(),
             used_procs: Vec::new(),
+            undeclared: HashMap::new(),
             next_proc_id: 0,
             imports: Vec::new(),
             envs: HashMap::new(),
@@ -259,6 +263,7 @@ impl<'a> Sema<'a> {
         }
         sema.unused_imports(module);
         sema.unused_procedures();
+        sema.finish_undeclared_notes();
         dedup_diagnostics(&mut sema.diags);
         sema
     }
@@ -385,7 +390,17 @@ impl<'a> Sema<'a> {
             return match found {
                 Some(s) => Some(s),
                 None => {
-                    self.error(span, format!("`{}` is not declared (report 4)", q[0]));
+                    // Report a name once. Later uses of the same undeclared
+                    // name add nothing but noise, so they are counted onto the
+                    // first diagnostic instead (PLAN.md W5.2).
+                    match self.undeclared.get_mut(&q[0]) {
+                        Some((_, count)) => *count += 1,
+                        None => {
+                            let at = self.diags.len();
+                            self.error(span, format!("`{}` is not declared (report 4)", q[0]));
+                            self.undeclared.insert(q[0].clone(), (at, 0));
+                        }
+                    }
                     None
                 }
             };
@@ -497,6 +512,27 @@ impl<'a> Sema<'a> {
                     ),
                 ),
             }
+        }
+    }
+
+    /// Attaches `N further uses are suppressed` to each undeclared name's first
+    /// diagnostic. Called once, at the end.
+    fn finish_undeclared_notes(&mut self) {
+        let entries: Vec<(String, (usize, usize))> = self
+            .undeclared
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for (name, (at, count)) in entries {
+            if count == 0 || at >= self.diags.len() {
+                continue;
+            }
+            let msg = if count == 1 {
+                format!("1 further use of `{name}` is suppressed")
+            } else {
+                format!("{count} further uses of `{name}` are suppressed")
+            };
+            self.diags[at].notes.push(msg);
         }
     }
 

@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use oberon_front::{
-    cgen, check_module_recovering, emit_c, emit_interface, parse_module, parse_with_diagnostics,
-    render_diagnostics, sym, Diagnostic,
+    cgen, check_module_recovering, emit_c, emit_interface, limit_errors, parse_module,
+    parse_with_diagnostics, render_diagnostics, sym, Diagnostic,
 };
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
@@ -53,6 +53,9 @@ struct Opts {
     cflag: Vec<String>,
     command: Option<(String, String)>,
     keep: bool,
+    /// How many errors to print before saying the rest were suppressed; `0` is
+    /// no limit (PLAN.md W5.2).
+    ferror_limit: usize,
 }
 
 /// One module in the link: source this build emitted, or C found on disk.
@@ -74,7 +77,8 @@ fn usage() -> ExitCode {
          \x20 --cflags \"…\"      extra C flags (split on whitespace)\n\
          \x20 --cflag ARG       one extra C flag (repeatable, no splitting)\n\
          \x20 --command M.P     run this command after the modules load (run)\n\
-         \x20 --keep            keep the temporary build directory"
+         \x20 --keep            keep the temporary build directory\n\
+         \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)"
     );
     ExitCode::FAILURE
 }
@@ -131,6 +135,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         cflag: Vec::new(),
         command: None,
         keep: false,
+        ferror_limit: 20,
     };
     let mut i = 2;
     while i < args.len() {
@@ -155,6 +160,12 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
+            "--ferror-limit" => {
+                o.ferror_limit = take(&mut i)?
+                    .parse()
+                    .map_err(|_| "--ferror-limit wants a number (0 means no limit)".to_string())
+                    .ok()?;
+            }
             other => {
                 eprintln!("obc: unknown option `{other}`");
                 return None;
@@ -269,7 +280,15 @@ fn emit_tree(
         None => {
             // Nothing parsed: the syntax diagnostics are all there is to report,
             // and they are already located.
+            let mut syntax = syntax;
+            let suppressed = limit_errors(&mut syntax, o.ferror_limit);
             print!("{}", render_diagnostics(&path.display().to_string(), src, &syntax));
+            if suppressed > 0 {
+                println!(
+                    "{suppressed} more error(s) were suppressed (--ferror-limit {})",
+                    o.ferror_limit
+                );
+            }
             return Err(format!("{} does not parse", path.display()));
         }
     };
@@ -327,8 +346,15 @@ fn emit_tree(
     // Now the imports' interfaces exist, so this module can be checked. The
     // parser recovers at statement level, so one run reports syntax errors *and*
     // type errors rather than stopping at the first of either.
-    let (parsed, diags) = check_module_recovering(src, interfaces);
+    let (parsed, mut diags) = check_module_recovering(src, interfaces);
+    let suppressed = limit_errors(&mut diags, o.ferror_limit);
     print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
+    if suppressed > 0 {
+        println!(
+            "{suppressed} more error(s) were suppressed (--ferror-limit {})",
+            o.ferror_limit
+        );
+    }
     if diags.iter().any(Diagnostic::is_error) {
         return Err(format!("`{name}` does not check"));
     }

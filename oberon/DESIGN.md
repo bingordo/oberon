@@ -14,7 +14,7 @@ meant to be kept:
 | Artefact | What it is | Status |
 |---|---|---|
 | `src/bin/obgen.rs`, `fuzz/` | **A random program generator used as a self-checking oracle**: it writes a module *and* the value every variable must have (its own interpreter, so no circularity), and a mismatch traps in the module itself | 25 seeds run, 0 survived: it found three defects in the emitted C that the hand-written suites had missed (§13 R20) |
-| `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 52 tests pass, clippy clean |
+| `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 55 tests pass, clippy clean |
 | `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
 | `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
 | `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 26 checks pass; it found the emitter and checker bugs listed in §14 |
@@ -1154,6 +1154,19 @@ Mix.mod:4:8: error: unexpected `;`
   only counting them: the statement the recovery discards is the innocent one,
   and its own errors are never reported, so the reader has to be told which text
   it was.
+* **A name is reported once.** Two uses of one undeclared name are one mistake:
+  the first use carries the message and the count of the rest
+  (``= note: 2 further uses of `Zz` are suppressed``), which is what a C compiler
+  does too. Two *different* names remain two diagnostics.
+* **An error limit**, `--ferror-limit N` (default 20, `0` = no limit): a file with
+  sixty broken statements prints twenty diagnostics and one line saying how many
+  were suppressed. Warnings are never dropped, the exit code is unchanged, and
+  below the limit nothing changes at all — which the suites check by asserting
+  exact counts on the small cases.
+* The **poison rule** is deliberate rather than incidental: a type or constant
+  that failed to resolve produces an `ErrorType`/error symbol, so its later uses
+  say nothing rather than reporting the same failure again — pinned by
+  `diag_tests::a_failed_type_or_constant_poisons_its_uses`.
 * Diagnostics are de-duplicated by *(span, severity, message)* and sorted by
   span, because the recovering parser and the checker can meet the same mistake:
   a call statement used to be looked up twice, so an unknown callee was reported
@@ -1171,7 +1184,7 @@ Mix.mod:4:8: error: unexpected `;`
 | lexer | the near-miss table in §4 | unit tests on token streams **[exists]** |
 | parser | report examples, all statement/expression forms, guard/call unification, unqualified-vs-qualified names | parse tests asserting AST shape **[exists: 7 tests]** |
 | parser (negative) | syntax errors, illegal characters, unterminated strings/comments, and the *report's own* restriction that `RETURN` is not a statement | `unwrap_err` assertions **[exists]** |
-| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `src/lib.rs::diag_tests` **[exists: 15 tests]** |
+| diagnostic rendering | byte span → `line:col`, the source line, the caret, notes, warning vs. error, one message per mistake | `src/lib.rs::diag_tests` **[exists: 18 tests]** |
 | error recovery | statement-level resynchronisation: several syntax errors in one run, syntax *and* semantic errors in one run; a fatal module-level error and a lexical error each reported once, with a location | `diag_tests` + `e2e` checks 10–13 **[exists]** |
 | resolver — reclassification (D2/D3) | guard vs. call, module-qualification fold, unresolved-selector invariant, a bad record `CASE` label | unit tests in `src/lib.rs` **[exists: 3 tests]** |
 | resolver + checker | one case per row of §8.5 (rows with two shapes have two cases), plus the report's `Out` module and the kitchen sink checking clean | `src/lib.rs::check_tests` **[exists: 5 tests]** |
