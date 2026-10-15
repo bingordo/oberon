@@ -214,6 +214,18 @@ a missing line is refused with a message that says to recompile, pinned by
 e2e interfaces and the fixtures carry the line; in the checker's own fixtures it is
 supplied by the helper, since those fixtures are about the language.
 
+Two later findings, from review of the driver's *diagnostic* path rather than the
+format: a refusal was keyed by the file's name, so a hand-renamed `Alias.sym`
+holding `MODULE M` was looked for under `Alias` and the reason went unreported —
+it is keyed by the module its own header names now, readable even when the rest of
+the file is not. And a module whose *C* was found skipped the refusal report
+entirely, because the driver's early path is not taken when the file is; the
+refusal is now also reported from the checker's diagnostic, which is the one place
+that knows an interface is needed whatever backs it, and the two paths are
+exclusive so neither can report it twice. Both are covered: the e2e keeps
+`an-unrelated-refused-interface-is-not-reported` beside
+`a-refused-interface-that-is-needed-is-explained`.
+
 **W3.3 continuous integration**
 Why: there is no `.github/` and no CI; the gate is currently a human habit.
 Done when: a workflow runs the four suites on a clean checkout, with a C
