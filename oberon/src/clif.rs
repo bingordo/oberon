@@ -1017,9 +1017,10 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             }
             // No default arm: a value that matches no label *falls through*,
             // which is what the C back end's `switch` does and what DESIGN §9.6
-            // records for the scalar `CASE`. (The report says such a program is
-            // aborted, and the C back end does not do that either: reconciling
-            // the two is not a decision a second back end can take on its own.)
+            // records for the scalar `CASE`. A *type*-`CASE` traps instead
+            // (§9.3); the report is silent on the scalar case, so which of our
+            // two checks is right is PLAN.md W2.5's decision rather than this
+            // back end's — the reference's behaviour is what is lowered.
             None => self.jump_to(after),
         }
         self.bcx.switch_to_block(after);

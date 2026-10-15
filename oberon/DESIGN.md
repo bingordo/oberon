@@ -2077,7 +2077,21 @@ Sources: `cranelift-codegen/src/ir/extfunc.rs:20-57,138-183`;
 **Layout.** The IR has scalar, vector and floating types, not records: a record is a
 byte region reached through a pointer, with the field offsets computed by *us* —
 which is the same arrangement the C back end already has, so the layout code can be
-shared rather than re-derived. `StackSlotData` takes a byte size and an alignment
+shared rather than re-derived.
+
+> **Corrected by the prototype (the second claim above is false).** The C back end
+> computes no offset and no size: it emits C structs (`struct R { const ObDesc
+> *desc; int32_t x; }`, an extension's base as its first member) and lets the C
+> compiler lay them out — `field_path` produces a *member path*, and `rt_new` is
+> handed `sizeof(T)`. So there is no layout code to share: the second back end must
+> reproduce the **C ABI's** layout for these shapes (alignment 4 for `int32_t`,
+> `float` and `uint32_t`, 1 for `char`, the pointer width for pointers; each member
+> at the next multiple of its own alignment; the struct's alignment the largest of
+> its members'), and the property that matters — a mixed build, where a C module
+> allocates what a lowered module reads — has to be *checked* rather than assumed:
+> a test that compares the computed size and field offsets with what `cc` reports
+> for the emitted header (`sizeof`, `offsetof`) is the shape that keeps the two
+> honest. What can be shared is the rule *table* and the walk over `types::Type`. `StackSlotData` takes a byte size and an alignment
 exponent, and `stack_addr` materialises the address. Sources:
 `cranelift-codegen/src/ir/types.rs:9-27`; `cranelift-codegen/src/ir/stackslot.rs:22-32,57-71`;
 `cranelift-frontend/src/frontend.rs:573-577`.
@@ -2212,6 +2226,20 @@ what is left is not a conformance bug but an inconsistency between our own two
 it has no default arm, while a scalar `CASE` falls through silently. Which of those
 the scalar case should do is a decision about the C path, recorded as PLAN.md W2.5 —
 not something this back end should settle by disagreeing with it.
+
+**What W9.2 inherits.** The refusals below are the work list, in the order the
+lowerer meets them, and each has a place to go: `Type::Record`/`Pointer` in
+`scalar`/`data_size` (with the C-ABI layout above), `ARRAY` and open-array
+parameters, the `Selector` arms in `designator_value`/`assign` (field, deref,
+guard), the `NEW`/`INC`/`DEC`/`PACK`/`UNPK` names in `call_stmt`, the descriptor
+and field-map data objects (cgen's `emit_type`/`desc_init`/`region_fields` are the
+shapes to mirror, and the descriptor word is at offset 0 of every view), the
+`ob_gc_root_region` call in a module body that has roots, and `REAL`/`CHAR`/`SET`
+in the type mapping. Three things W9.1 established are reused rather than rebuilt:
+data objects with relocations (the command table), the object-boundary entry points
+in `oberon.h`, and the `__load`/command-table shape. The acceptance test is `e2e`
+(the corpus's collector blocks come back on with it, since a pointer graph is what
+they take apart).
 
 **Evidence.** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the

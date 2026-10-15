@@ -1285,10 +1285,10 @@ runtime's checks are `static inline` helpers with no link-time identity, so four
 `ob_rt_*` entry points had to be added — is there with the runs that settle the
 shift rule (29 of 30 coverage programs carry a count of 32 or more; 6 fail if the
 rule is dropped), the `OptLevel`, the module/command-table shape and the one
-divergence it found in the C path (a scalar `CASE` with no matching label falls
-through there, where report §9.5 says the program is aborted; the second back end
-was made to agree with the C path, and the C path's behaviour is left alone
-because W9.1 does not change it).
+inconsistency it found between our own two checks (a scalar `CASE` with no
+matching label falls through where a type-`CASE` traps and warns; the report is
+silent on the case, and the second back end was made to agree with the C path,
+which W9.1 does not change — the decision is W2.5's).
 
 **Split, so that the first half is completable rather than open-ended.** The research
 half is done. The prototype is now W9.1 proper, scoped to the **fuzz corpus**:
@@ -1304,13 +1304,56 @@ squarely on the corpus's deliberate large-count shifts.
 
 **W9.2 the rest of the language on the Cranelift back end** — **open**
 
+*Notes from W9.1, so the next session starts from them rather than re-deriving:*
+
+* The refusals the W9.1 lowerer raises are the work list, each at the site it has
+  to be replaced (`scalar`/`data_size` for a type, the `Selector` arms of
+  `designator_value`/`assign` for one, `call_stmt` for a predeclared name), and
+  every one names W9.2 and the byte it was refused at — so the back end widens
+  one construct at a time without ever lowering something it has not implemented.
+* **The layout is the C ABI's, not ours** (DESIGN §16's layout paragraph is
+  corrected): `cgen` emits C structs and lets `cc` place the members, so the
+  second back end has to reproduce that layout and *check* it against what `cc`
+  reports for the emitted header. This is the first thing to build, because
+  records, arrays, pointers, `NEW` and the collector's field maps all sit on it.
+* The three shapes that carry over unchanged: data objects with relocations, the
+  `ob_rt_*` object-boundary entry points in `oberon.h`, and the
+  `__init`/`__load`/command-table model the driver's loader already calls.
+* `obgen --backend=clif` renders the scalar fragment and its two blocks (the
+  collector's) are C-only: once records and pointers exist, turn them back on in
+  `fuzz/run.sh`'s clif mode and widen the adversarial variants, which is what the
+  pointer graph's only oracle needs.
+
 What W9.1's prototype leaves out, listed so it is not mistaken for done: records and
 their descriptors, `ARRAY` and open-array parameters, `POINTER TO` and `NEW`, type
 guards and the type-`CASE`, `SYSTEM`, `REAL`/`CHAR`/`SET`, and the string and record
-copies. The constraints are already fixed — the descriptor at offset 0, the field
-layout the C emitter computes, the runtime's C ABI — so it is a matter of emitting
-the same shapes through another IR, and `e2e` is the acceptance test it cannot yet
-meet.
+copies. The constraints are already fixed — the descriptor at offset 0, the runtime's
+C ABI, and a layout that is the *C compiler's* rather than ours (see the correction
+in the notes above) — so it is a matter of emitting the same shapes through another
+IR, and `e2e` is the acceptance test it cannot yet meet.
+
+**Sliced, because the whole of it is more than one session holds** (W9.1's author
+stopped rather than half-write it, which is the right call and the reason these are
+written down):
+
+* **W9.2a — the layout, and arrays on top of it.** A layout module that computes
+  sizes, offsets and alignment the way the C ABI does for the shapes we emit — the
+  basic types, fixed arrays, a record whose base is its first member and whose
+  descriptor is at offset 0 — plus the test that makes `cc` the authority: emitted
+  header in, `sizeof`/`offsetof` out, compared against the computed table. Then
+  scalar fixed arrays. Done when that test passes and the corpus's scalar programs
+  still do.
+* **W9.2b — records, pointers and the heap.** Descriptor emission matching the C
+  emitter's `ObDesc` including the collector's field map, record locals, fields,
+  assignment and copies, `POINTER TO`, `NEW` through `rt_new`, and the type-`CASE`
+  and guards that read a descriptor. Done when the corpus's *collector* blocks run
+  in the clif mode (`fuzz/run.sh`, `obgen --backend=clif` widening accordingly): a
+  pointer graph is the only thing that takes those paths apart.
+* **W9.2c — the rest, and `e2e`.** Open arrays and `VAR` parameters, nested
+  procedures with static links, `REAL`/`CHAR`/`SET`, string and record copies,
+  imports and cross-module calls, `SYSTEM`. Done when `BACKEND=clif bash
+  e2e/run.sh` passes every row the C path does — the harness is already there, and
+  it stops at the first row the back end cannot meet.
 
 **W7.7 a byte for every trap, not only the memory ones** — **done**
 
