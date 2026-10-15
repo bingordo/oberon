@@ -547,18 +547,25 @@ three distinct causes:
 
 Done when: `bash fuzz/run.sh` passes for a few hundred seeds and joins the gate,
 with one regression fixture per cause in `e2e/` (or a row in `Regress.mod`) so
-the suites catch a return of any of them. **Progress**: the fold and the
-parameter marks landed (they were the reason `obc build` rejected generated
-programs), and the fuzzer's signal changed twice — first from "the C compiler
-rejects our output" to "the program's own checks trap", which is how W6.5 was
-found and fixed, and now to a smaller residue. What is left, with the diagnosis
-already made: (a) the fold only sees expressions it can evaluate itself, so a
-*constant whose value is a named `CONST`* is not folded and its product can still
-overflow in C — the checker knows the value, so the emitter needs a
-use-site-to-value lookup (the same shape as the guard/call split); (b) at least
-one `-Wunused-but-set-parameter` case may survive if a parameter is only written;
-(c) the remaining self-check traps need the same treatment W6.5 got, one at a
-time.
+the suites catch a return of any of them. **Progress**: the fold, the parameter
+marks and the named-`CONST` lookup landed, and each landing changed the signal:
+
+| state | C rejections | value mismatches | passing |
+|---|---|---|---|
+| first run | 25 | 0 | 0 |
+| after the fold and the parameter marks | 0 | 24 | 1 |
+| after W6.5 (the shift semantics) | 0 | 23 | 2 |
+| after the named-`CONST` fold and the self-comparison fold | 1 (a self-comparison, now folded) | 22 | 2 |
+
+What is left is one *class*: the program's own self-check traps, i.e. the
+compiled value differs from the mirror's. Each is now named by the runner
+(`IF m1 # 2 THEN … (* check m1 expected 2 *)`) because the trap-offset parser had
+been looking for a bracket the runtime's message does not print. Triaging them is
+the next thing, and it wants a tool rather than hand-simulation of a 140-line
+program: a `--explain SEED` mode that prints, per check, the mirror's value and
+the statement that last wrote that variable would turn each one into a two-minute
+read. `(b)` in the earlier list is *not* a cause: `(void)p;` marks a parameter
+used even when the body only assigns it (verified in C, gcc accepts both orders).
 
 **W6.5 the generator found a real bug: `LSL`/`ASR` masked their count** — **fixed**
 Why it matters: the report's own table (§8.2.2) defines `LSL(x,n)` as `x * 2^n`

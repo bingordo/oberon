@@ -1074,11 +1074,17 @@ fn one(seed: u64, obc: &Path, work: &Path, keep: bool) -> Result<(), String> {
     let err = String::from_utf8_lossy(&run.stderr).to_string();
     // A trap names the byte offset of the designator, and the check line names
     // the variable and the expectation, so the failure explains itself.
+    // The runtime prints `index out of range (at byte N of the source)`, so take
+    // the digits after "at byte " rather than looking for a closing bracket.
     let at = err
-        .split("(at byte ")
+        .split("at byte ")
         .nth(1)
-        .and_then(|s| s.split(')').next())
-        .and_then(|s| s.trim().parse::<u32>().ok());
+        .map(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|s| s.parse::<u32>().ok());
     let mut why = format!("exited with {}", run.status);
     if let Some(at) = at {
         let (line, col) = line_col(&src, at);

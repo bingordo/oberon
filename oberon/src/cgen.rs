@@ -1086,7 +1086,10 @@ impl<'a> Emitter<'a> {
         // documented build line treats warnings as errors (R20, PLAN.md W6.2).
         // The folder is the same one DESIGN §8.3 cross-checks against the
         // runtime, so this cannot disagree with the emitted helpers.
-        if let Ok(c) = const_eval::eval(e) {
+        // The resolver is the checker's use-site table: a designator that names a
+        // constant is folded to its value, which is what lets `MAX * (1 + c0)`
+        // become one literal instead of a C expression that overflows.
+        if let Ok(c) = const_eval::eval_with(e, &|x| self.sema.const_at(x.span)) {
             if let Some(v) = c.int() {
                 return format!("((int32_t){}u)", v);
             }
@@ -1177,6 +1180,20 @@ impl<'a> Emitter<'a> {
     fn binary(&mut self, op: BinOp, l: &Expr, r: &Expr) -> String {
         let lt = self.sema.type_at(l.span, self.types).unwrap_or(TypeId(0));
         let rt = self.sema.type_at(r.span, self.types).unwrap_or(TypeId(0));
+        // `x = x` is true and `x < x` is false for every scalar but REAL (where
+        // NaN makes it false), yet C compilers warn about the comparison itself
+        // and the documented build line treats warnings as errors (R20). Only
+        // plainly side-effect-free operands are folded: a call may differ per
+        // call, and in Oberon it may have side effects.
+        if self.types.same_type(lt, rt)
+            && !matches!(self.types.get(lt), Type::Basic(Basic::Real))
+            && matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+            && l == r
+            && self.is_plain(l)
+        {
+            let truth = matches!(op, BinOp::Eq | BinOp::Le | BinOp::Ge);
+            return if truth { "1".into() } else { "0".into() };
+        }
         // A one-character string on either side makes this a CHAR comparison.
         let want = if self.types.is_char(lt) {
             Some(lt)
@@ -1228,6 +1245,16 @@ impl<'a> Emitter<'a> {
             };
         }
         self.binary_plain(op, &a, &b, lt, rt)
+    }
+
+    /// A literal, or a designator with no selectors: reading one has no side
+    /// effect, so a comparison of two identical ones is a constant.
+    fn is_plain(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Char(_) | ExprKind::Bool(_) | ExprKind::Set(_) => true,
+            ExprKind::Designator(d) => d.sels.is_empty(),
+            _ => false,
+        }
     }
 
     fn binary_plain(&self, op: BinOp, a: &str, b: &str, lt: TypeId, rt: TypeId) -> String {

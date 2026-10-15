@@ -183,6 +183,8 @@ pub struct Sema<'a> {
     /// For a name reported as undeclared: the index of that first diagnostic, so
     /// further uses of the same name can be counted onto it instead of repeated.
     undeclared: HashMap<String, (usize, usize)>,
+    /// Where a constant was used, and what it was worth: `const_at` reads this.
+    const_uses: HashMap<u64, Const>,
     next_proc_id: usize,
     imports: Vec<(String, Span)>,
     /// Built type environments of imported modules, by interface index.
@@ -227,6 +229,7 @@ impl<'a> Sema<'a> {
             declared_procs: Vec::new(),
             used_procs: Vec::new(),
             undeclared: HashMap::new(),
+            const_uses: HashMap::new(),
             next_proc_id: 0,
             imports: Vec::new(),
             envs: HashMap::new(),
@@ -381,6 +384,9 @@ impl<'a> Sema<'a> {
         if q.len() == 1 {
             self.used.push(q[0].clone());
             let found = self.lookup(&q[0]);
+            if let Some(Sym::Const(c, _)) = &found {
+                self.const_uses.insert(span_key(span), c.clone());
+            }
             if let Some(Sym::Proc { id: Some(id), .. }) = found {
                 // A use of a procedure this unit declares: check 54's
                 // unused-procedure half reads this. Qualified names cannot
@@ -513,6 +519,12 @@ impl<'a> Sema<'a> {
                 ),
             }
         }
+    }
+
+    /// The value of a constant at the place it is used, so the emitter can fold
+    /// an expression the checker has already resolved the names in (R20).
+    pub fn const_at(&self, span: Span) -> Option<Const> {
+        self.const_uses.get(&span_key(span)).cloned()
     }
 
     /// Attaches `N further uses are suppressed` to each undeclared name's first

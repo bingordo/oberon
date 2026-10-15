@@ -163,7 +163,18 @@ fn ord_of(c: &Const) -> Result<i32, String> {
 
 // ------------------------------------------------------------------- folder
 
+/// The folder, with a way to look up a designator that names a constant. The
+/// checker and the emitter are the callers that have one; `eval` is the same
+/// thing without (DESIGN §8.3: the folder itself resolves nothing).
+pub fn eval_with(e: &Expr, resolve: &dyn Fn(&Expr) -> Option<Const>) -> EvalResult {
+    eval_inner(e, resolve)
+}
+
 pub fn eval(e: &Expr) -> EvalResult {
+    eval_inner(e, &|_| None)
+}
+
+fn eval_inner(e: &Expr, resolve: &dyn Fn(&Expr) -> Option<Const>) -> EvalResult {
     match &e.kind {
         ExprKind::Int(v) => Ok(Const::Int(*v as i32)),
         ExprKind::Real(v) => Ok(Const::Real(*v as f32)),
@@ -175,11 +186,11 @@ pub fn eval(e: &Expr) -> EvalResult {
         ExprKind::Set(elems) => {
             let mut bits = 0u32;
             for el in elems {
-                let lo = eval(&el.lo)?.int().ok_or_else(|| {
+                let lo = eval_inner(&el.lo, resolve)?.int().ok_or_else(|| {
                     "a set element must be a constant integer (report 8.2)".to_string()
                 })?;
                 let hi = match &el.hi {
-                    Some(h) => eval(h)?.int().ok_or_else(|| {
+                    Some(h) => eval_inner(h, resolve)?.int().ok_or_else(|| {
                         "a set range bound must be a constant integer".to_string()
                     })?,
                     None => lo,
@@ -190,6 +201,11 @@ pub fn eval(e: &Expr) -> EvalResult {
         }
         ExprKind::Designator(d) => {
             if d.base.len() == 1 && d.sels.is_empty() {
+                // A lone designator may be a named constant, which only the
+                // caller can know: it owns the scope.
+                if let Some(c) = resolve(e) {
+                    return Ok(c);
+                }
                 return Err(not_const(&format!("the designator `{}`", d.base[0])));
             }
             if d.sels.is_empty() {
@@ -210,7 +226,7 @@ pub fn eval(e: &Expr) -> EvalResult {
             call(name, &vals)
         }
         ExprKind::Unary(op, x) => {
-            let v = eval(x)?;
+            let v = eval_inner(x, resolve)?;
             match (op, v) {
                 (UnOp::Not, Const::Bool(b)) => Ok(Const::Bool(!b)),
                 (UnOp::Not, _) => Err("~ needs a BOOLEAN operand (report 8.2.1)".into()),
@@ -224,8 +240,8 @@ pub fn eval(e: &Expr) -> EvalResult {
             }
         }
         ExprKind::Binary(op, l, r) => {
-            let a = eval(l)?;
-            let b = eval(r)?;
+            let a = eval_inner(l, resolve)?;
+            let b = eval_inner(r, resolve)?;
             binary(*op, a, b)
         }
     }
