@@ -362,17 +362,20 @@ fn reclassify_designator(d: &mut Designator, names: &mut Names) -> Result<(), Re
         let taken = std::mem::replace(&mut d.sels[i], Selector::Deref);
         d.sels[i] = match taken {
             Selector::Args(args) => {
-                // `SYSTEM.SIZE(T)` is the one call whose single argument is a
-                // type name (report §11.1: `SIZE(T)` takes "any type"), so rule
-                // (b) must not swallow it: this paren group stays a call.
-                let sized = matches!(d.base.as_slice(), [alias, entry]
-                    if entry == "SIZE" && names.is_system(alias));
+                // Two calls take a *type* as their single argument —
+                // `SYSTEM.SIZE(T)` (report §11.1) and `MIN(T)`/`MAX(T)` (W8.2) —
+                // so rule (b) must not swallow them: the paren group stays a
+                // call. A guard, after all, needs a designator of a record or
+                // pointer type, which none of these names can be.
+                let takes_a_type = matches!(d.base.as_slice(), [alias, entry]
+                    if entry == "SIZE" && names.is_system(alias))
+                    || matches!(d.base.as_slice(), [n] if n == "MIN" || n == "MAX");
                 match args.as_ref().and_then(|a| single_type_name(a, names)) {
                     // `t(T)` is a guard whether or not more selectors follow: a
                     // procedure call can never take a *type* as its only
                     // argument, because types and variables share one namespace
                     // (report 4).
-                    Some(q) if !sized => Selector::Guard(q),
+                    Some(q) if !takes_a_type => Selector::Guard(q),
                     _ => Selector::Call(args.unwrap_or_default()),
                 }
             }

@@ -623,6 +623,30 @@ printf 'MODULE SysNoImp;\n  VAR i: INTEGER;\nBEGIN\n  i := SYSTEM.ADR(i)\nEND Sy
 check "system-must-be-imported" "1" \
     "$(grep -c '`SYSTEM` is not declared' "$DRV/sysnoimp.out")"
 
+# `MIN(T)`/`MAX(T)` (W8.2) and `CASE … ELSE` (W8.1): the extremes are constants,
+# wherever they appear, and `ELSE` is report §9.5's default arm under a keyword
+# LALR(1) can parse.
+runs_case min-max-and-case-else 'MODULE Ext;
+  CONST Low = MIN(INTEGER); High = MAX(INTEGER);
+  VAR i: INTEGER; ok: ARRAY 1 OF INTEGER;
+BEGIN
+  IF Low # (0 - 2147483647 - 1) THEN ok[1] := 0 END;
+  IF High # 2147483647 THEN ok[1] := 0 END;
+  IF MAX(BYTE) # 255 THEN ok[1] := 0 END;
+  IF MIN(CHAR) # 0 THEN ok[1] := 0 END;
+  i := MIN(INTEGER);
+  IF i >= 0 THEN ok[1] := 0 END;
+  CASE i OF 1: i := 1 | 2: i := 2 ELSE i := 7 END;
+  IF i # 7 THEN ok[1] := 0 END;
+  CASE 5 OF 1: i := 1 ELSE i := 9 END;
+  IF i # 9 THEN ok[1] := 0 END
+END Ext.
+'
+# Two defaults are one answer too many, and the message says so.
+printf 'MODULE Two;\n  VAR i: INTEGER;\nBEGIN\n  CASE i OF 1: i := 1 | ELSE i := 2 END\nEND Two.\n' > "$DRV/Two.mod"
+"$OBC" check "$DRV/Two.mod" >"$DRV/two.out" 2>&1 || true
+check "two-case-defaults-are-refused" "1" "$(grep -c 'two default arms' "$DRV/two.out")"
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

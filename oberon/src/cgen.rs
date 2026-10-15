@@ -1955,6 +1955,11 @@ impl<'a> Emitter<'a> {
             Some(Selector::Call(a)) => a.clone(),
             _ => Vec::new(),
         };
+        // `MIN(T)`/`MAX(T)` (W8.2): a constant the checker recorded. A user's own
+        // `MIN` records nothing, so shadowing needs no check here.
+        if let Some(v) = self.sema.extreme_at(d.span) {
+            return format!("((int32_t){}u)", v as u32);
+        }
         if let Some(entry) = self.system_entry(&d.base) {
             if SYSTEM_FUNCTIONS.contains(&entry) {
                 return self.sys_function(entry, &args, level);

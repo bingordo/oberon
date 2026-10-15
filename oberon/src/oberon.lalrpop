@@ -368,9 +368,16 @@ ForStmt: Stmt = <lo:@L> "FOR" <var:Ident> ":=" <from:Expr> "TO" <to:Expr> <by:By
 );
 ByClause: Expr = "BY" <e:Expr> => e;
 
-CaseStmt: Stmt = <lo:@L> "CASE" <subject:Expr> "OF" <first:CaseArm> <rest:CaseArmTail*> "END" <hi:@R> => {
+CaseStmt: Stmt = <lo:@L> "CASE" <subject:Expr> "OF" <first:CaseArm> <rest:CaseArmTail*> <els:ElseClause?> "END" <hi:@R> => {
     let mut arms = vec![first];
     arms.extend(rest);
+    // `ELSE S` is the default arm, represented as an arm with an empty label
+    // list — which is what the checker and the emitter already treat as the
+    // default. It is how report §9.5's own default gets a spelling LALR(1) can
+    // parse (DESIGN §5 D8, PLAN.md W8.1).
+    if let Some(body) = els {
+        arms.push(CaseArm { labels: None, body, span: sp(lo, hi) });
+    }
     Stmt::new(StmtKind::Case { subject, arms }, sp(lo, hi))
 };
 CaseArmTail: CaseArm = "|" <a:CaseArm> => a;

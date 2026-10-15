@@ -229,6 +229,10 @@ pub struct Sema<'a> {
     /// C's — a record up-cast, a pointer up/down cast, a string into a `CHAR`
     /// array, a guard, a type-`CASE` narrowing.
     pub types_at: HashMap<u64, TypeId>,
+    /// `MIN(T)`/`MAX(T)` by the span of the call: their value is fixed by the
+    /// type, so the checker is where it is known and the emitter reads it here
+    /// (W8.2) — the same channel as `types_at`, for the same reason.
+    extremes: HashMap<u64, i32>,
 }
 
 impl<'a> Sema<'a> {
@@ -254,6 +258,7 @@ impl<'a> Sema<'a> {
             consts: HashMap::new(),
             call_types: HashMap::new(),
             types_at: HashMap::new(),
+            extremes: HashMap::new(),
         }
     }
 
@@ -326,6 +331,39 @@ impl<'a> Sema<'a> {
     }
 
     // -------------------------------------------------------------- plumbing
+
+    fn note_extreme(&mut self, span: Span, v: i32) {
+        self.extremes.insert(key_of(span), v);
+    }
+
+    /// The value `MIN`/`MAX` gave at this span, if the call was one of them: a
+    /// user's own `MIN` records nothing, so shadowing needs no extra check.
+    pub fn extreme_at(&self, span: Span) -> Option<i32> {
+        self.extremes.get(&key_of(span)).copied()
+    }
+
+    /// The type an argument *names*, when it is a type name rather than an
+    /// expression: `SIZE(T)`, `MIN(T)` (report §11.1, W8.2).
+    fn type_arg(&mut self, e: &Expr) -> Option<TypeId> {
+        match &e.kind {
+            ExprKind::Designator(d) if d.sels.is_empty() => {
+                self.type_of_qual_silent(&d.base, e.span)
+            }
+            _ => None,
+        }
+    }
+
+    /// The extreme of an ordinal type (W8.2): `INTEGER`, and `BYTE`/`CHAR`,
+    /// whose range report §6.1 fixes at 0..255. A type without one has no
+    /// extreme to name, which is an error rather than a zero.
+    fn extreme_of(&self, name: &str, ty: TypeId) -> Option<i32> {
+        let min = name == "MIN";
+        match self.types.get(ty) {
+            Type::Basic(Basic::Integer) => Some(if min { i32::MIN } else { i32::MAX }),
+            Type::Basic(Basic::Byte) | Type::Basic(Basic::Char) => Some(if min { 0 } else { 255 }),
+            _ => None,
+        }
+    }
 
     fn note_type(&mut self, span: Span, ty: TypeId) {
         self.types_at.insert(key_of(span), ty);
@@ -531,6 +569,9 @@ impl<'a> Sema<'a> {
             self.declare(name, Sym::Predef(name), Span::default());
         }
         for name in PREDEFINED_PROPER {
+            self.declare(name, Sym::Predef(name), Span::default());
+        }
+        for name in PREDEFINED_TYPED {
             self.declare(name, Sym::Predef(name), Span::default());
         }
     }
@@ -890,6 +931,26 @@ impl<'a> Sema<'a> {
                     if let Some(Sym::Const(v, _)) = self.lookup(&name) {
                         e.kind = literal(&v);
                         return;
+                    }
+                }
+                // `MIN(T)`/`MAX(T)` (W8.2): a constant wherever it appears, so a
+                // constant context folds it here rather than meeting a call the
+                // folder refuses to evaluate.
+                if matches!(name.as_str(), "MIN" | "MAX") && d.sels.len() == 1 {
+                    // A constant declaration is substituted *before* resolution
+                    // classifies the paren group, so both forms are accepted here.
+                    let args = match &d.sels[0] {
+                        Selector::Call(a) => Some(a.as_slice()),
+                        Selector::Args(Some(a)) => Some(a.as_slice()),
+                        _ => None,
+                    };
+                    if let Some([arg]) = args {
+                        if let Some(ty) = self.type_arg(arg) {
+                            if let Some(v) = self.extreme_of(&name, ty) {
+                                e.kind = literal(&Const::Int(v));
+                                return;
+                            }
+                        }
                     }
                 }
                 // `LEN(v)` of a fixed-size array.
@@ -2041,7 +2102,9 @@ impl<'a> Sema<'a> {
                 Sym::Var { ty, .. } if self.types.is_proc(ty) => {
                     Some(self.signature(ty).1.is_some())
                 }
-                Sym::Predef(n) => Some(PREDEFINED_FUNCTIONS.contains(&n)),
+                Sym::Predef(n) => {
+                    Some(PREDEFINED_FUNCTIONS.contains(&n) || PREDEFINED_TYPED.contains(&n))
+                }
                 _ => None,
             };
         }
@@ -2100,7 +2163,43 @@ impl<'a> Sema<'a> {
     }
 
     /// A predeclared procedure of report §10.2, used as a call.
+    /// `MIN(T)`/`MAX(T)` (W8.2). The argument is a type name, so this is the
+    /// shape of a SYSTEM entry rather than of a predefined function; the value
+    /// is a constant of type `INTEGER`.
+    fn extreme_call(&mut self, span: Span, name: &str, args: &[Expr]) -> Typed {
+        if args.len() != 1 {
+            self.error(span, format!("{name} takes 1 argument, the type (W8.2)"));
+            return Typed::error(self.types.error());
+        }
+        let arg_ty = self.type_arg(&args[0]);
+        let Some(ty) = arg_ty else {
+            self.error(
+                args[0].span,
+                format!("the argument of {name} must be a type name, not an expression"),
+            );
+            return Typed::error(self.types.error());
+        };
+        match self.extreme_of(name, ty) {
+            Some(v) => {
+                self.note_extreme(span, v);
+                Typed::value(self.types.integer())
+            }
+            None => {
+                let ty = self.error_ty(
+                    args[0].span,
+                    format!("{name} is defined for INTEGER, BYTE and CHAR"),
+                );
+                Typed::error(ty)
+            }
+        }
+    }
+
     fn predef_call(&mut self, span: Span, name: &str, args: &[Expr]) -> Typed {
+        // Before the arguments are typed: `MIN(T)`/`MAX(T)` take a *type*, and
+        // typing `T` as an expression is the mistake this call exists not to make.
+        if matches!(name, "MIN" | "MAX") {
+            return self.extreme_call(span, name, args);
+        }
         let mut tys = Vec::new();
         let mut typed: Vec<Typed> = Vec::new();
         for a in args {
@@ -2458,7 +2557,7 @@ impl<'a> Sema<'a> {
                         // `WriteLn`-style calls of a predeclared function used
                         // as a statement are caught below by the function check.
                         Some(Sym::Predef(n)) => {
-                            if PREDEFINED_FUNCTIONS.contains(&n) {
+                            if PREDEFINED_FUNCTIONS.contains(&n) || PREDEFINED_TYPED.contains(&n) {
                                 // ✔ row 31: a function's value must be used.
                                 self.error(
                                     d.span,
@@ -2665,7 +2764,16 @@ impl<'a> Sema<'a> {
                 );
             }
             match &arm.labels {
-                None => has_default = true,
+                None => {
+                    // Two defaults — `CASE x OF 1: … ELSE … | END`, or `ELSE` with
+                    // a label-less `|` arm — are two answers to one question
+                    // (W8.1; the report's grammar allows only one, and `ELSE` is
+                    // the spelling this dialect adds).
+                    if has_default {
+                        self.error(arm.span, "CASE has two default arms (report 9.5)");
+                    }
+                    has_default = true;
+                }
                 Some(labels) => {
                     for l in labels {
                         // One label per entry: a range is `l.lo .. l.hi`, and the
@@ -2841,6 +2949,9 @@ struct TypeScope {
 const PREDEFINED_FUNCTIONS: &[&str] = &[
     "ABS", "ODD", "LEN", "LSL", "ASR", "ROR", "FLOOR", "FLT", "ORD", "CHR",
 ];
+/// `MIN(T)`/`MAX(T)` (W8.2): function procedures whose argument is a *type*, so
+/// they have no signature to build and are dispatched by name like a SYSTEM entry.
+const PREDEFINED_TYPED: &[&str] = &["MIN", "MAX"];
 /// Report §10.2, the proper procedures.
 const PREDEFINED_PROPER: &[&str] = &[
     "INC", "DEC", "INCL", "EXCL", "NEW", "ASSERT", "PACK", "UNPK",

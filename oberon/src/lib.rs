@@ -1620,6 +1620,59 @@ END M.\n";
         assert!(w.is_empty(), "every import is used, and so is P0: {w:#?}");
     }
 
+    /// W8.2: `MIN(T)`/`MAX(T)` name the extreme of an ordinal type, and the value
+    /// is a constant — in a constant declaration as much as in a statement.
+    #[test]
+    fn min_and_max_are_constants_of_ordinal_types() {
+        let src = "MODULE M;\n  CONST Low = MIN(INTEGER); High = MAX(INTEGER);\n\
+  VAR i: INTEGER; b: BYTE; c: CHAR; r: REAL;\n\
+BEGIN\n  i := MIN(INTEGER); i := MAX(BYTE); i := MIN(CHAR);\n\
+  i := MAX(BYTE) - MIN(BYTE); c := CHR(MAX(CHAR))\nEND M.\n";
+        let e = errors(src, &[]);
+        assert!(e.is_empty(), "the extremes are constants: {e:#?}");
+
+        // A type without an extreme is refused rather than given one, and so is
+        // an argument that is an expression rather than a type name.
+        let bad = errors("MODULE M;\n  VAR i: INTEGER; r: REAL;\nBEGIN\n  i := MIN(REAL)\nEND M.\n", &[]);
+        assert!(
+            bad.iter().any(|d| d.contains("defined for INTEGER, BYTE and CHAR")),
+            "{bad:#?}"
+        );
+        let bad = errors("MODULE M;\n  VAR i: INTEGER;\nBEGIN\n  i := MIN(i)\nEND M.\n", &[]);
+        assert!(bad.iter().any(|d| d.contains("must be a type name")), "{bad:#?}");
+    }
+
+    /// W8.2: a program that declares its own `MIN` shadows the predefined one —
+    /// the scoping rule every predeclared name already has.
+    #[test]
+    fn a_declared_min_shadows_the_predefined_one() {
+        let src = "MODULE M;\n  VAR i: INTEGER;\n\
+  PROCEDURE MIN(x: INTEGER): INTEGER;\n  BEGIN RETURN x + 1 END MIN;\n\
+BEGIN\n  i := MIN(41)\nEND M.\n";
+        let e = errors(src, &[]);
+        assert!(e.is_empty(), "a user MIN takes a value, not a type: {e:#?}");
+    }
+
+    /// W8.1: `CASE … ELSE` is report §9.5's default arm under a keyword LALR(1)
+    /// can parse, and two defaults are one answer too many.
+    #[test]
+    fn case_else_is_the_default_arm_and_there_is_only_one() {
+        let src = "MODULE M;\n  VAR i: INTEGER;\nBEGIN\n\
+  CASE i OF 1: i := 1 | 2: i := 2 ELSE i := 3 END;\n\
+  CASE i OF 1: i := 1 ELSE i := 3 END\nEND M.\n";
+        let e = errors(src, &[]);
+        assert!(e.is_empty(), "ELSE is the default arm: {e:#?}");
+
+        let two = errors(
+            "MODULE M;\n  VAR i: INTEGER;\nBEGIN\n  CASE i OF 1: i := 1 | ELSE i := 2 END\nEND M.\n",
+            &[],
+        );
+        assert!(
+            two.iter().any(|d| d.contains("two default arms")),
+            "{two:#?}"
+        );
+    }
+
     /// `SIZE(Texts.Writer)` is a *type* from another module: the qualified name
     /// has to resolve, and it counts as a use of the import that names it.
     #[test]

@@ -435,7 +435,7 @@ A *fatal* error — a missing `END`, an unterminated comment, an illegal charact
 diagnostic rather than printed as a `ParseError` **[verified]**, so a reader
 never sees a byte offset.
 
-### D8 — the `CASE` default arm is spelled `| : S`, not `| S` **[decided; deviation recorded]**
+### D8 — the `CASE` default arm is spelled `ELSE S`, not `| S` **[decided; `ELSE` added in W8.1]**
 
 The report's `case = [CaseLabelList ":" StatementSequence]` puts the label list and
 its colon in one optional group, so a *default* arm is written as a bare statement
@@ -447,19 +447,17 @@ its own is the default with no statements. The report's bare `| S` is therefore
 `error: unexpected `:=` … = note: expected END, ., .., ,, : or |`, pointing at the
 missing colon.
 
-This is not an oversight and not fixable in the grammar: the two forms share a
-first set (a statement sequence may start with the same qualident a type or
-constant label may), so telling `| k := 2` from `| k: …` needs two tokens of
-lookahead, which LALR(1) does not have and the reference compiler's recursive
-descent does. The options were a hand-written case-arm parser, a two-token
-lookahead trick in the lexer, or this: keep the grammar and record the deviation.
-The deviation costs source portability for one spelling — a program written for
-another compiler that uses the default arm must insert the colon — while the
-*semantics* (a default arm, and an empty one) are fully expressible, and the
-existing diagnostic already says which token is missing. Rejecting `| : S` instead
-would leave no way to write a default arm at all, which is worse; accepting both
-would need the lookahead. Revisit only if a corpus of real Oberon-07 sources
-becomes the target, in which case the case-arm parser is the honest fix.
+The report's bare `| S` is still rejected, and not because it was forgotten: a
+statement sequence and a label list share a first set (a call statement starts with
+the same qualident a constant label may), so telling `| k := 2` from `| k: …` needs
+two tokens of lookahead that LALR(1) does not have and the reference compiler's
+recursive descent does. `ELSE` is the answer instead (PLAN.md W8.1): it is already
+a report keyword, its arm is the same node as a label-less `|` arm — which the
+checker and the emitter have always treated as the default — and two defaults in one
+`CASE` are refused by row 63 rather than silently ordered. The empty-label spelling
+`| : S` is still accepted, so a program that already used it keeps working; the
+deviation from the report is that the default arm has a spelling its grammar does
+not, which `ELSE` supplies.
 
 ---
 
@@ -861,6 +859,9 @@ is added or removed by `-Ochecks`" half of row 60 is `csmoke`'s
 | 58 | `SYSTEM.GET`'s variable is not writable — row 6's reasons, since `GET` writes it | §11.1, §9.1 | E |
 | 59 | a `SYSTEM` entry used with the wrong number of arguments (the entries have no formal parameter list for row 25 to check) | §11.1 | E |
 | 60 | not a check but a rule the lowering states: `SYSTEM.COPY`'s count is in *words* and `SIZE(T)` is the byte size including padding (§9.10), and no `-Ochecks` setting adds or removes anything for `SYSTEM` | §11.1 | — |
+| 61 | `MIN`/`MAX`'s argument is not a *type name* | W8.2 | E |
+| 62 | `MIN`/`MAX` of a type that has no extreme — `REAL`, `SET`, `BOOLEAN`, a structured type: named, rather than given a zero | W8.2 | E |
+| 63 | a `CASE` with two default arms (`ELSE` and a label-less `\|` arm) | W8.1, §9.5 | E |
 
 ### 8.6 Storage and allocation
 
@@ -1097,6 +1098,13 @@ consistently to `y < 0`. Two hazards were found and are handled:
   `x >> n` (gcc, clang: arithmetic); the portable form
   `(x < 0) ? ~(~(uint32_t)x >> n) : (uint32_t)x >> n` was verified separately
   over 7 cases **[verified]** and is what the emitter should ship.
+
+**`MIN(T)`/`MAX(T)`** (W8.2) are constants of the checker's making: it reads the
+extreme from the type and records the value, and the emitter lowers the call to
+that value, so nothing about them reaches the back end as a call. A constant
+context folds them like a named constant (§8.5 rows 61-62). `MIN`/`MAX` are
+*predeclared*, so a program that declares its own shadows them, and the recorded
+value is keyed by the call's span, which is why nothing has to be checked for that.
 
 **Evaluation order.** Oberon's reference compilers read left to right, and C
 leaves the order of the operands of `+`, `*`, `/` — and of a call's *arguments* —
@@ -1443,7 +1451,7 @@ section or risk each item comes from.
 |---|---|---|
 | R1 | The report's grammar is not LR(1) in three places. | **Found and resolved**, not papered over: D2 and D3 move two decisions to the resolver; D1 is a local factoring. Evidence in §5. |
 | R2 | Type guard vs. call argument list is decided by a *semantic* rule. | Sound (types and variables share one namespace), pinned by tests. The residual case `f(x)(y)` is diagnosed rather than mis-parsed. |
-| R3 | No garbage collector. | Documented deviation (§1). `NEW` failures yield `NIL`, which is specified. A mark-sweep collector can replace `rt_new` without touching generated code. |
+| R3 | No garbage collector. | **Decided, not yet built** (§15, PLAN.md W10.1/W10.2): mark-sweep and non-moving, a precise mark driven by a descriptor that gains the pointer-field offsets, a conservative stack walk until the Cranelift back end can supply stack maps, and collection before `NEW` gives up. `NEW` failures already yield `NIL`, which is specified, and one allocation entry point (`rt_new`) is where all of it hangs. |
 | R4 | Signed overflow: C's UB vs. Oberon's unspecified wrap. | `-fwrapv` in the documented compile line **[verified]**; the emitted code never relies on the C compiler's optimiser reasoning about overflow. |
 | R5 | `SYSTEM` (§11.1) was not implemented. | **Implemented** (`PLAN.md` W4.1): the import resolves to a builtin module (§9.10), the report's six portable entries are lowered in place, and the RISC-specific extras (`VAL`, `ADC`, `SBC`, `UML`, `COND`, `LED`) are still refused *by name*. R31 records the one thing the report's model does not give on a 64-bit host. |
 | R6 | `FOR` loops that end at the largest `INTEGER`: `v += k` wraps and the guard is re-tested against a wrapped value. | **Resolved**: the report's own equivalence (§9.8) is `v := beg; WHILE v <= end DO S; v := v + inc END`, so the wrap and the re-test *are* the specified behaviour, and with `-fwrapv` it is defined C. No check is added, and W3.1's flag does not need one: a `FOR` loop cannot exceed its bound. |
@@ -1528,6 +1536,19 @@ or self-inconsistent and a compiler has to choose once and then be consistent:
    exit code, and the suites' clean modules import nothing unused.
 11. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
    and assignment per §9.1.2), but is not an integer operand.
+13. **Two additive extensions, on by default** (`PLAN.md` W8.1, W8.2). `CASE … ELSE`
+    and `MIN(T)`/`MAX(T)` are not report Oberon-07, and they are adopted rather
+    than gated. The rule that decides which extensions may be: an extension that
+    *only adds* — a report program cannot be affected by it — may be on by default,
+    while one that changes how existing text tokenises or resolves needs a dialect
+    switch (W8.10 is the case in point, since the report makes capital and
+    lower-case letters distinct). `ELSE` is already a keyword and `MIN`/`MAX` are
+    predeclared *names* that a program can shadow, so neither can change what an
+    existing program means. W8.11's survey records the rest: the ones with a real
+    cost (numeric inclusion, type-bound procedures, `WITH`) stay rejected, and the
+    syntaxes that are another spelling of machinery we already have are not worth
+    their keyword.
+
 12. **The SYSTEM address model** (report §11.1, `PLAN.md` W4.1). The report's
    `mem[a]` is an array of *words* on a machine whose addresses are words, and it
    types `ADR` as `INTEGER`; this implementation defines an address as a **byte**
