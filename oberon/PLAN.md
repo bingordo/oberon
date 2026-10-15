@@ -1220,6 +1220,17 @@ Done when: each item above has either landed with tests or been declined in DESI
 **W9.1 research the back end, then build it beside the C one** — **done**
 (the research is DESIGN §16, the prototype is §16's second subsection)
 
+Independently checked by the integrator, not taken from the author's report: `obc emit
+Elf.mod --backend=clif` writes `Elf.o`, and `file` reads it as *ELF 64-bit LSB
+relocatable, x86-64* — machine code for the module with `Elf__init` and `Elf__load`
+exported and the only undefined symbols being `ob_rt_index_at`, `ob_rt_div_at`,
+`ob_rt_mod_at`, `ob_rt_trap_pos` and `ob_register_commands`. That is the design's ABI
+boundary visible in the object itself: the module is compiled, the runtime stays C.
+The corpus passes on both back ends (`bash fuzz/run.sh` and `BACKEND=clif bash
+fuzz/run.sh`, exit 0 each), and `BACKEND=clif bash e2e/run.sh` stops at the first row
+the back end cannot yet meet — 39 check lines against the C path's 101 — which is the
+harness for W9.2 rather than a failure of it.
+
 Why: every memory-safety and code-generation finding of W7 has been about the *C*
 the emitter writes, not about Oberon-07 — R15 (a guarded read gcc can prove is
 outside the allocation), R20 (a `malloc`-typed `NEW`), the `-Werror` classes that
