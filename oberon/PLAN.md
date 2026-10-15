@@ -1435,6 +1435,23 @@ with the reason, and the correctness oracle is unchanged — `fuzz` with
 `OB_GC_STRESS=1` and the standard suite both still green. "We measured, and this is
 the bound we accept" is a legitimate outcome; "it seems fine" is not.
 
+**First step is the instrument, and it is not optional**: `.15`'s collector has no
+counter of any kind, so wall-clock numbers cannot separate a pause from the mutator
+work between pauses. `OB_GC_STATS=1` should report, per collection, the bytes before
+and after, the blocks marked and swept, and the *time spent inside* `ob_collect` —
+the shape `OB_ALLOC_FAIL_AT` and `OB_GC_STRESS` already have.
+
+**One early observation, recorded with its caveat.** A churn benchmark of my own —
+5000 live nodes kept while 200 000 objects are allocated and dropped — ran
+*unbounded* in 12.0 s and 12.8 s, at a 2 MB ceiling in 5.7 s and 6.8 s, and at
+512 KB in 10.6 s and 7.6 s. The bounded runs being *faster* than the unbounded one is
+not the collector being free: it is that reuse beats growth, since the unbounded run
+grows the heap to ~6 MB and pays for the pages while the bounded one stays cache-hot.
+So the trade this collector makes is memory spent against pauses rather than speed
+against safety — and the honest caveat is that those numbers came from a machine that
+was compiling at the same time, which is why they are a direction and not a
+measurement. The instrument is what turns them into one.
+
 ## Ideas not yet in the design (adopt or drop)
 
 - Fuzz the *lexer* with random bytes and random token streams: assert no panic
