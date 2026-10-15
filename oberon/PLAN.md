@@ -999,13 +999,17 @@ VOC, Oberon-2 §10.1, Component Pascal §10, Oberon+ and Zonnon §7.9 all allow 
 **W8.5 `EXIT` for loops** — **done**
 `LOOP`/`EXIT` exist in Oberon-2, Component Pascal, Oberon+ and Zonnon. `EXIT` alone (no `LOOP`) removes the flag-variable dance from `WHILE`/`REPEAT`/`FOR` bodies and maps to C's `break`. Against it, from Wirth himself: the 2007 revision removed features "judged duplicative or non-essential" for "regularity, simplicity, completeness, and well-structuredness" — which is why `LOOP` (redundant with `WHILE TRUE`) is *not* proposed, and why `EXIT` should be weighed rather than assumed. Note the keyword cost: `EXIT` is a new reserved word, so an identifier spelled `EXIT` in upper case would collide (Oberon is case-sensitive, so lower case is safe) — the same caveat Oberon+ documents for `WITH` and `LOOP`. **Done**: `EXIT` lowers to C's `break`, which leaves exactly the innermost loop in every form we emit (a `for (;;)` with its guards inside, or a C `for`), so no bookkeeping is needed; `EXIT` outside a loop is refused with a located error (row 64). Tests: `exit-outside-a-loop-is-refused`, and the same `e2e` row walks all three loop forms.
 
-**W8.6 `LONGINT` / `LONGREAL` as real 64-bit types** — *defer, with the blast radius stated*
-Oberon-2 §6.1, Component Pascal §6.1, VOC and Oberon+ (which goes further with `INT8`…`INT64`) all have wider numeric types. But Wirth's own Project Oberon compilers define `LONGINT`/`LONGREAL` as **synonyms** for `INTEGER`/`REAL`, with no widening — so a *real* 64-bit integer is not what a reference implementation means by the name. A C back end gets them cheaply (`int64_t`, `double`), but they touch the type algebra, the folder, the emitter, the `.sym` format and the generator's mirror. Defer until something needs them.
+**W8.6 `LONGINT` / `LONGREAL` as real 64-bit types** — **deferred, decision recorded**
+Oberon-2 §6.1, Component Pascal §6.1, VOC and Oberon+ (which goes further with `INT8`…`INT64`) all have wider numeric types. But Wirth's own Project Oberon compilers define `LONGINT`/`LONGREAL` as **synonyms** for `INTEGER`/`REAL`, with no widening — so a *real* 64-bit integer is not what a reference implementation means by the name. A C back end gets them cheaply (`int64_t`, `double`), but they touch the type algebra, the folder, the emitter, the `.sym` format and the generator's mirror. Defer until something needs them. **Deferred deliberately**: nothing in the corpus,
+the suites or the target programs needs them, and the reference compilers' own
+`LONGINT` is a synonym rather than a wider type, so taking the name would mean
+something different from what an Oberon programmer expects. Revisit with a program
+that needs one, and then as a dialect (DESIGN §13 decision 13).
 
 **W8.7 the escape hatch's scope** — *feeds W4.1*
 Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`, `COND`, `REG`, `LDREG`, `LDPSR`, `LED`, `ADC`, `SBC`, `UML`; VOC adds `INT8`…`INT64`, `SET32`/`SET64`, `ADDRESS`; AntKrotov adds `GET8/16/32`, `PUT8/16/32`, `SADR`, `WSADR`, `MOVE`, `TYPEID`, `CODE` and, on STM32, `WCHAR`/`WCHR`. Decision to take in W4.1: the report's portable five, plus the *sized* accessors (`GET8/16/32`, `PUT8/16/32`) because a byte-address model needs them, while register/PSR/`LED`/`CODE`/`WCHAR` are target-specific and stay refused by name.
 
-**W8.8 what the survey says to reject** — recorded so the question does not come back
+**W8.8 what the survey says to reject** — **recorded; closed**
 * syntax conveniences *other than the keyword case above* (which is W8.10): `_` in identifiers, `//` comments, optional end names, single-quoted strings, conditional compilation (AntKrotov, Oberon+) — each makes a program non-portable to a report compiler, and our value is strict conformance;
 * type-width *models* (VOC's `-O2`/`-OC`/`-OV`, Oberon+'s fixed-width set) — a dialect matrix multiplies the type algebra; the report fixes `INTEGER` = 32 bits and `REAL` = 32 bits;
 * `WITH` — superseded by guards, `IS` and type-`CASE`, and Wirth removed it;
@@ -1013,7 +1017,7 @@ Every survey found `SYSTEM` growing the same way: Wirth's RISC compiler adds `H`
 * dynamic and multi-dimensional open arrays, `NEW(v, n)`, `LEN(v, dim)` (all four) — they interact with descriptors and, in the systems that have them, with a tracing collector;
 * tracing garbage collection and finalizers (VOC, Oberon-2 systems) — finalizers stay rejected (the report has no such concept), and GC is no longer simply "out": its design is being studied first (W4.5) with `rt_new` as the door (R3).
 
-**W8.9 a lesson that is not an extension: our overflow stance is ahead of production**
+**W8.9 a lesson that is not an extension: our overflow stance is ahead of production** — **recorded; closed**
 VOC's C back end does not establish `-fwrapv`, so signed overflow there is undefined C. Our design fixes it deliberately (R4) and R20 is about making that choice *warning-clean* — not about giving it up.
 
 **W8.10 lower-case keywords** — *requested; opt-in by default, see the rule below*
