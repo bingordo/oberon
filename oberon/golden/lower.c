@@ -324,11 +324,15 @@ static void cases_runtime(void) {
   check("rt-div-y=-1[-7 DIV -1 = 7, -7 MOD -1 = 0, INT32_MIN DIV -1 = INT32_MIN, no idiv trap]",
         rt_div(-7, -1) == 7 && rt_mod(-7, -1) == 0 && rt_div(INT32_MIN, -1) == INT32_MIN,
         detail_i("-7 DIV -1", rt_div(-7, -1), 7));
-  check("rt-asr-portable[-8 ASR 1 = -4, -1 ASR 31 = -1, 33 ASR 33 = 16 (count mod 32)]",
-        rt_asr(-8, 1) == -4 && rt_asr(-1, 31) == -1 && rt_asr(33, 33) == 16,
+  /* The report defines ASR as `x DIV 2^n` (R22), so a count of 33 is 0, not a
+   * masked no-op. */
+  check("rt-asr-portable[-8 ASR 1 = -4, -1 ASR 31 = -1, 33 ASR 33 = 0 (x DIV 2^n)]",
+        rt_asr(-8, 1) == -4 && rt_asr(-1, 31) == -1 && rt_asr(33, 33) == 0,
         detail_i("-8 ASR 1", rt_asr(-8, 1), -4));
-  check("rt-lsl[-1 LSL 31 = INT32_MIN, 1 LSL 32 = 1 (count mod 32)]",
-        rt_lsl(-1, 31) == INT32_MIN && rt_lsl(1, 32) == 1,
+  /* LSL is `x * 2^n`, so multiplying by 2^32 wraps to zero rather than
+   * shifting by zero (R22). */
+  check("rt-lsl[-1 LSL 31 = INT32_MIN, 1 LSL 32 = 0 (x * 2^n wraps)]",
+        rt_lsl(-1, 31) == INT32_MIN && rt_lsl(1, 32) == 0,
         detail_i("-1 LSL 31", rt_lsl(-1, 31), INT32_MIN));
   check("rt-ror[0x12345678 ROR 8 = 0x78123456, ROR 0 = identity]",
         rt_ror(0x12345678u, 8) == 0x78123456u && rt_ror(0x12345678u, 0) == 0x12345678u,

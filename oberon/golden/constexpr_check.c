@@ -52,8 +52,11 @@ static int64_t c_m7_p_slash_3(void) { return (int64_t)rt_div(-7, 3); }
 
 /* SHIFTS.  LSL(1, 31) is recomputed as the plain shift of 1 into the sign bit. */
 static int64_t c_lsl_1_31(void) { return (int64_t)(int32_t)0x80000000u; }
-static int64_t c_lsl_1_32(void) { return (int64_t)rt_lsl(1, 0); }
-static int64_t c_lsl_1_33(void) { return (int64_t)rt_lsl(1, 1); }
+/* LSL is `x * 2^n` (report §8.2.2), so at n = 32 the product wraps to zero and at
+ * n = 33 it stays zero: recomputed here as the wrap rather than as a shift by a
+ * masked count (R22). */
+static int64_t c_lsl_1_32(void) { return (int64_t)((1u * 0u)); }
+static int64_t c_lsl_1_33(void) { return (int64_t)((1u << 1) * 0u); }
 static int64_t c_asr_m8_1(void) { return (int64_t)rt_div(-8, 2); }
 static int64_t c_asr_8_1(void) { return (int64_t)rt_div(8, 2); }
 static int64_t c_asr_m1_31(void) { return (int64_t)rt_div(-1, 1073741824); }

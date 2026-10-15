@@ -120,8 +120,16 @@ static void rt_guard(int32_t cond, const char *msg) { if (!cond) rt_trap(msg); }
 
 /* Shifts.  report: LSL(x,n) = x * 2^n ; ASR(x,n) = x DIV 2^n ; ROR = rotate
  * right by n.  n is reduced modulo 32.                                     */
-static int32_t rt_lsl(int32_t x, int32_t n) { return (int32_t)((uint32_t)x << (n & 31)); }
-static int32_t rt_asr(int32_t x, int32_t n) { return x >> (n & 31); } /* gcc: arithmetic */
+/* As emitted (src/oberon_h.inc): the report defines LSL as `x * 2^n` and ASR as
+ * `x DIV 2^n`, so a count of 32 or more is defined, not a no-op (R22). */
+static int32_t rt_lsl(int32_t x, int32_t n) {
+  if (n >= 32) return 0;
+  return (int32_t)((uint32_t)x << (n & 31));
+}
+static int32_t rt_asr(int32_t x, int32_t n) {
+  if (n >= 32) return (x < 0) ? -1 : 0;
+  return x >> (n & 31); /* gcc: arithmetic */
+}
 static uint32_t rt_ror(uint32_t x, int32_t n) {
   n = n & 31;
   if (n == 0) return x;
@@ -384,7 +392,11 @@ static void case_types(void) {
 /* ==================================================================== */
 static void case_shifts(void) {
   check("lsl(1,31)==INT32_MIN", rt_lsl(1, 31) == INT32_MIN, "expected INT32_MIN");
-  check("lsl(1,32)==1[n mod 32]", rt_lsl(1, 32) == 1, "expected 1");
+  check("lsl(1,32)==0[x*2^32 wraps]", rt_lsl(1, 32) == 0, "expected 0");
+  check("lsl(1,33)==0[x*2^33 wraps]", rt_lsl(1, 33) == 0, "expected 0");
+  check("asr(8,32)==0[8 DIV 2^32]", rt_asr(8, 32) == 0, "expected 0");
+  check("asr(-8,32)==-1[floor]", rt_asr(-8, 32) == -1, "expected -1");
+  check("ror(1,32)==1[rotation is mod 32]", rt_ror(1u, 32) == 1u, "expected 1");
   check("asr(-8,1)==-4", rt_asr(-8, 1) == -4, "expected -4");
   check("asr(-1,1)==-1", rt_asr(-1, 1) == -1, "expected -1");
   check("ror(1,1)==0x80000000", rt_ror(1u, 1) == 0x80000000u, "expected 0x80000000");

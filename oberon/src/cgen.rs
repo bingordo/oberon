@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::ast::{self, BinOp, CaseLabel, Expr, ExprKind, Module, QIdent, Selector, Span, Stmt, StmtKind, TypeExpr, UnOp};
+use crate::const_eval;
 use crate::sema::Sema;
 use crate::types::{Basic, Param, Type, TypeId, Types};
 
@@ -645,6 +646,18 @@ impl<'a> Emitter<'a> {
             // The link may be unused when the body reaches nothing enclosing.
             let _ = writeln!(out, "    (void)sl;");
         }
+        // Oberon does not require a body to read its parameters, and the same
+        // build line rejects `-Wunused-parameter`/`-Wunused-but-set-parameter`
+        // (R20): mark each one used. Nested procedures copy their parameters
+        // into a frame, which does read them, but the extra statement costs
+        // nothing and removes the class of failure that the generator found.
+        for (n, pm) in &flat {
+            let name = mangle(n);
+            let _ = writeln!(out, "    (void){name};");
+            if matches!(self.types.get(pm.ty), Type::OpenArray { .. }) {
+                let _ = writeln!(out, "    (void){name}__len;");
+            }
+        }
 
         self.frames.push(Frame { frame: frame.clone(), level, path: path.clone() });
 
@@ -1067,6 +1080,20 @@ impl<'a> Emitter<'a> {
     // ---------------------------------------------------------- expressions
 
     fn expr(&mut self, e: &Expr, want: Option<TypeId>) -> String {
+        // A constant expression is emitted as its value. The C compiler would
+        // fold it anyway; the point is that it also *warns* about the overflow it
+        // folds through (`-Woverflow`, and a tautological comparison), and the
+        // documented build line treats warnings as errors (R20, PLAN.md W6.2).
+        // The folder is the same one DESIGN §8.3 cross-checks against the
+        // runtime, so this cannot disagree with the emitted helpers.
+        if let Ok(c) = const_eval::eval(e) {
+            if let Some(v) = c.int() {
+                return format!("((int32_t){}u)", v);
+            }
+            if let Some(b) = c.bool() {
+                return if b { "1".to_string() } else { "0".to_string() };
+            }
+        }
         match &e.kind {
             ExprKind::Int(v) => format!("((int32_t){}u)", v),
             ExprKind::Real(v) => format!("((float){v:?}f)"),

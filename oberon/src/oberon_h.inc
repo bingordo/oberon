@@ -87,13 +87,19 @@ static inline int32_t rt_mod(int32_t x, int32_t y) {
     return r;
 }
 
+/* The report's table (§8.2.2) defines these as `x * 2^n` and `x DIV 2^n`, so a
+ * count of 32 or more is defined rather than a no-op: multiplying by 2^32 wraps
+ * to zero, and `x DIV 2^32` is 0 or -1. Only a *negative* count is undefined,
+ * and masking it keeps the C defined too (R22). */
 static inline int32_t rt_lsl(int32_t x, int32_t n) {
+    if (n >= 32) return 0;
     return (int32_t)((uint32_t)x << ((uint32_t)n & 31u));
 }
 
 /* Portable arithmetic shift right: the sign is re-extended explicitly, so this
  * does not depend on `>>` being arithmetic (DESIGN 9.5). */
 static inline int32_t rt_asr(int32_t x, int32_t n) {
+    if (n >= 32) return (x < 0) ? -1 : 0;
     uint32_t k = (uint32_t)n & 31u;
     return (x < 0) ? (int32_t)~(~(uint32_t)x >> k) : (int32_t)((uint32_t)x >> k);
 }

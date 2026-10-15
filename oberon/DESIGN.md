@@ -694,7 +694,8 @@ fixed-size array is folded by the checker, which knows lengths, and the folder
 says so rather than guessing.
 
 The folder implements the *same* arithmetic as the emitted C — floor `DIV`/`MOD`
-including the `y == -1` case, shifts with the count reduced mod 32, `{a .. b}` as
+including the `y == -1` case, the shifts *as the report defines them* (`x * 2^n` and
+`x DIV 2^n`, the rotation mod 32 — R22), `{a .. b}` as
 `((1u << (b-a+1)) - 1u) << a`, set union/difference/intersection/symmetric
 difference, and `INTEGER` arithmetic that wraps as `-fwrapv` does — and
 `tests::agrees_with_the_emitted_c` checks that against a table of values produced
@@ -720,7 +721,7 @@ Inserted into the outermost scope before anything else, as report §10.2 defines
 | `ABS(x)` | numeric → same type | |
 | `ODD(x)` | INTEGER → BOOLEAN | |
 | `LEN(v)` | array → INTEGER | |
-| `LSL`, `ASR`, `ROR` | (INTEGER, INTEGER) → INTEGER | shift count mod 32 |
+| `LSL`, `ASR`, `ROR` | (INTEGER, INTEGER) → INTEGER | `x * 2^n`, `x DIV 2^n`, rotate right by n (report §8.2.2); a negative count is undefined and is masked |
 | `FLOOR(x)` | REAL → INTEGER | round down |
 | `FLT(x)` | INTEGER → REAL | |
 | `ORD(x)` | CHAR/BOOLEAN/SET → INTEGER | |
@@ -969,7 +970,7 @@ process abort, which is what makes the trap rule testable at all.
 | `s + t`, `s - t`, `s * t`, `s / t`, `-s` (sets) | `(s \| t)`, `(s & ~t)`, `(s & t)`, `(s ^ t)`, `(~s)` |
 | `x IN s` | `(int32_t)((s >> (x & 31)) & 1u)` |
 | `{a .. b}` | `rt_set(a, b)` = `((1u << (b-a+1)) - 1u) << a`, empty when `a > b`, width-32 case as `0xFFFFFFFFu << a` |
-| `LSL(x,n)`, `ASR(x,n)`, `ROR(x,n)` | `rt_lsl`, `rt_asr`, `rt_ror`, count taken mod 32 |
+| `LSL(x,n)`, `ASR(x,n)`, `ROR(x,n)` | `rt_lsl`, `rt_asr`, `rt_ror`; `LSL`/`ASR` follow the report definition, so a count of 32 or more is 0 (or -1), and only `ROR` masks (R22) |
 | `a < b` on `CHAR` arrays | `rt_charcmp(a, na, b, nb) < 0` — compares up to `max(na, nb)` bytes, treating the byte *after* an operand's length as NUL, so a filled array and a terminated one with the same content compare equal and the result agrees with `strcmp` wherever both are terminated **[verified]**: agreement with `strcmp` on terminated operands (all 25 ordered pairs), operands filled with no NUL at all, antisymmetry over 121 pairs, and ASan proving no read past either operand |
 | `x = NIL` on pointers | `x == NULL` |
 | `v IS T` | `rt_is(RT_DESC(v), &TD_T)` |
@@ -1250,6 +1251,7 @@ section or risk each item comes from.
 | R18 | `--cflags "…"` is split on whitespace, so a single flag whose own argument contains a space cannot be written that way. | Mitigated by `--cflag ARG`, which appends one argument verbatim and is repeatable; both are in the driver's usage. A path with spaces is passed correctly as a *file* argument, because the driver never goes through a shell. |
 | R19 | Declaration-level and module-level syntax errors get no recovery: every shape that would express it is rejected by LALRPOP with a local ambiguity on the error token, because the report lets each declaration section be empty and the section's ε production then competes with the error token. | **Measured**, not assumed: four shapes were tried, all four rejected (D7). The outcome is one located diagnostic instead of a cascade, and statement-level recovery covers the common case. |
 | R20 | The emitted C is not warning-clean for *legal* programs: a constant subexpression that overflows (106 messages), a parameter the body never reads (13), and a comparison of two constants (1) all trip the documented `-Werror` build line, so a program the checker accepts can fail to build. | **Found by the generator on its first run** (25/25 seeds, none of them rejected by the front end — see PLAN.md W6.2 for the fixes and the seeds). The value C computes is right in the overflow case, so this is a contract violation rather than a miscompile; the e2e suite uses that build line as its guarantee, which is why it has to be fixed rather than documented. |
+| R22 | `LSL` and `ASR` masked their shift count with `& 31`, which is what `ROR` does but not what the report defines: §8.2.2's table gives `LSL(x,n) = x * 2^n` and `ASR(x,n) = x DIV 2^n`, so a count of 32 is *defined* (0, or 0/-1) rather than a no-op. The constant folder and the runtime helpers agreed with each other and both disagreed with the report, and four places documented the masking as intended. | **Found by the generator** (PLAN.md W6.5): a generated program's self-check trapped, and the mirror — which follows the report — was right. Fixed in the runtime header, the folder, `csmoke` (whose spec had encoded the masking, as R11's did before it), `golden`'s case list and the second-pass table, plus the four document mentions. |
 | R21 | A plain pointer dereference is not `NIL`-checked: `p := NIL; p.x := 1` emits `Mem3__p->x = 1` and dies of SIGSEGV with no message, although the emitted runtime header lists `NIL` among `rt_trap`'s reasons and the *guard* path does test `v != NULL` first. | **Found while auditing memory safety** (PLAN.md W7.1), with a three-line program as evidence. Every other violation of the same class reports a located trap, so this is a hole in the guarantee §9.4 states rather than a design choice; the fix and the decision it needs (check every dereference, or none) are itemised there. |
 
 Decisions taken during implementation, recorded because the report is silent

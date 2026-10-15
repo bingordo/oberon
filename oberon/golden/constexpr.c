@@ -89,7 +89,7 @@ static int64_t v_m7_p_slash_3(void) { return (int64_t)rt_div(0 - 7, 3); }
 /* LSL(1, 31)             ==>  rt_lsl(1, 31) */
 static int64_t v_lsl_1_31(void) { return (int64_t)rt_lsl(1, 31); }
 
-/* LSL(1, 32)             ==>  rt_lsl(1, 32)  [count mod 32] */
+/* LSL(1, 32)             ==>  rt_lsl(1, 32)  [x * 2^32 wraps to 0] */
 static int64_t v_lsl_1_32(void) { return (int64_t)rt_lsl(1, 32); }
 
 /* LSL(1, 33)             ==>  rt_lsl(1, 33) */

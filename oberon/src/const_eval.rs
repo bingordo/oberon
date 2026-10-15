@@ -5,7 +5,8 @@
 //! `CASE` labels (§9.5) and the `BY` increment of `FOR` (§9.8). The design also
 //! claims something specific and checkable here: **the folder and the generated
 //! C compute the same values**, because both implement the report's `DIV`/`MOD`
-//! (floor), the shift counts reduced mod 32, and the set operations the same
+//! (floor), the shifts defined by the report (`x * 2^n` and `x DIV 2^n`, the
+//! rotation mod 32), and the set operations the same
 //! way. `tests::agrees_with_the_emitted_c` checks that claim against a table
 //! produced by the C back end's own helpers.
 //!
@@ -106,10 +107,19 @@ pub fn modulo(x: i32, y: i32) -> EvalResult {
     Ok(Const::Int(if r != 0 && (r < 0) != (y < 0) { r + y } else { r }))
 }
 
+/// `x * 2^n` (report §8.2.2), so a count of 32 or more wraps to zero; only a
+/// negative count is undefined and stays masked, as the runtime does (R22).
 fn lsl(x: i32, n: i32) -> i32 {
+    if n >= 32 {
+        return 0;
+    }
     ((x as u32) << (n & 31)) as i32
 }
+/// `x DIV 2^n`, which is 0 or -1 once the count reaches 32.
 fn asr(x: i32, n: i32) -> i32 {
+    if n >= 32 {
+        return if x < 0 { -1 } else { 0 };
+    }
     let n = n & 31;
     if x < 0 {
         !((!(x as u32)) >> n) as i32
@@ -443,8 +453,11 @@ mod tests {
     #[test]
     fn shifts_agree_with_the_runtime_helpers() {
         assert_eq!(eval_src("LSL(1, 31)").unwrap(), Const::Int(i32::MIN));
-        assert_eq!(eval_src("LSL(1, 32)").unwrap(), Const::Int(1), "count mod 32");
-        assert_eq!(eval_src("LSL(1, 33)").unwrap(), Const::Int(2));
+        assert_eq!(eval_src("LSL(1, 32)").unwrap(), Const::Int(0), "x * 2^32 wraps");
+        assert_eq!(eval_src("LSL(1, 33)").unwrap(), Const::Int(0), "x * 2^33 wraps");
+        assert_eq!(eval_src("ASR(8, 32)").unwrap(), Const::Int(0), "8 DIV 2^32");
+        assert_eq!(eval_src("ASR(-8, 32)").unwrap(), Const::Int(-1), "floor(-8 / 2^32)");
+        assert_eq!(eval_src("ASR(8, 63)").unwrap(), Const::Int(0));
         assert_eq!(eval_src("ASR(-8, 1)").unwrap(), Const::Int(-4));
         assert_eq!(eval_src("ASR(-1, 31)").unwrap(), Const::Int(-1));
         assert_eq!(eval_src("ROR(1, 1)").unwrap(), Const::Int(i32::MIN));

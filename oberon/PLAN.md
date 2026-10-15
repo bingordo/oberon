@@ -547,7 +547,36 @@ three distinct causes:
 
 Done when: `bash fuzz/run.sh` passes for a few hundred seeds and joins the gate,
 with one regression fixture per cause in `e2e/` (or a row in `Regress.mod`) so
-the suites catch a return of any of them.
+the suites catch a return of any of them. **Progress**: the fold and the
+parameter marks landed (they were the reason `obc build` rejected generated
+programs), and the fuzzer's signal changed twice — first from "the C compiler
+rejects our output" to "the program's own checks trap", which is how W6.5 was
+found and fixed, and now to a smaller residue. What is left, with the diagnosis
+already made: (a) the fold only sees expressions it can evaluate itself, so a
+*constant whose value is a named `CONST`* is not folded and its product can still
+overflow in C — the checker knows the value, so the emitter needs a
+use-site-to-value lookup (the same shape as the guard/call split); (b) at least
+one `-Wunused-but-set-parameter` case may survive if a parameter is only written;
+(c) the remaining self-check traps need the same treatment W6.5 got, one at a
+time.
+
+**W6.5 the generator found a real bug: `LSL`/`ASR` masked their count** — **fixed**
+Why it matters: the report's own table (§8.2.2) defines `LSL(x,n)` as `x * 2^n`
+and `ASR(x,n)` as `x DIV 2^n`, so a count of 32 or more is *defined* — 0 for a
+logical shift left, 0 or -1 for an arithmetic shift right — while only the
+*rotation* is a mod-32 operation. The runtime helpers, the constant folder, the
+`csmoke` spec (which named the wrong rule) and four document mentions all said
+"count mod 32", so `LSL(1, 32)` returned 1 instead of 0.
+Evidence: a generated program's self-check trapped; the generator's mirror
+follows the report, so the mismatch was the compiler's, and `LSL(1,32)` on its own
+settles it.
+Fixed in `src/oberon_h.inc` (both helpers), `src/const_eval.rs` (both folds and
+its doc), `csmoke/smoke.c` (the copied helpers, the case that encoded the masking,
+and four new cases), `golden/lower.c` and `golden/constexpr_check.c` (the
+second-pass recomputation), `golden/constexpr.tsv` (regenerated), and the four
+document mentions; DESIGN §13 R22 is the record. All suites green afterwards.
+This is the first defect the generator found that the three hand-written suites
+could not: they all agreed with the wrong rule.
 
 **W6.3 language details the generator had to learn** — **recorded, not a compiler bug**
 The first runs were also a conformance test of the *generator*, and the
