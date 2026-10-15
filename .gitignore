@@ -16,3 +16,7 @@
 # Editor and OS noise.
 *.swp
 .DS_Store
+
+# Failing seeds kept by the fuzzer, for triage: the compiler is expected to
+# accept every program the generator produces, so anything here is a bug.
+/oberon/fuzz/findings/
