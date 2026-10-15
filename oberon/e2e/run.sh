@@ -597,8 +597,16 @@ fi
 
 # 7. Regression module: one line of output per defect the review found, each
 #    line's expectation computed from the report rather than from a run.
-"$OBC" run Regress.mod -I . --command Regress.Run >"$DRV/regress.got" 2>"$DRV/regress.log"
-check "regressions-all-hold" "$(cat regress.expected.txt)" "$(cat "$DRV/regress.got")"
+# The run reports rather than aborting: a back end that cannot lower this module
+# yet says so as a FAIL, and the rows after it still run (which is what the
+# Cranelift back end's distance is measured with).
+if "$OBC" run Regress.mod -I . --command Regress.Run >"$DRV/regress.got" 2>"$DRV/regress.log"; then
+    check "regressions-all-hold" "$(cat regress.expected.txt)" "$(cat "$DRV/regress.got")"
+else
+    echo "FAIL regressions-all-hold:"
+    sed -n '1,6p' "$DRV/regress.log"
+    fail=$((fail + 1))
+fi
 
 # 8. A recursive record type must compile (the type collector used to recurse
 #    forever), and an Oberon identifier that is a C keyword must survive.
@@ -930,11 +938,15 @@ if "$OBC" build "$DRV/UseDef.mod" -I "$DRV" --out "$DRV" -o "$DRV/usedef" >/dev/
     "$DRV/usedef" || status=$?
     check "pointer-to-a-record-in-another-module" "0" "$status"
     # The bug's signature is a name one side does not know: the header said
-    # `Def__Anon_1` while the interface said `Node`, so neither may appear.
+    # `Def__Anon_1` while the interface said `Node`, so neither may appear. The
+    # header is the C back end's to write, whatever BACKEND says, so it is asked
+    # for that way (the interface is written by either).
+    mkdir -p "$DRV/defc"
+    "$C_OBC" emit "$DRV/Def.mod" -I "$DRV" --out "$DRV/defc" >/dev/null 2>&1 || true
     check "neither-side-names-the-pointee-anonymously" "0" \
-        "$(cat "$DRV/Def.h" "$DRV/Def.sym" | grep -c 'Anon')"
+        "$(cat "$DRV/defc/Def.h" "$DRV/Def.sym" | grep -c 'Anon')"
     check "the-pointee-keeps-its-name-on-both-sides" "1" \
-        "$(grep -c 'Def__Node' "$DRV/Def.h" | grep -c '^[1-9]')"
+        "$(grep -c 'Def__Node' "$DRV/defc/Def.h" | grep -c '^[1-9]')"
 else
     echo "FAIL pointer-to-a-record-in-another-module: did not build"
     fail=$((fail + 1))
