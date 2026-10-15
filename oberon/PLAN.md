@@ -691,7 +691,7 @@ Cost and risk: the collision surface is "every identifier whose spelling matches
 Tests: the existing near-miss table extended with a lower/mixed-case spelling per keyword; a negative test that the default dialect still rejects `begin`; a test that identifiers are not folded; a test that a module declaring its own `integer` or `nil` still compiles with the aliases in place; an `e2e/Lower.mod` built and run through the driver with the flag; and the generator gains a lower-case rendering mode, so the fuzzer covers the dialect end to end.
 Done when: the flag reaches both CLIs, the default is provably unchanged (the suites are the proof), those tests pass, the collision diagnostic names the dialect, the dialect is recorded in the interface header (with the version line of W3.2), and DESIGN §3 documents it.
 
-**W8.11 Oberon-2 support: consider it as a dialect, not as dribbled extensions** — *consideration, with a recommendation*
+**W8.11 Oberon-2 support: consider it as a dialect, not as dribbled extensions** — **considered; the decision and the mechanism are recorded in DESIGN §5 and §13**
 Why: everything in this wave is a piece of Oberon-2, so the honest question is
 not "should we add `WITH`?" but "are we becoming an Oberon-2 compiler?". The
 delta is now known from Oberon-2's own report (not from summaries):

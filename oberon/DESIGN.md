@@ -195,6 +195,17 @@ mechanism, which is why §5 records the (deliberate) choice to fail fast in v1.
 with five changes. Each change exists because the report's own grammar is not
 LR(1) at that point; each is stated with the evidence that forced it.
 
+One decision here is about the grammar's *shape* rather than its content, and it
+predates any dialect: **a dialect is a gated grammar, not a second grammar.**
+LALRPOP chooses alternatives at build time, so accepting an extension with a flag
+would mean a second grammar for every flag combination — double the parser
+maintenance, and two grammars that can disagree about the report's own syntax.
+Instead the grammar accepts the union and the checker rejects what the selected
+dialect does not allow, with a diagnostic that names the reason. That is also why
+extensions whose only benefit is a different spelling of existing syntax are not
+worth taking (`WITH` in `PLAN.md` W8.11): they buy familiarity and cost a
+reserved word.
+
 ### D1 — `statement` is factored into assignment vs. call **[verified]**
 
 The report's `statement = [assignment | ProcedureCall | ...]` with
@@ -1253,7 +1264,18 @@ or self-inconsistent and a compiler has to choose once and then be consistent:
 6. **`ORD` of a `SET` is not folded.** Report §10.2 lists `SET` among `ORD`'s
    argument types, but a set has no single ordinal number, so no constant exists
    to produce; the folder reports that rather than inventing one.
-7. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
+7. **Oberon-2 is not supported, and the reason is recorded rather than
+   assumed.** Everything in `PLAN.md` W8 turned out to be a piece of Oberon-2, so
+   the question "are we becoming an Oberon-2 compiler?" was answered explicitly:
+   the additive pieces (`CASE … ELSE`, `EXIT`, early `RETURN`, `MIN`/`MAX`) are
+   taken on their own merits, while numeric *inclusion* (which would replace this
+   document's explicit no-implicit-conversion rule), type-bound procedures with
+   their dispatch tables, and heap/nested open arrays are declined until a
+   *named* program needs them. `PLAN.md` W8.11 holds the delta table, the
+   mechanism (a gated grammar, §5), the scope boundary — the language only, since
+   ETH's library and system modules are a separate port — and the trigger that
+   would change the answer.
+8. **A single-character string is usable where a `CHAR` is expected** (`ORD("0")`,
    and assignment per §9.1.2), but is not an integer operand.
 
 Open questions, to be settled with a decision record when M1 starts:
