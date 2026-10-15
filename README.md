@@ -54,6 +54,7 @@ regression suite rather than a memory of one.
 obc check Foo.mod -I DIR        # diagnostics only: located errors, warnings, an exit code
 obc emit  Foo.mod --out DIR     # Foo.c, Foo.h and the runtime header
 obc build Foo.mod -o Foo        # resolve the import graph, emit, and call cc
+obc build Foo.mod -o Foo -Ochecks=nil   # runtime checks: all (default), none, or a list
 obc run   Foo.mod --command Foo.Run
 ```
 

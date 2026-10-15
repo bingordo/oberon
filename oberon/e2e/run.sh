@@ -297,6 +297,23 @@ if "$OBC" build "$DRV/Checks.mod" --out "$DRV" -o "$DRV/checks-on" >/dev/null 2>
     check "checks-off-runs" "0" "$status"
     check "checks-off-emits-no-check" "0" \
         "$(grep -c 'rt_index\|rt_nil\|rt_guard_is' "$DRV/Checks.c")"
+    # Every check has a name, and a named set emits exactly those (W8.3).
+    printf 'MODULE Named;\n  TYPE R = RECORD x: INTEGER END; P = POINTER TO R;\n  VAR a: ARRAY 100 OF INTEGER; p: P; n: INTEGER;\nBEGIN\n  n := a[150]; p.x := 1\nEND Named.\n' > "$DRV/Named.mod"
+    "$OBC" emit "$DRV/Named.mod" -Ochecks=nil --out "$DRV" >/dev/null 2>&1
+    check "named-checks-emit-only-that-check" "1" \
+        "$(grep -c 'rt_nil' "$DRV/Named.c")"
+    check "named-checks-leave-the-others-out" "0" \
+        "$(grep -c 'rt_index' "$DRV/Named.c")"
+    "$OBC" emit "$DRV/Named.mod" -Ochecks=index --out "$DRV" >/dev/null 2>&1
+    check "named-checks-can-turn-one-back-on" "1" \
+        "$(grep -c 'rt_index' "$DRV/Named.c")"
+    # And an unknown name is a diagnostic rather than a silent default.
+    if "$OBC" emit "$DRV/Named.mod" -Ochecks=banana --out "$DRV" 2>"$DRV/banana.log"; then
+        echo "FAIL unknown-check-name-is-refused: the flag was accepted"
+        fail=$((fail + 1))
+    else
+        check "unknown-check-name-is-refused" "1" "$(grep -c 'names no check' "$DRV/banana.log")"
+    fi
 else
     echo "FAIL checks-flag: the module did not build either way"
     fail=$((fail + 1))

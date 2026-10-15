@@ -123,11 +123,52 @@ pub struct Emitter<'a> {
     /// a violation becomes the program's problem instead of a located trap. The
     /// divisor checks stay: they keep C's arithmetic *defined* rather than merely
     /// unchecked (R4's stance), and `ASSERT` is a statement, not a check.
-    checks: bool,
+    checks: Checks,
 }
 
 pub fn emit_module(module: &Module, types: &Types, sema: &Sema<'_>) -> (String, String) {
-    emit_module_checked(module, types, sema, true)
+    emit_module_checked(module, types, sema, Checks::ALL)
+}
+
+/// Which runtime checks the emitter writes (PLAN.md W3.1, refined by W8.3). All of
+/// them by default; `-Ochecks=n` is the empty set, and `-Ochecks=index,guard` the
+/// subset that leaves the `NIL` check and the type-`CASE` fallback out. The divisor
+/// checks are not in the set: they keep C's arithmetic *defined* rather than merely
+/// unchecked (R4's stance), and `ASSERT` is a statement rather than a check.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Checks {
+    pub index: bool,
+    pub nil: bool,
+    pub guard: bool,
+    pub case_: bool,
+}
+
+impl Checks {
+    pub const ALL: Checks = Checks { index: true, nil: true, guard: true, case_: true };
+    pub const NONE: Checks = Checks { index: false, nil: false, guard: false, case_: false };
+
+    /// The set named by `-Ochecks=<list>`. `all` and `none` are the whole and the
+    /// empty set; any other name that is not a check is `None`, so the driver can
+    /// say which one it did not know.
+    pub fn parse(list: &str) -> Option<Checks> {
+        let mut c = Checks::NONE;
+        for name in list.split(',') {
+            match name.trim() {
+                "" => {}
+                "all" | "y" => return Some(Checks::ALL),
+                "none" | "n" => return Some(Checks::NONE),
+                "index" => c.index = true,
+                "nil" => c.nil = true,
+                "guard" => c.guard = true,
+                "case" => c.case_ = true,
+                _ => return None,
+            }
+        }
+        Some(c)
+    }
+
+    /// The names `parse` accepts, for the driver's message.
+    pub const NAMES: &'static str = "index, nil, guard, case, all, none";
 }
 
 /// The same, with the runtime checks under the caller's control (`-Ochecks=n`).
@@ -135,7 +176,7 @@ pub fn emit_module_checked(
     module: &Module,
     types: &Types,
     sema: &Sema<'_>,
-    checks: bool,
+    checks: Checks,
 ) -> (String, String) {
     let mut e = Emitter::new(module.name.clone(), types, sema);
     e.checks = checks;
@@ -145,7 +186,7 @@ pub fn emit_module_checked(
 impl<'a> Emitter<'a> {
     fn new(module: String, types: &'a Types, sema: &'a Sema<'a>) -> Emitter<'a> {
         Emitter {
-            checks: true,
+            checks: Checks::ALL,
             types,
             sema,
             module,
@@ -1137,7 +1178,7 @@ impl<'a> Emitter<'a> {
                 self.pop_scope();
                 let _ = writeln!(out, "    break; }}");
             }
-            if !default_taken && self.checks {
+            if !default_taken && self.checks.case_ {
                 let _ = writeln!(
                     out,
                     "    default: rt_trap_pos(\"CASE: no matching type\", {}); break;",
@@ -1825,7 +1866,7 @@ impl<'a> Emitter<'a> {
                         ty
                     };
                     let path = self.field_path(rec, f).unwrap_or_default();
-                    if is_pointer && !volatile && self.checks {
+                    if is_pointer && !volatile && self.checks.nil {
                         // The check is part of the access, so a NIL target traps
                         // with this designator's offset (R21).
                         text = format!("rt_nil({text}, {})", d.span.lo);
@@ -1850,7 +1891,7 @@ impl<'a> Emitter<'a> {
                             // an open array used to be emitted with no check at all
                             // — the trap matrix found it (PLAN.md W7.4).
                             match open_len.take() {
-                                Some(len) if self.checks => {
+                                Some(len) if self.checks.index => {
                                     let _ = write!(text, "[rt_index({i}, {len}, {})]", d.span.lo);
                                 }
                                 _ => {
@@ -1859,7 +1900,7 @@ impl<'a> Emitter<'a> {
                             }
                         } else {
                             match self.types.array_len(ty) {
-                                Some(n) if self.checks => {
+                                Some(n) if self.checks.index => {
                                     let _ = write!(text, ".e[rt_index({i}, {n}, {})]", d.span.lo);
                                 }
                                 _ => {
@@ -1877,7 +1918,7 @@ impl<'a> Emitter<'a> {
                 }
                 Selector::Deref => {
                     // Same rule for `p^`: the check is inside the dereference.
-                    if is_pointer && !volatile && self.checks {
+                    if is_pointer && !volatile && self.checks.nil {
                         text = format!("rt_nil({text}, {})", d.span.lo);
                     }
                     text = format!("(*({text}))");
@@ -1912,7 +1953,7 @@ impl<'a> Emitter<'a> {
                             // every lvalue caller flushes. The cast stays unless
                             // the guard is the whole designator, because a field's
                             // offset belongs to the narrowed record (DESIGN R29).
-                            if self.checks {
+                            if self.checks.guard {
                                 let _ = writeln!(self.prelude, "    {test};");
                             }
                             if last {
@@ -1920,7 +1961,7 @@ impl<'a> Emitter<'a> {
                             } else {
                                 view
                             }
-                        } else if self.checks {
+                        } else if self.checks.guard {
                             format!("(({test}, {view}))")
                         } else {
                             view
@@ -1946,7 +1987,7 @@ impl<'a> Emitter<'a> {
                             d.span.lo
                         );
                         text = if lvalue {
-                            if self.checks {
+                            if self.checks.guard {
                                 let _ = writeln!(self.prelude, "    {test};");
                             }
                             if last {
@@ -1954,7 +1995,7 @@ impl<'a> Emitter<'a> {
                             } else {
                                 view
                             }
-                        } else if self.checks {
+                        } else if self.checks.guard {
                             format!("(({test}, {view}))")
                         } else {
                             view

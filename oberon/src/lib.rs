@@ -75,7 +75,7 @@ pub fn emit_c<'input>(
     input: &'input str,
     interfaces: &[sym::Interface],
 ) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
-    emit_c_with_checks(input, interfaces, true)
+    emit_c_with_checks(input, interfaces, cgen::Checks::ALL)
 }
 
 /// The same, with the runtime checks under the caller's control: `-Ochecks=n`
@@ -84,7 +84,7 @@ pub fn emit_c<'input>(
 pub fn emit_c_with_checks<'input>(
     input: &'input str,
     interfaces: &[sym::Interface],
-    checks: bool,
+    checks: cgen::Checks,
 ) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
     let mut m = parse_module(input)?;
     let sema = sema::Sema::check_owned(&mut m, interfaces);

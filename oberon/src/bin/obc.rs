@@ -57,8 +57,9 @@ struct Opts {
     /// How many errors to print before saying the rest were suppressed; `0` is
     /// no limit (PLAN.md W5.2).
     ferror_limit: usize,
-    /// Runtime checks: on unless `-Ochecks=n` (DESIGN §9.4, PLAN.md W3.1).
-    checks: bool,
+    /// Which runtime checks to write: all of them unless `-Ochecks=…` narrows the
+    /// set (DESIGN §9.4, PLAN.md W3.1 and W8.3).
+    checks: cgen::Checks,
 }
 
 /// One module in the link: source this build emitted, or C found on disk.
@@ -82,7 +83,8 @@ fn usage() -> ExitCode {
          \x20 --command M.P     run this command after the modules load (run)\n\
          \x20 --keep            keep the temporary build directory\n\
          \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)
-         \x20 -Ochecks | -Ochecks=n   runtime checks on (default) or compiled out)"
+         \x20 -Ochecks[=LIST]   runtime checks: all (default), none, or a list of
+         \x20                   index, nil, guard and case)"
     );
     ExitCode::FAILURE
 }
@@ -140,7 +142,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         command: None,
         keep: false,
         ferror_limit: 20,
-        checks: true,
+        checks: cgen::Checks::ALL,
     };
     let mut i = 2;
     while i < args.len() {
@@ -165,8 +167,20 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
-            "-Ochecks" => o.checks = true,
-            "-Ochecks=n" => o.checks = false,
+            "-Ochecks" => o.checks = cgen::Checks::ALL,
+            other if other.starts_with("-Ochecks=") => {
+                let list = &other["-Ochecks=".len()..];
+                match cgen::Checks::parse(list) {
+                    Some(c) => o.checks = c,
+                    None => {
+                        eprintln!(
+                            "obc: `-Ochecks={list}` names no check; expected one of {}",
+                            cgen::Checks::NAMES
+                        );
+                        return None;
+                    }
+                }
+            }
             "--ferror-limit" => {
                 o.ferror_limit = take(&mut i)?
                     .parse()

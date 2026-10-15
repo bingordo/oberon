@@ -1040,8 +1040,11 @@ The one row without a test is `rt_new`'s failure path, and the one access withou
 a check is the exception named in the pointer row. Both are itemised (W7.4, R26)
 rather than implied.
 
-Runtime checks are on by default (`-Ochecks`) and compiled out with `-Ochecks=n`
-(W3.1). What the flag removes: the index bounds check, the `NIL` check on a
+Runtime checks are on by default (`-Ochecks`) and narrowed with `-Ochecks=<list>`
+(W3.1, refined by W8.3): `none` or `n` removes every one, `all` is the default, and
+the names are `index`, `nil`, `guard` and `case`, so a build can keep the checks a
+given test is about and drop the rest — which is what the memory-safety rows want to
+vary. An unknown name is a diagnostic, not a silent default. What the flag removes: the index bounds check, the `NIL` check on a
 pointer access, a type guard's tag test, and the type-`CASE` fallback that traps
 when no label matches — after which a violation is the program's problem, which is
 the point of the switch. What it keeps, deliberately: the divisor checks, because
