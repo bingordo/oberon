@@ -1664,7 +1664,9 @@ turns `detect_stack_use_after_return` off and unpoisons the region it reads). Th
 standard suites are unchanged with the collector idle: no stress, no limit, and the
 only path that collects is a `malloc` failure.
 
-**W10.3 collector pauses** — **open, a feature in its own right**
+**W10.3 collector pauses** — **done: measured, and the bound declined with its reason**
+(`OB_GC_STATS=1` and `fuzz/gc-bench.mod` are the instrument and the benchmark; numbers
+and the path they point at are at the end of this item)
 
 The collector §15 decides on is stop-the-world, so a pause is proportional to the
 live set *plus* the whole heap: marking walks the reachable graph and conservatively
@@ -1712,6 +1714,39 @@ the sweep loop already distinguishes what it keeps from what it frees, and the c
 is `timespec_get(&ts, TIME_UTC)` — C11, so no feature-test macro and no new dependency.
 It writes to *stderr*, so a program's own output is untouched, and a final line at exit
 gives the totals. A benchmark then reports a distribution instead of an impression.
+
+**The instrument, and what it measured.** `OB_GC_STATS=1` reports per collection and
+totals at exit (bytes before and after, blocks kept and freed, time inside
+`ob_collect`), on stderr, off by default. The benchmark is `fuzz/gc-bench.mod`: 5 000
+live nodes kept while 200 000 objects are allocated and dropped, so the collector has
+something to reclaim and something to keep. Built with the documented line and run as
+`OB_GC_STATS=1 OB_GC_LIMIT=<bytes> ./gc-bench`:
+
+| heap ceiling | collections | worst pause | median pause | total inside the collector |
+|---|---|---|---|---|
+| 2 MB | 6 | **1.03 s** | 0.75 s | 4.26 s of a ~8 s run |
+| 512 KB | 36 | **0.28 s** | 0.11 s | 4.14 s of a ~8 s run |
+
+Those are one run's numbers, and repeat runs on this machine vary by about 20% (the
+same benchmark, same ceiling, worst pause 0.33 s at 36 collections), so they are read
+as a shape rather than a limit: the worst pause tracks the heap the collector is given,
+roughly linearly, and a run's total collector time does not move with it.
+
+**The bound is declined, with the reason.** No interactive bound survives those
+numbers: 0.28 s is four hundred times a 60 Hz frame. Two things are worth separating
+in why. The first is the benchmark's *shape* — 200 000 objects become garbage before
+the first collection, so the first sweep walks the whole heap, and that is the 1.03 s
+at the larger ceiling, not a steady state. The second is the one that matters: total
+time inside the collector is ~4.2 s either way, and it only *moves* between few long
+pauses and many short ones as the ceiling shrinks — which is the measurement saying
+that the work is what it is and this design does it with the mutator stopped.
+
+So the path is the one §15 and this item list, in order: **trigger on a threshold**
+rather than only on a failing allocation, which removes the grow-to-the-limit burst
+and spreads the same work; then **incremental marking**, which is reachable at all only
+because this collector does not move objects; then concurrent marking, and generational
+only if allocation rates ask for it. The numbers above are the baseline those have to
+beat, and the knob that exists today — the ceiling — is recorded with them.
 
 **One early observation, recorded with its caveat.** A churn benchmark of my own —
 5000 live nodes kept while 200 000 objects are allocated and dropped — ran

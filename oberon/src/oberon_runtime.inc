@@ -5,6 +5,7 @@
  * Link this once with the generated translation units.
  */
 #include <setjmp.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,22 @@ struct ObBlock {
 
 static ObBlock *ob_blocks = NULL;    /* every block, newest first */
 static size_t ob_heap_bytes = 0;     /* what the heap holds, headers included */
+
+/* `OB_GC_STATS=1` reports a pause distribution instead of an impression (PLAN.md
+ * W10.3): per collection, the heap before and after, how many blocks were kept
+ * and freed, and the time spent inside `ob_collect` — which is the pause, since
+ * the mutator is stopped for all of it. Written to stderr, so a program's own
+ * output is untouched, and never on by default. */
+static int ob_stats = 0;
+static size_t ob_gc_count = 0;
+static size_t ob_gc_kept = 0;
+static size_t ob_gc_freed = 0;
+static int64_t ob_gc_ns = 0;
+static int64_t ob_gc_worst_ns = 0;
+
+static int64_t ob_ns_between(const struct timespec *a, const struct timespec *b) {
+    return (int64_t)(b->tv_sec - a->tv_sec) * 1000000000 + (int64_t)(b->tv_nsec - a->tv_nsec);
+}
 static uintptr_t ob_heap_lo = UINTPTR_MAX; /* the range a candidate must fall */
 static uintptr_t ob_heap_hi = 0;           /* in to be a pointer at all */
 
@@ -60,6 +77,7 @@ static void ob_gc_env(void) {
     ob_stress = stress != NULL && atoi(stress) != 0;
     limit = getenv("OB_GC_LIMIT");
     if (limit != NULL) ob_limit = (size_t)strtoul(limit, NULL, 10);
+    ob_stats = getenv("OB_GC_STATS") != NULL;
 }
 
 /* One module's roots, as `__init` hands them over (DESIGN 15.4). The list grows:
@@ -239,7 +257,13 @@ static void ob_mark_stack(void) {
  * still valid (DESIGN 15.1, 15.6). */
 static void ob_collect(void) {
     ObBlock **link;
+    struct timespec t0;
+    struct timespec t1;
+    size_t before = ob_heap_bytes;
+    size_t kept = 0;
+    size_t freed = 0;
     if (ob_blocks == NULL) return; /* an empty heap has nothing to reclaim */
+    if (ob_stats) timespec_get(&t0, TIME_UTC);
     ob_mark_len = 0;
     {
         int32_t i;
@@ -257,12 +281,29 @@ static void ob_collect(void) {
         ObBlock *b = *link;
         if (b->mark) {
             b->mark = 0; /* the flag is this collection's, not the block's */
+            kept += 1;
             link = &b->next;
         } else {
             *link = b->next;
             ob_heap_bytes -= sizeof(ObBlock) + b->size;
+            freed += 1;
             free(b);
         }
+    }
+    if (ob_stats) {
+        int64_t pause = 0;
+        timespec_get(&t1, TIME_UTC);
+        pause = ob_ns_between(&t0, &t1);
+        ob_gc_count += 1;
+        ob_gc_kept += kept;
+        ob_gc_freed += freed;
+        ob_gc_ns += pause;
+        if (pause > ob_gc_worst_ns) ob_gc_worst_ns = pause;
+        fprintf(
+            stderr,
+            "gc %zu: before=%zu after=%zu kept=%zu freed=%zu pause_us=%lld\n",
+            ob_gc_count, before, ob_heap_bytes, kept, freed, (long long)(pause / 1000)
+        );
     }
 }
 
@@ -273,6 +314,15 @@ static void ob_collect(void) {
  * program that never allocates never pays for it. */
 static void ob_gc_at_exit(void) {
     ob_collect();
+    if (ob_stats) {
+        fprintf(
+            stderr,
+            "gc totals: %zu collections, %zu kept, %zu freed, %lld us inside them, "
+            "worst %lld us\n",
+            ob_gc_count, ob_gc_kept, ob_gc_freed, (long long)(ob_gc_ns / 1000),
+            (long long)(ob_gc_worst_ns / 1000)
+        );
+    }
 }
 
 /* `NEW`: one allocation point for the whole language, so a failing allocation
