@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use oberon_front::{
-    cgen, check_module_recovering, emit_c, emit_interface, parse_module, parse_module_recovering,
-    parse_with_diagnostics, render_diagnostics, sym, Diagnostic,
+    cgen, check_module_recovering, emit_c, emit_interface, parse_module, parse_with_diagnostics,
+    render_diagnostics, sym, Diagnostic,
 };
 
 /// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
@@ -328,8 +328,8 @@ fn emit_tree(
     // parser recovers at statement level, so one run reports syntax errors *and*
     // type errors rather than stopping at the first of either.
     let (parsed, diags) = check_module_recovering(src, interfaces);
+    print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
     if diags.iter().any(Diagnostic::is_error) {
-        print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
         return Err(format!("`{name}` does not check"));
     }
     let _ = parsed;

@@ -16,7 +16,7 @@ meant to be kept:
 | `.` (this crate) | Working front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 47 tests pass, clippy clean |
 | `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 67 cases pass, 1 bug in the test spec itself (R11) |
 | `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
-| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 24 checks pass; it found the emitter and checker bugs listed in §14 |
+| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 26 checks pass; it found the emitter and checker bugs listed in §14 |
 
 Everything marked **[design]** below is not yet implemented; everything marked
 **[verified]** was executed in this repository (commands in §14).
@@ -1150,7 +1150,7 @@ Mix.mod:4:8: error: unexpected `;`
 | whole-program shape | statement lowering of the report's procedures, module init, command table, exported interface, read-only exports | `golden` **[exists: 66 cases, plain + ASan/UBSan]** |
 | regressions found by review | one output line per defect found in the code review: integer `/`, CHAR ordinal order, folded constants, `CASE` ranges and multi-labels, record-copy descriptors, a local record as a `VAR` record parameter, open-array forwarding, a call through a record field, `PACK`/`UNPK`, `NEW` on a recursive type | `e2e/Regress.mod` + `regress.expected.txt` **[exists: 11 lines]** |
 | compile-only regressions | a recursive record type; Oberon identifiers that are C keywords; a *failing* guard Dtraps with its offset | `e2e/run.sh` checks 8 and 9 **[exists]** |
-| the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash e2e/run.sh` **[exists: 24 checks]** |
+| the compiler itself | emit C for five modules (the report's `Out`, a hello-world, a language torture program, and a deliberately trapping one), compile that C with `-Werror`, run it, compare with an independent expectation, check that a trap names the source offset, and do it once more through the driver (`obc build`/`run`/`check`) | `bash e2e/run.sh` **[exists: 26 checks]** |
 | interface format | round trip, fixed point, parameterless procedures, rejection of an illegal parameter type | unit tests in `src/sym.rs` **[exists: 3 tests]** |
 | whole language | the report's example modules (`Out`'s `Write`/`WriteInt`/`WriteLn`, `log2`, `ReadInt`) compiled and executed against a `Texts`/`Oberon` stub | `e2e` + `golden` **[exists]** |
 
@@ -1173,7 +1173,8 @@ runtime helpers in executable form.
 | M6 | diagnostics pass, `-Ochecks`, golden tests | compiler is usable on a few thousand lines of Oberon-07 |
 | M7 | driver: import-graph resolution, loader generation, C invocation, run | `obc run Hello.mod` produces a runnable program; `obc run Torture.mod --command Torture.Run` matches the expected output — **done**, `src/bin/obc.rs` |
 
-M0 is complete; everything else is design.
+The open work is itemised in `PLAN.md`, in the order it is worth doing, with the
+section or risk each item comes from.
 
 ---
 

@@ -127,6 +127,15 @@ check "driver-reports-syntax-and-semantic-errors-together" "3" \
 check "driver-recovers-past-the-syntax-error" "1" \
     "$(grep -c 'Mix.mod:5:3: error: `y` is not declared' "$DRV/mix.out")"
 
+# A module that only *warns* still reports it, and still exits 0: warnings are
+# not errors, but they must not be invisible either.
+printf 'MODULE Warn;\n  IMPORT Texts;\nBEGIN\nEND Warn.\n' > "$DRV/Warn.mod"
+warn_status=0
+"$OBC" check "$DRV/Warn.mod" -I . --out "$DRV" >"$DRV/warn.out" 2>&1 || warn_status=$?
+check "clean-module-shows-its-warning" "1" \
+    "$(grep -c 'warning: import `Texts` is never used' "$DRV/warn.out")"
+check "a-warning-does-not-fail-the-build" "0" "$warn_status"
+
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true
