@@ -556,16 +556,37 @@ marks and the named-`CONST` lookup landed, and each landing changed the signal:
 | after the fold and the parameter marks | 0 | 24 | 1 |
 | after W6.5 (the shift semantics) | 0 | 23 | 2 |
 | after the named-`CONST` fold and the self-comparison fold | 1 (a self-comparison, now folded) | 22 | 2 |
+| after the mirror's `FOR` semantics was corrected | 1 | 3 | **21** |
 
-What is left is one *class*: the program's own self-check traps, i.e. the
-compiled value differs from the mirror's. Each is now named by the runner
-(`IF m1 # 2 THEN … (* check m1 expected 2 *)`) because the trap-offset parser had
-been looking for a bracket the runtime's message does not print. Triaging them is
-the next thing, and it wants a tool rather than hand-simulation of a 140-line
-program: a `--explain SEED` mode that prints, per check, the mirror's value and
-the statement that last wrote that variable would turn each one into a two-minute
-read. `(b)` in the earlier list is *not* a cause: `(void)p;` marks a parameter
-used even when the body only assigns it (verified in C, gcc accepts both orders).
+The jump is the interesting part, and it was a *generator* bug that the report
+settles: §9.8 defines `FOR v := beg TO end … DO S END` as equivalent to
+`v := beg; WHILE v <= end DO S; v := v + inc END`, so the control variable ends at
+`end + inc` — which is exactly what the emitted C's `for` header leaves. The
+mirror stopped at the last body value, so every program that read a control
+variable after its loop disagreed with a compiler that was right. `--explain`
+(`obgen --explain VAR --base SEED`, the trace of one variable after each
+top-level body statement) is what found it: it showed the mirror's value becoming
+the expected one inside a `CASE` whose taken arm ran a `FOR`, and the control
+variable was in the expression that followed.
+
+The residue is now four seeds, each located:
+* one is still a C rejection: a self-comparison whose operands contain *calls*
+  (`f() = f()`), which `is_plain` deliberately does not fold because a call may
+  differ per call and may have side effects, and which gcc warns about anyway
+  (`-Wtautological-compare`). Fix: evaluate the operands into temporaries in
+  source order and compare those — which C cannot warn about, and which is
+  *better* than a bare comparison since Oberon is left to right and C's argument
+  order is unspecified. That is the same temporary mechanism §9.5 already uses for
+  structured value arguments (R16).
+* three are self-check traps whose divergence is inside the recursive function
+  `R` (`m0 := m0 + R(3)` is the statement that moves the variable the check
+  traps on). The next step is to trace *inside* the call — extend `--explain` to
+  follow a call into its body, or print the compiled value by rewriting the check
+  into an `Out.WriteInt` — because the mirror and the emitted C should agree there
+  and one of them is wrong.
+
+`(b)` in the earlier list is *not* a cause: `(void)p;` marks a parameter used even
+when the body only assigns it (verified in C, gcc accepts both orders).
 
 **W6.5 the generator found a real bug: `LSL`/`ASR` masked their count** — **fixed**
 Why it matters: the report's own table (§8.2.2) defines `LSL(x,n)` as `x * 2^n`

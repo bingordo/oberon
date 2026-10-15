@@ -331,6 +331,12 @@ impl Stmt {
                     }
                     i += 1;
                 }
+                // Report §9.8 defines the loop as `v := beg; WHILE v <= end DO S;
+                // v := v + inc END`, so the control variable ends at `end + inc` —
+                // which is exactly what the emitted C's `for` header leaves. The
+                // mirror used to stop at the last body value and disagree with
+                // every program that read the variable afterwards.
+                m[*v] = i;
             }
             Stmt::Case(e, arms) => {
                 let v = e.eval(g, m, l, depth);
