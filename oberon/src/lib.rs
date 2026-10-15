@@ -937,6 +937,22 @@ mod emit_tests {
     }
 
     #[test]
+    fn a_pointer_access_is_checked_for_nil() {
+        // R21: `p.f` and `p^` used to be emitted as a plain dereference, so a NIL
+        // pointer faulted instead of trapping with a location. The check is part
+        // of the access, which is why an assignment to a field of a pointer
+        // target still compiles.
+        let src = "MODULE M;\n  TYPE R = RECORD x: INTEGER END;\n  VAR p: POINTER TO R;\nBEGIN\n  p.x := 1;\n  p^ := p^\nEND M.\n";
+        let c = c_of(src);
+        assert!(c.contains("rt_nil("), "{c}");
+        assert!(c.contains("rt_nil(") && c.contains(")->x"), "{c}");
+        // a plain pointer assignment and a NIL test are not dereferences
+        let src = "MODULE M;\n  TYPE R = RECORD x: INTEGER END;\n  VAR p, q: POINTER TO R;\nBEGIN\n  p := q;\n  IF p # NIL THEN END\nEND M.\n";
+        let c = c_of(src);
+        assert!(!c.contains("rt_nil("), "{c}");
+    }
+
+    #[test]
     fn a_shadowed_builtin_call_is_not_folded_away() {
         // `ABS` is a predefined name, but a nested procedure or a parameter may
         // legally shadow it. Folding by *spelling* would remove the call and its

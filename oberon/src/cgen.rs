@@ -1505,6 +1505,11 @@ impl<'a> Emitter<'a> {
                         ty
                     };
                     let path = self.field_path(rec, f).unwrap_or_default();
+                    if is_pointer {
+                        // The check is part of the access, so a NIL target traps
+                        // with this designator's offset (R21).
+                        text = format!("rt_nil({text}, {})", d.span.lo);
+                    }
                     let sep = if is_pointer { "->" } else { "." };
                     let _ = write!(text, "{sep}{path}{}", mangle(f));
                     ty = self.types.field(rec, f).unwrap_or(TypeId(0));
@@ -1537,6 +1542,10 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 Selector::Deref => {
+                    // Same rule for `p^`: the check is inside the dereference.
+                    if is_pointer {
+                        text = format!("rt_nil({text}, {})", d.span.lo);
+                    }
                     text = format!("(*({text}))");
                     ty = self.types.deref(ty).unwrap_or(TypeId(0));
                     is_pointer = self.types.is_pointer(ty);

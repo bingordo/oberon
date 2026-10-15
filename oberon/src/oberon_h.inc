@@ -244,6 +244,18 @@ static inline void rt_unpk(float *x, int32_t *n) {
 
 /* A guard's test, usable as an expression so that it keeps its place in a
  * short-circuit operand: `(rt_guard_is(cond, msg), value)`. */
+/* A pointer access is checked for NIL. The report makes using NIL an error
+ * (§6.4) and the design traps rather than faulting (R21), with the source offset
+ * of the designator so a failure is locatable without a debugger.
+ *
+ * A macro rather than a helper function, and not because of speed: the result has
+ * to keep the operand's *pointer type* (a `void *` could not be selected from),
+ * and `rt_nil(p, at)->f` must remain an lvalue so an assignment to a field of a
+ * pointer target still compiles. The operand is a variable or a field, never a
+ * call, so evaluating it twice is free. */
+#define rt_nil(p, at) \
+    (((p) == NULL) ? ((rt_trap_pos("NIL pointer dereference", (at))), (p)) : (p))
+
 static inline void rt_guard_is(int32_t cond, const char *msg) {
     if (!cond) rt_trap(msg);
 }

@@ -153,6 +153,27 @@ check "and-says-how-many-it-suppressed" "1" \
 check "zero-means-no-limit" "60" \
     "$(grep -c 'error:' "$DRV/flood0.out")"
 
+# A NIL pointer dereference traps with the designator's offset, in both
+# spellings (report §6.4 makes using NIL an error; the design traps rather than
+# faulting: R21, computed as a fault before this check existed).
+for form in field caret; do
+    if [ "$form" = field ]; then
+        stmt='p.x := 1'
+        body='TYPE R = RECORD x: INTEGER END; VAR p: POINTER TO R'
+    else
+        stmt='p^ := p^'
+        body='TYPE R = RECORD x: INTEGER END; VAR p: POINTER TO R'
+    fi
+    {
+        printf 'MODULE Nil%s;\n  %s;\nBEGIN\n  p := NIL;\n  %s\nEND Nil%s.\n' \
+            "$form" "$body" "$stmt" "$form"
+    } > "$DRV/Nil$form.mod"
+    "$OBC" build "$DRV/Nil$form.mod" --out "$DRV" -o "$DRV/nil$form" >/dev/null 2>&1 || true
+    sh -c '"$0" >/dev/null 2>"$1"' "$DRV/nil$form" "$DRV/nil$form.err" || true
+    check "nil-$form-dereference-traps" "1" \
+        "$(grep -c 'NIL pointer dereference (at byte' "$DRV/nil$form.err")"
+done
+
 # Two syntax errors in one body are both reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true

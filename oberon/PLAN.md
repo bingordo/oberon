@@ -695,7 +695,7 @@ found two holes (W7.1, W7.2) and confirmed two static checks are in place.
 | a failed *type guard* | traps with the offset, and the pointer spelling tests `v != NULL` first (§9.5) |
 | a **plain dereference of `NIL`** (`p.x := 1`, `p^ := p^`) | **nothing**: no check is emitted, so the process dies of SIGSEGV with no message — see W7.1 |
 
-**W7.1 a plain pointer dereference is not `NIL`-checked — open, a defect**
+**W7.1 a plain pointer dereference is not `NIL`-checked — done**
 Why: `rt_trap`'s own comment in the emitted header lists its reasons as
 "bounds, NIL, case, ASSERT", and §9.5 checks `NIL` on the *guard* path, but the
 emitter's dereference lowering (`Mem3__p->x = 1`) has no check at all. Evidence:
@@ -713,7 +713,16 @@ not provably non-`NIL` — we have no such analysis, and pretending otherwise is
 how the hole got here. Recorded in DESIGN §13 either way.
 Done when: field and `^` dereferences of a `NIL` pointer both trap with the
 designator's offset, both spellings are in the e2e trap matrix, and the emitted
-C for the guarded case still compiles under the documented build line.
+C for the guarded case still compiles under the documented build line. **Done**,
+and the implementation shape matters: `rt_nil` is a *macro*, not a helper function,
+because the result has to keep the operand's pointer type (a `void *` cannot be
+selected from) and because `rt_nil(p, at)->f` must remain an lvalue so an
+assignment to a field of a pointer target still compiles — which is the case the
+hole bit. Both spellings trap with the offset (`e2e` checks
+`nil-field-dereference-traps` and `nil-caret-dereference-traps`), an emission test
+asserts the check is present for a dereference and absent for a pointer assignment
+or a `NIL` test, and the decision the item asked for is taken: every dereference is
+checked.
 
 **W7.2 a constant out-of-range index is not diagnosed — open, a decision**
 Why: `a[10]` on `ARRAY 4 OF INTEGER` compiles, and `e2e/Trap.mod` *relies* on
