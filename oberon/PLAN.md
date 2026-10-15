@@ -221,11 +221,14 @@ compiler that has ASan/UBSan (the golden suite runs plain *and* sanitised; `CC`
 overrides the default gcc) and a Rust toolchain no older than the one
 `Cargo.lock` pins.
 
-**W3.4 README at the repository root**
+**W3.4 README at the repository root** — **done**
 Why: the only entry point is DESIGN.md inside the crate; a reader arriving at
 the repository sees no statement of what it is.
 Done when: a short README gives the build line, the gate commands, and the two
-documents (`oberon/DESIGN.md`, `oberon/PLAN.md`).
+documents (`oberon/DESIGN.md`, `oberon/PLAN.md`). **Done**: the repository root
+has `README.md` with the layout table, the build and gate commands, the driver's
+four verbs, the emitted C's build line and why `-fwrapv` is in it, and a pointer
+to W6.2 for the fuzzer's state.
 
 ---
 
