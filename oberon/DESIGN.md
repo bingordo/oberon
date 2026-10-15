@@ -2433,6 +2433,60 @@ descriptor that belongs to *another* module's object — an imported record type
 `TD_` is currently emitted here rather than imported, which a mixed build must not
 do. Both are named, with their byte, rather than half-lowered.
 
+### Imported descriptors, procedure values, and what is left **[in part; `PLAN.md` W9.2d]**
+
+* **A type that came from an interface is not this module's to define.** Its `TD_`
+  is an *import*: the defining module's object carries the descriptor and, with it,
+  the field map, so one type has one descriptor and `IS`, a guard and a type-`CASE`
+  agree across the boundary. `cgen` has the same rule (a qualified name resolves to
+  the defining module's C name). Two things the walk had to learn: a *pointer*'s
+  base is part of the layout a module needs (a `NEW` on an imported `POINTER TO T`
+  asks for `T`'s layout, and its members with it), and a pointer whose base holds a
+  pointer back to it (`P = POINTER TO Node; Node = RECORD next: P END`) must have
+  its own layout recorded *before* the walk goes on, or the walk recurses forever —
+  which the `Gc.mod` rows caught at once.
+* **Procedure values** are code addresses: assigning a module-level procedure to a
+  procedure variable is `func_addr` (report §6.5 forbids assigning a nested one, so
+  the value has the plain ABI and no static link — the C back end's shape too), and
+  a call through one is `call_indirect` with the signature the checker recorded at
+  the call site. `Torture.mod`'s `fn := twice; fn(21)` is the case, and the row
+  that reads it (`Out.WriteInt(fn(21), W)`) still waits on the module's *nested*
+  procedure.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **67 pass, 2 fail** (from 66
+and 3 at the start of this slice; the C path is 126/0). Both remaining rows are
+`Torture.mod`, which declares a **nested procedure** (`PROCEDURE inner`) and, in
+the output row, reaches `SYSTEM` through the module's own use. Nested procedures
+with static links and `SYSTEM` are what is left of W9.2d; the tree refuses both by
+name, with the byte, so nothing is half-lowered while they are missing.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:### Imported descriptors, procedure values, and what is left **[in part; `PLAN.md` W9.2d]**
+
+* **A type that came from an interface is not this module's to define.** Its `TD_`
+  is an *import*: the defining module's object carries the descriptor and, with it,
+  the field map, so one type has one descriptor and `IS`, a guard and a type-`CASE`
+  agree across the boundary. `cgen` has the same rule (a qualified name resolves to
+  the defining module's C name). Two things the walk had to learn: a *pointer*'s
+  base is part of the layout a module needs (a `NEW` on an imported `POINTER TO T`
+  asks for `T`'s layout, and its members with it), and a pointer whose base holds a
+  pointer back to it (`P = POINTER TO Node; Node = RECORD next: P END`) must have
+  its own layout recorded *before* the walk goes on, or the walk recurses forever —
+  which the `Gc.mod` rows caught at once.
+* **Procedure values** are code addresses: assigning a module-level procedure to a
+  procedure variable is `func_addr` (report §6.5 forbids assigning a nested one, so
+  the value has the plain ABI and no static link — the C back end's shape too), and
+  a call through one is `call_indirect` with the signature the checker recorded at
+  the call site. `Torture.mod`'s `fn := twice; fn(21)` is the case, and the row
+  that reads it (`Out.WriteInt(fn(21), W)`) still waits on the module's *nested*
+  procedure.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **67 pass, 2 fail** (from 66
+and 3 at the start of this slice; the C path is 126/0). Both remaining rows are
+`Torture.mod`, which declares a **nested procedure** (`PROCEDURE inner`) and, in
+the output row, reaches `SYSTEM` through the module's own use. Nested procedures
+with static links and `SYSTEM` are what is left of W9.2d; the tree refuses both by
+name, with the byte, so nothing is half-lowered while they are missing.
+
 **Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the
 `-Odialect=lower` dialect, then 30 coverage seeds and 10 adversarial coverage

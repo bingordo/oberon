@@ -853,10 +853,25 @@ impl<'a> Backend<'a> {
     /// them, which two back ends cannot agree on — a name no client can write is
     /// the one case where that matters).
     fn type_symbol(&self, t: TypeId, names: &HashMap<TypeId, String>) -> String {
+        // A type that came from an interface belongs to that module and is named
+        // there (cgen's `type_c_name`); a declared one keeps its Oberon name; and
+        // a composite reached through a pointer without a declaration of its own
+        // gets a deterministic one.
+        if let Some(q) = self.sema.qualified_name(t) {
+            return mangle(&q);
+        }
         names
             .get(&t)
             .cloned()
             .unwrap_or_else(|| format!("{}__Anon_{}", self.module_name, t.0))
+    }
+
+    /// Whether this module has to *define* a type's descriptor, or only name the
+    /// one another module's object already defines. An interface's record type is
+    /// the second: emitting a second `TD_` here would give one type two
+    /// descriptors, and `IS`, a guard and a type-`CASE` read them by address.
+    fn owns_descriptor(&self, t: TypeId) -> bool {
+        self.sema.qualified_name(t).is_none()
     }
 
     /// The data the descriptor machinery needs, for every record type the module
@@ -878,6 +893,16 @@ impl<'a> Backend<'a> {
         // map names the descriptors of the records inside it.
         for &t in &records {
             let symbol = self.type_symbol(t, &names);
+            if !self.owns_descriptor(t) {
+                // Another module's object defines it, and its field map with it:
+                // this one only names the symbol.
+                let id = self
+                    .obj
+                    .declare_data(&format!("TD_{symbol}"), Linkage::Import, false, false)
+                    .map_err(|e| host(format!("{e}")))?;
+                self.descs.insert(t, id);
+                continue;
+            }
             let entries = self.record_map(t);
             if !entries.is_empty() {
                 let id = self
@@ -902,6 +927,9 @@ impl<'a> Backend<'a> {
         // relocations into them.
         let fld = crate::layout::ob_fld(self.ptr_bytes);
         for &t in &records {
+            if !self.owns_descriptor(t) {
+                continue;
+            }
             let Some(id) = self.maps.get(&t).copied() else {
                 continue;
             };
@@ -929,6 +957,9 @@ impl<'a> Backend<'a> {
         }
         // The descriptors, in id order, with their bases' already declared.
         for &t in &records {
+            if !self.owns_descriptor(t) {
+                continue;
+            }
             let symbol = self.type_symbol(t, &names);
             let name_id = self.declare_string(&format!("type_name_{}", t.0), &symbol)?;
             let d = crate::layout::ob_desc(self.ptr_bytes);
@@ -1154,6 +1185,10 @@ impl<'a> Backend<'a> {
             // The C back end's `float`.
             Type::Basic(Basic::Real) => Some(types::F32),
             Type::Pointer { .. } => Some(self.ptr),
+            // A procedure value is a code address (report §6.5: only a
+            // *module-level* procedure can be assigned to one, so it is the plain
+            // ABI and no static link — which is the C back end's shape too).
+            Type::Proc { .. } => Some(self.ptr),
             _ => None,
         }
     }
@@ -1180,7 +1215,7 @@ impl<'a> Backend<'a> {
             Type::Basic(Basic::Integer) | Type::Basic(Basic::Boolean) => Ok(4),
             Type::Basic(Basic::Set) | Type::Basic(Basic::Real) => Ok(4),
             Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) => Ok(1),
-            Type::Pointer { .. } => Ok(self.ptr_bytes),
+            Type::Pointer { .. } | Type::Proc { .. } => Ok(self.ptr_bytes),
             Type::Record { .. } | Type::Array { .. } => match self.layout(t) {
                 Some(l) => Ok(l.size),
                 None => Err(not_yet(&format!("a value of type {}", type_name(self.types.get(t))), span)),
@@ -3273,6 +3308,42 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         }
     }
 
+    /// The IR signature of the procedure a call site names, for an indirect call:
+    /// the checker's `call_types` at that site, turned into the same ABI a
+    /// declared procedure gets (DESIGN §9.7).
+    fn proc_signature(
+        &mut self,
+        d: &Designator,
+        span: Span,
+    ) -> Result<ir::SigRef, Diagnostic> {
+        let pty = self
+            .b
+            .sema
+            .call_types
+            .get(&span_key(d.span))
+            .copied()
+            .ok_or_else(|| not_yet(&format!("the call `{}`", d.base.join(".")), d.span))?;
+        let (params, result) = match self.b.types.get(pty) {
+            Type::Proc { params, result } => (params.clone(), *result),
+            _ => return Err(not_yet("a call to a non-procedure", span)),
+        };
+        let formals: Vec<Formal> = params
+            .iter()
+            .enumerate()
+            .map(|(i, pm)| Formal {
+                name: format!("a{i}"),
+                ty: pm.ty,
+                by_var: pm.by_var,
+            })
+            .collect();
+        let mut sig = self.b.obj.make_signature();
+        sig.params = self.b.abi_params(&formals, span)?;
+        if let Some(r) = result {
+            sig.returns.push(AbiParam::new(self.b.scalar(r, span)?));
+        }
+        Ok(self.bcx.import_signature(sig))
+    }
+
     /// The reference to another module's procedure, which the body's walk
     /// declared.
     fn imported_ref(
@@ -3316,14 +3387,22 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 .copied()
                 .ok_or_else(|| not_yet(&format!("the call to `{name}` as a value"), span));
         }
-        // A name that is a variable or a module object here is a procedure value,
-        // so this is a call through a pointer, which needs a signature in the IR
-        // (PLAN.md W9.2c).
-        if self.vars.contains_key(&name) || self.shadows(&name) {
-            return Err(not_yet(
-                &format!("the call through the procedure variable `{name}`"),
-                span,
-            ));
+        // A call through a procedure *variable* (or a procedure parameter): the
+        // callee is a value, so the call is indirect and carries the signature
+        // the checker recorded at this call site.
+        if self.vars.contains_key(&name) || self.b.vars.contains_key(&name) {
+            let place = self.named_place(&name, span)?;
+            let (callee, _) = self.pointer_value(&place, span)?;
+            let sigref = self.proc_signature(d, span)?;
+            let args = self.call_args(d)?.to_vec();
+            let vals = self.pass_args(d, &args)?;
+            let call = self.bcx.ins().call_indirect(sigref, callee, &vals);
+            return self
+                .bcx
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| not_yet(&format!("the call to `{name}` as a value"), span));
         }
         let args = self.call_args(d)?.to_vec();
         match name.as_str() {
@@ -3763,6 +3842,13 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 Some(v) => Ok(self.bcx.ins().iconst(I32, i64::from(v))),
                 None => Err(not_yet("a non-INTEGER constant", span)),
             };
+        }
+        // A declared procedure's name where a *value* is expected is its
+        // address: what assigning it to a procedure variable means (report §6.5).
+        if d.sels.is_empty() {
+            if let Some(fref) = self.frefs.get(&d.base[0]).copied() {
+                return Ok(self.bcx.ins().func_addr(self.b.ptr, fref));
+            }
         }
         let place = self.place(d, span)?;
         let (v, _) = self.read_place(&place, span)?;

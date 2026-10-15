@@ -1469,6 +1469,20 @@ written down):
   rows remain. Done when `BACKEND=clif bash e2e/run.sh`
   passes every row the C path does — 126 as of W9.2b, and the harness is there to
   say so.
+  **Two of the four are done.** An interface's record type now *imports* its `TD_`
+  rather than defining one, so `IS`, a guard and a type-`CASE` agree across a module
+  boundary (`gc-roots-hold-their-objects` is the row that says so; the layout walk
+  also had to follow a pointer to its base, and to record a pointer's own layout
+  before recursing, or `P = POINTER TO Node; Node = RECORD next: P END` never
+  terminates — the two `Gc.mod` rows caught that at once). Procedure values are code
+  addresses (`func_addr` for a module-level procedure, `call_indirect` for a call
+  through one, with the signature the checker recorded at the call site), which is
+  what `Torture.mod`'s `fn := twice; fn(21)` needed. **`BACKEND=clif bash
+  e2e/run.sh`: 67 pass, 2 fail** (from 66/3). What is left is the other two:
+  **nested procedures with static links** and **`SYSTEM`**, both refused by name
+  today and both required by the two remaining rows — `Torture.mod` declares
+  `PROCEDURE inner` and reaches `SYSTEM`. The gate is green and the corpus passes on
+  both back ends.
 
 **W7.7 a byte for every trap, not only the memory ones** — **done**
 

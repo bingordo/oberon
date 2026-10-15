@@ -123,10 +123,22 @@ impl<'a> Layouts<'a> {
             // `int32_t`, `float` and `uint32_t` are all one word (and so is
             // `BOOLEAN`, which the C back end emits as an `int32_t`).
             Type::Basic(_) => Some(Layout::new(4, 4)),
-            // A pointer, and a procedure value, are an address.
-            Type::Pointer { .. } | Type::Proc { .. } => {
-                Some(Layout::new(self.pointer, self.pointer))
+            // A pointer, and a procedure value, are an address — and the walk
+            // continues into what a pointer points at, because `NEW`, a field
+            // access and the collector's map all need *that* type's layout and
+            // members. The recursion terminates: a pointer's base is a declared
+            // type, so a cycle goes through a pointer.
+            Type::Pointer { base } => {
+                // The pointer's own layout is known before the walk goes on, so a
+                // cycle through it (`P = POINTER TO Node; Node = RECORD next: P
+                // END`) terminates: the cache is filled here rather than after the
+                // recursion.
+                let layout = Some(Layout::new(self.pointer, self.pointer));
+                self.cache.insert(t, layout);
+                let _ = self.of(base);
+                return layout;
             }
+            Type::Proc { .. } => Some(Layout::new(self.pointer, self.pointer)),
             // `struct { T e[n]; }`: no trailing padding inside the array, and the
             // element's alignment is the array's.
             Type::Array { len, elem } => {
