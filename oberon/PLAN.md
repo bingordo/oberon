@@ -1443,9 +1443,30 @@ written down):
   arrays in both modes with the hidden length, `VAR` parameters, and the string and
   record copies the parameter modes require. Done when the `e2e` rows about values
   and parameters pass under `BACKEND=clif`.
+  **Done.** `REAL` is the `f32` with the float instructions (`fcmp` for its
+  comparisons, `FLT`/`FLOOR`/`ABS` included, and `FLOOR` saturating where C's cast
+  is undefined); `CHAR`/`BYTE` is one byte read *unsigned* wherever it is compared
+  or converted (`ORD`/`CHR`, the ordinal order, and `rt_charcmp` for two character
+  arrays); `SET` is the `uint32_t` mask (`bor`/`band`/`bxor`/complement, `ob_rt_set`
+  for a constructor, the `& 31` bit test for `IN`). A `VAR` actual is the caller's
+  address, a structured *value* actual a copy the caller makes, an open array a
+  pointer and the hidden length its index check uses, and a string literal a data
+  object — `rt_strcopy` into an array, a byte copy for array-to-array. Cross-module
+  calls and imported variables came with it, since `Hello`/`Out` need them.
+  **`BACKEND=clif bash e2e/run.sh`: 66 checks pass, 3 fail** (from 56/9 at the start
+  of the slice; `e2e` on the C path is 126/0), and the three are named: `Torture.mod`
+  declares a **procedure variable**, and `GcRoots.mod` needs a descriptor that
+  belongs to *another* module's object (an imported record type's `TD_` is emitted
+  here rather than imported, which a mixed build must not do). Both are refused by
+  name with their byte. The corpus passes on both back ends (86 programs, exit 0),
+  and the gate is green.
+  *Found here*: DESIGN §9.4's table names an `rt_charcopy` for an array-to-array
+  `CHAR` copy, and the header has no such function — the C back end never needed one
+  (a full-length copy is a C struct assignment), so the lowerer copies the bytes
+  itself and the table's row is one the C side never had to justify.
 * **W9.2d — the scope machinery, and every row.** Nested procedures with static
-  links, imports and cross-module calls (the loader already links either back end),
-  `SYSTEM`, and whatever rows remain. Done when `BACKEND=clif bash e2e/run.sh`
+  links, procedure variables, `SYSTEM`, imported record descriptors, and whatever
+  rows remain. Done when `BACKEND=clif bash e2e/run.sh`
   passes every row the C path does — 126 as of W9.2b, and the harness is there to
   say so.
 

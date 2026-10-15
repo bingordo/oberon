@@ -1123,9 +1123,14 @@ process abort, which is what makes the trap rule testable at all.
 | `rt_in` | `int32_t (uint32_t, int32_t)` | `x IN s` |
 | `rt_set` | `uint32_t (int32_t, int32_t)` | `{a .. b}` |
 | `rt_strcopy` | `void (char *dst, int32_t n, const char *src)` | string literal → `CHAR` array (pads) |
-| | | *(`rt_charcopy` and `rt_charcmp` are executed in `golden`, the rest of the table in `csmoke`)* |
-| `rt_charcopy` | `void (char *dst, int32_t n, const char *src, int32_t m)` | `CHAR` array → `CHAR` array (no padding) |
+| | | *(`rt_charcmp` is executed in `golden`, the rest of the table in `csmoke`)* |
 | `rt_charcmp` | `int32_t (const char *, int32_t, const char *, int32_t)` | `CHAR` array relations (bounded) |
+
+There is **no** `rt_charcopy`, which this table used to name: a `CHAR` array copied
+from another of the same length is a full-length byte copy, which in C is the struct
+assignment the emitter writes and needs no helper. It was a table row nothing
+executed, and W9.2c found it by trying to call the function from the second back end
+and failing to link.
 | `rt_is` | `int32_t (const ObDesc *, const ObDesc *)` | `IS` |
 | `rt_new` | `void *(int32_t, ObDesc *)` | `NEW` |
 | `rt_trap` | `void (const char *)` | `ASSERT`, guards, bounds, `NIL`, a `CASE` default |
@@ -1197,7 +1202,7 @@ is wider than the `INTEGER` a temporary of its type would be (§9.10, R31).
 
 | Oberon | emitted C |
 |---|---|
-| `d := e` | `d = e;`; for a `CHAR` array destination, `rt_strcopy(d, n, e)` from a string literal (length-checked, zero-padded) or `rt_charcopy(d, n, e, n)` from another array of the same length (no terminator implied) |
+| `d := e` | `d = e;`; for a `CHAR` array destination, `rt_strcopy(d, n, e)` from a string literal (length-checked, zero-padded), or the byte copy C's struct assignment gives from another array of the same length (no terminator implied) |
 | procedure call | `f(&a, b, c);` — VAR actuals get `&`, structured value actuals get a caller-made copy |
 | `IF … ELSIF … ELSE … END` | `if (…) { … } else if (…) { … } else { … }` |
 | `WHILE g1 DO S1 ELSIF g2 DO S2 END` | `for (;;) { if (g1) {S1} else if (g2) {S2} else break; }` (report §9.6: repeat until no guard is true) |
@@ -2381,7 +2386,54 @@ cannot meet are what the rest of the language is — `CHAR`/`REAL`/`SET` values,
 arrays, `VAR` parameters, nested procedures, and the `Hello`/`Out` runtime fixtures.
 Reported as a distance rather than as a pass.
 
-**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
+### The value types, open arrays and `VAR` parameters **[implemented; `PLAN.md` W9.2c]**
+
+* **`REAL`** is the C back end's `float` (the IR's `f32`): `fadd`/`fsub`/`fmul`/
+  `fdiv`, `fneg`, `fabs` for `ABS` (which keeps its operand's type), `fcvt_from_sint`
+  for `FLT`, and `fcmp` for the comparisons — so a NaN compares false exactly as
+  C's `<` does. `FLOOR` floors and then converts *saturating*, where the C back
+  end's `(int32_t)rt_floor(x)` is undefined outside the range: the design's stance
+  is that no emitted code relies on undefined behaviour, so the defined answer wins.
+* **`CHAR`** (and `BYTE`) is one byte, read *unsigned* wherever it is compared or
+  converted: `icmp` with the unsigned codes is the C back end's `(unsigned char)`
+  casts, `ORD` zero-extends, `CHR` truncates, and a one-character string is its
+  byte (report §10.1's `ch <= "9"`). Two character *arrays* compare through the
+  runtime's bounded `rt_charcmp`, which reads neither operand past its length (R14).
+* **`SET`** is the C back end's `uint32_t` mask: `+ - * /` are `bor`, `and` with
+  the complement, `band` and `bxor` (report §8.2.3), `-s` is every bit of the word,
+  `{a .. b}` is one `ob_rt_set` call per element (the clamping and the width-32
+  case are the runtime's), and `x IN s` is the mask test `(s >> (x & 31)) & 1`.
+* **Open arrays and `VAR` parameters** follow §9.7's table exactly: a `VAR` actual
+  is the *caller's* address, a structured *value* actual is the address of a copy
+  the caller makes (so the callee's writes are invisible, report §10.1), and an
+  open array is a pointer and a *hidden length* — indexing is `rt_index(i, len, at)`
+  against that length, which is what makes an index past the end of a shorter
+  actual trap, and `LEN` is the length itself. **[verified]** the corpus's own row
+  `PROCEDURE Fill(VAR v: ARRAY OF INTEGER)` with `v[4]` on a four-element actual
+  reports `index out of range (at byte 95 of the source)` on both back ends.
+* **Other modules** are reached by the C back end's names: a call is
+  `Texts__WriteString` with the ABI the *interface* declares (the checker's
+  `call_types` at the call site, which is where the C back end reads it), and an
+  imported variable (`Oberon.Log`) is the defining module's data, declared as an
+  import. **[verified]** `Hello` (a `VAR Writer` parameter, an `ARRAY OF CHAR`
+  argument and a string literal) builds and prints `Hello, world!` and its command
+  through the lowered object.
+
+*Found here*: DESIGN §9.4's table names an `rt_charcopy` for an array-to-array
+`CHAR` copy, and the header has no such function — the C back end never needed one,
+because a full-length copy is a C struct assignment. The lowerer therefore copies
+those bytes itself (`emit_small_memory_copy`, which is the same assignment), and
+the table's row is one the C side never had to justify.
+
+**Where it stands.** `BACKEND=clif bash e2e/run.sh`: **66 checks pass, 3 fail**
+(from 56 and 9 at the start of this slice; `e2e` on the C path is 126/0). The three
+are the rows that need what is still outside the slice: `Torture.mod` declares a
+**procedure variable** (refused by name, as is `SYSTEM`), and `GcRoots.mod` needs a
+descriptor that belongs to *another* module's object — an imported record type's
+`TD_` is currently emitted here rather than imported, which a mixed build must not
+do. Both are named, with their byte, rather than half-lowered.
+
+**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`:**Evidence (W9.1).** `BACKEND=clif bash fuzz/run.sh`: the regression list (9 seeds,
 value oracle), the same 9 under the adversarial trap oracle, the same 9 in the
 `-Odialect=lower` dialect, then 30 coverage seeds and 10 adversarial coverage
 seeds — **67 programs, 0 failures** (against the same corpus's numbers on the C

@@ -408,6 +408,18 @@ void ob_rt_trap_pos(const char *msg, int32_t at) {
     rt_trap_pos(msg, at);
 }
 
+uint32_t ob_rt_set(int32_t a, int32_t b) {
+    return rt_set(a, b);
+}
+
+void ob_rt_strcopy(char *dst, int32_t n, const char *src) {
+    rt_strcopy(dst, n, src);
+}
+
+int32_t ob_rt_charcmp(const char *a, int32_t na, const char *b, int32_t nb) {
+    return rt_charcmp(a, na, b, nb);
+}
+
 int32_t ob_rt_is(const ObDesc *d, const ObDesc *target) {
     return rt_is(d, target);
 }

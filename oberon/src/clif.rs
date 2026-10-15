@@ -49,8 +49,30 @@ use crate::sema::{span_key, Sema};
 use crate::types::{Basic, Type, TypeId, Types};
 use crate::Diagnostic;
 
-/// A formal parameter as the checker flattened it: its name, and its type.
-type Formal = (String, TypeId);
+/// A formal parameter as the checker flattened it, and how the C back end passes
+/// it (DESIGN §9.7): a value of a basic type is the value itself, a `VAR`
+/// parameter is the caller's address, a *structured* value parameter is the
+/// address of a copy the caller made, and an open array is a pointer *and* a
+/// hidden length (report §10.1).
+#[derive(Clone)]
+struct Formal {
+    name: String,
+    ty: TypeId,
+    by_var: bool,
+}
+
+impl Formal {
+    fn open(&self, types: &Types) -> Option<TypeId> {
+        match types.get(self.ty) {
+            Type::OpenArray { elem } => Some(*elem),
+            _ => None,
+        }
+    }
+
+    fn structured(&self, types: &Types) -> bool {
+        matches!(types.get(self.ty), Type::Record { .. } | Type::Array { .. })
+    }
+}
 
 /// `INTEGER` and `BOOLEAN` are one IR type here (DESIGN §9.2: an `int32_t`, with
 /// 0/1 for the truth values, so `ORD(p)` is the C value).
@@ -125,6 +147,12 @@ enum Rt {
     /// `ob_gc_root_region(base, fields, n)`: a module variable the collector has
     /// to walk (DESIGN §15.4).
     GcRoot,
+    /// `rt_set(a, b)`: the mask a set constructor `{a .. b}` is (§9.5).
+    Set,
+    /// `rt_strcopy`/`rt_charcmp`: the bounded CHAR-array operations (a literal
+    /// into an array, and the relations).
+    StrCopy,
+    CharCmp,
 }
 
 impl Rt {
@@ -139,6 +167,9 @@ impl Rt {
             Rt::New => "rt_new",
             Rt::GuardAt => "ob_rt_guard_at",
             Rt::GcRoot => "ob_gc_root_region",
+            Rt::Set => "ob_rt_set",
+            Rt::StrCopy => "ob_rt_strcopy",
+            Rt::CharCmp => "ob_rt_charcmp",
         }
     }
 }
@@ -229,6 +260,274 @@ fn host(message: String) -> Diagnostic {
     Diagnostic::error(Span::default(), message)
 }
 
+/// What a body needs *declared* before its builder exists: the string literals
+/// (data objects), and the symbols of other modules it calls or reads — an
+/// imported procedure is a function reference and an imported variable a data
+/// reference, and Cranelift will not accept either unless it was declared into
+/// the function first (DESIGN §16.2's constraint).
+#[derive(Default)]
+struct Uses {
+    strings: Vec<(u32, String)>,
+    /// `(symbol, the callee's procedure type or the variable's type, is a call)`.
+    imports: Vec<(String, TypeId, bool)>,
+}
+
+/// Every string literal in a body, with the byte it starts at: a literal used
+/// where a pointer is expected (`ARRAY OF CHAR`, or a character array compared
+/// with one) has to be a data object the module carries, and Cranelift's symbol
+/// references have to be declared before the builder exists. A literal that
+/// turns out to be used as a `CHAR` only leaves a few bytes of `.rodata` unused,
+/// which is the same trade the trap messages make.
+fn collect_strings(body: &[Stmt], out: &mut Vec<(u32, String)>) {
+    for s in body {
+        collect_strings_stmt(s, out);
+    }
+}
+
+fn uses_of(sema: &Sema<'_>, types: &Types, module: &Module, body: &[Stmt]) -> Uses {
+    let mut uses = Uses::default();
+    collect_strings(body, &mut uses.strings);
+    collect_imports(sema, types, module, body, &mut uses);
+    uses.strings.sort_unstable();
+    uses.strings.dedup();
+    uses.imports.sort_by(|a, b| a.0.cmp(&b.0));
+    uses.imports.dedup_by(|a, b| a.0 == b.0);
+    uses
+}
+
+/// The alias a module was imported under resolves to the module it stands for
+/// (report §11).
+fn alias_of(module: &Module, alias: &str) -> Option<String> {
+    module
+        .imports
+        .iter()
+        .find(|i| i.alias == alias)
+        .map(|i| i.module.clone())
+}
+
+fn collect_imports(
+    sema: &Sema<'_>,
+    types: &Types,
+    module: &Module,
+    body: &[Stmt],
+    uses: &mut Uses,
+) {
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign { target, value } => {
+                collect_imports_designator(sema, types, module, target, uses);
+                collect_imports_expr(sema, types, module, value, uses);
+            }
+            StmtKind::Call(d) => collect_imports_designator(sema, types, module, d, uses),
+            StmtKind::If { arms, els } => {
+                for (c, b) in arms {
+                    collect_imports_expr(sema, types, module, c, uses);
+                    collect_imports(sema, types, module, b, uses);
+                }
+                if let Some(b) = els {
+                    collect_imports(sema, types, module, b, uses);
+                }
+            }
+            StmtKind::While { arms } => {
+                for (c, b) in arms {
+                    collect_imports_expr(sema, types, module, c, uses);
+                    collect_imports(sema, types, module, b, uses);
+                }
+            }
+            StmtKind::Repeat { body, until } => {
+                collect_imports(sema, types, module, body, uses);
+                collect_imports_expr(sema, types, module, until, uses);
+            }
+            StmtKind::For {
+                from, to, by, body, ..
+            } => {
+                collect_imports_expr(sema, types, module, from, uses);
+                collect_imports_expr(sema, types, module, to, uses);
+                if let Some(k) = by {
+                    collect_imports_expr(sema, types, module, k, uses);
+                }
+                collect_imports(sema, types, module, body, uses);
+            }
+            StmtKind::Case { subject, arms } => {
+                collect_imports_expr(sema, types, module, subject, uses);
+                for arm in arms {
+                    collect_imports(sema, types, module, &arm.body, uses);
+                }
+            }
+            StmtKind::Return(e) => {
+                if let Some(e) = e {
+                    collect_imports_expr(sema, types, module, e, uses);
+                }
+            }
+            StmtKind::Exit => {}
+        }
+    }
+}
+
+fn collect_imports_expr(
+    sema: &Sema<'_>,
+    types: &Types,
+    module: &Module,
+    e: &Expr,
+    uses: &mut Uses,
+) {
+    match &e.kind {
+        ExprKind::Designator(d) => collect_imports_designator(sema, types, module, d, uses),
+        ExprKind::Unary(_, x) => collect_imports_expr(sema, types, module, x, uses),
+        ExprKind::Binary(_, l, r) => {
+            collect_imports_expr(sema, types, module, l, uses);
+            collect_imports_expr(sema, types, module, r, uses);
+        }
+        ExprKind::TypeTest(x, _) => collect_imports_expr(sema, types, module, x, uses),
+        ExprKind::Set(elems) => {
+            for el in elems {
+                collect_imports_expr(sema, types, module, &el.lo, uses);
+                if let Some(h) = &el.hi {
+                    collect_imports_expr(sema, types, module, h, uses);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_imports_designator(
+    sema: &Sema<'_>,
+    types: &Types,
+    module: &Module,
+    d: &Designator,
+    uses: &mut Uses,
+) {
+    if d.base.len() == 2 {
+        if let Some(m) = alias_of(module, &d.base[0]) {
+            let symbol = format!("{}__{}", m, mangle(&d.base[1]));
+            let called = matches!(d.sels.last(), Some(Selector::Call(_)));
+            // The checker recorded the type of the whole designator where it
+            // stands (a call's type at the call site, a variable's at its use),
+            // which is where the C back end reads it too — an interface's
+            // *variables* are not in the type environment it builds.
+            let ty = if called {
+                sema.call_types.get(&span_key(d.span)).copied()
+            } else {
+                sema.type_at(d.span, types)
+            };
+            if let Some(ty) = ty {
+                uses.imports.push((symbol, ty, called));
+            }
+        }
+    }
+    for sel in &d.sels {
+        match sel {
+            Selector::Index(ix) => {
+                for e in ix {
+                    collect_imports_expr(sema, types, module, e, uses);
+                }
+            }
+            Selector::Call(args) | Selector::Args(Some(args)) => {
+                for e in args {
+                    collect_imports_expr(sema, types, module, e, uses);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_strings_stmt(s: &Stmt, out: &mut Vec<(u32, String)>) {
+    match &s.kind {
+        StmtKind::Assign { target, value } => {
+            collect_strings_designator(target, out);
+            collect_strings_expr(value, out);
+        }
+        StmtKind::Call(d) => collect_strings_designator(d, out),
+        StmtKind::If { arms, els } => {
+            for (c, body) in arms {
+                collect_strings_expr(c, out);
+                collect_strings(body, out);
+            }
+            if let Some(body) = els {
+                collect_strings(body, out);
+            }
+        }
+        StmtKind::While { arms } => {
+            for (c, body) in arms {
+                collect_strings_expr(c, out);
+                collect_strings(body, out);
+            }
+        }
+        StmtKind::Repeat { body, until } => {
+            collect_strings(body, out);
+            collect_strings_expr(until, out);
+        }
+        StmtKind::For {
+            from, to, by, body, ..
+        } => {
+            collect_strings_expr(from, out);
+            collect_strings_expr(to, out);
+            if let Some(k) = by {
+                collect_strings_expr(k, out);
+            }
+            collect_strings(body, out);
+        }
+        StmtKind::Case { subject, arms } => {
+            collect_strings_expr(subject, out);
+            for arm in arms {
+                collect_strings(&arm.body, out);
+            }
+        }
+        StmtKind::Return(e) => {
+            if let Some(e) = e {
+                collect_strings_expr(e, out);
+            }
+        }
+        StmtKind::Exit => {}
+    }
+}
+
+fn collect_strings_designator(d: &Designator, out: &mut Vec<(u32, String)>) {
+    for sel in &d.sels {
+        match sel {
+            Selector::Index(ix) => {
+                for e in ix {
+                    collect_strings_expr(e, out);
+                }
+            }
+            Selector::Call(args) | Selector::Args(Some(args)) => {
+                for e in args {
+                    collect_strings_expr(e, out);
+                }
+            }
+            Selector::Args(None) | Selector::Field(_) | Selector::Guard(_) | Selector::Deref => {}
+        }
+    }
+}
+
+fn collect_strings_expr(e: &Expr, out: &mut Vec<(u32, String)>) {
+    match &e.kind {
+        ExprKind::Str(text) => out.push((e.span.lo, text.clone())),
+        ExprKind::Designator(d) => collect_strings_designator(d, out),
+        ExprKind::Unary(_, x) => collect_strings_expr(x, out),
+        ExprKind::Binary(_, l, r) => {
+            collect_strings_expr(l, out);
+            collect_strings_expr(r, out);
+        }
+        ExprKind::TypeTest(x, _) => collect_strings_expr(x, out),
+        ExprKind::Set(elems) => {
+            for el in elems {
+                collect_strings_expr(&el.lo, out);
+                if let Some(h) = &el.hi {
+                    collect_strings_expr(h, out);
+                }
+            }
+        }
+        ExprKind::Int(_)
+        | ExprKind::Real(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Nil => {}
+    }
+}
+
 /// A construct this milestone's fragment does not cover. Naming the milestone is
 /// what keeps it from reading as a limitation of the language, and the span makes
 /// it the same kind of diagnostic as a type error: the reason and where.
@@ -266,8 +565,12 @@ struct Backend<'a> {
     /// A module variable's own map, when its type reaches a pointer: what
     /// `__init` registers with the collector.
     root_maps: HashMap<String, DataId>,
-    /// Every procedure the module declares, under the symbol it is emitted with.
+    /// Every procedure the module declares, under the symbol it is emitted with,
+    /// and the formals it was declared with (which is what a call's argument
+    /// passing needs when the checker recorded no type at the call site — a
+    /// parameterless call written without parentheses has no `Call` selector).
     procs: HashMap<String, FuncId>,
+    proc_formals: HashMap<String, Vec<Formal>>,
     /// The module's variables, as data objects.
     vars: HashMap<String, DataId>,
     /// What each module variable's type is: an index into one needs the length
@@ -319,6 +622,7 @@ impl<'a> Backend<'a> {
             nfields: HashMap::new(),
             root_maps: HashMap::new(),
             procs: HashMap::new(),
+            proc_formals: HashMap::new(),
             vars: HashMap::new(),
             var_ty: HashMap::new(),
             rt: HashMap::new(),
@@ -364,6 +668,9 @@ impl<'a> Backend<'a> {
             Rt::New,
             Rt::GuardAt,
             Rt::GcRoot,
+            Rt::Set,
+            Rt::StrCopy,
+            Rt::CharCmp,
         ] {
             let sig = self.rt_signature(rt);
             let id = self
@@ -423,9 +730,12 @@ impl<'a> Backend<'a> {
             layouts.of(self.decl_type(&v.ty));
         }
         for p in &module.decls.procs {
-            let (params, result) = self.signature_of(p)?;
-            for (_, ty) in &params {
-                layouts.of(*ty);
+            let (formals, result) = self.formals(p)?;
+            for f in &formals {
+                layouts.of(f.ty);
+                if let Some(elem) = f.open(self.types) {
+                    layouts.of(elem);
+                }
             }
             if let Some(r) = result {
                 layouts.of(r);
@@ -690,6 +1000,26 @@ impl<'a> Backend<'a> {
     fn rt_signature(&self, rt: Rt) -> Signature {
         let mut sig = self.obj.make_signature();
         match rt {
+            // `rt_set(int32_t, int32_t) -> uint32_t`.
+            Rt::Set => {
+                sig.params.push(AbiParam::new(I32));
+                sig.params.push(AbiParam::new(I32));
+                sig.returns.push(AbiParam::new(I32));
+            }
+            // `rt_strcopy(char *, int32_t, const char *)`.
+            Rt::StrCopy => {
+                sig.params.push(AbiParam::new(self.ptr));
+                sig.params.push(AbiParam::new(I32));
+                sig.params.push(AbiParam::new(self.ptr));
+            }
+            // `rt_charcmp(const char *, int32_t, const char *, int32_t) -> int32_t`.
+            Rt::CharCmp => {
+                sig.params.push(AbiParam::new(self.ptr));
+                sig.params.push(AbiParam::new(I32));
+                sig.params.push(AbiParam::new(self.ptr));
+                sig.params.push(AbiParam::new(I32));
+                sig.returns.push(AbiParam::new(I32));
+            }
             // `rt_is(const ObDesc *, const ObDesc *) -> int32_t`.
             Rt::Is => {
                 sig.params.push(AbiParam::new(self.ptr));
@@ -742,15 +1072,12 @@ impl<'a> Backend<'a> {
         &mut self,
         name: &str,
         export: bool,
-        params: &[TypeId],
+        params: &[AbiParam],
         result: Option<TypeId>,
         span: Span,
     ) -> Result<FuncId, Diagnostic> {
         let mut sig = self.obj.make_signature();
-        for p in params {
-            let ty = self.scalar(*p, span)?;
-            sig.params.push(AbiParam::new(ty));
-        }
+        sig.params = params.to_vec();
         if let Some(r) = result {
             sig.returns.push(AbiParam::new(self.scalar(r, span)?));
         }
@@ -761,6 +1088,26 @@ impl<'a> Backend<'a> {
         };
         self.obj
             .declare_function(name, linkage, &sig)
+            .map_err(|e| host(format!("{e}")))
+    }
+
+    /// Another module's procedure, as a symbol this object imports: the C back
+    /// end links against exactly this name (DESIGN §9.7), and the ABI is the
+    /// interface's.
+    fn declare_import(
+        &mut self,
+        name: &str,
+        params: &[AbiParam],
+        result: Option<TypeId>,
+        span: Span,
+    ) -> Result<FuncId, Diagnostic> {
+        let mut sig = self.obj.make_signature();
+        sig.params = params.to_vec();
+        if let Some(r) = result {
+            sig.returns.push(AbiParam::new(self.scalar(r, span)?));
+        }
+        self.obj
+            .declare_function(name, Linkage::Import, &sig)
             .map_err(|e| host(format!("{e}")))
     }
 
@@ -783,6 +1130,11 @@ impl<'a> Backend<'a> {
     /// A type's alignment, from the layout: what a frame slot holding one has to
     /// be aligned to (the same number the C back end's `memset` of a local gets
     /// from the C compiler).
+    /// The frontend configuration, for the memory helpers the emitter uses.
+    fn obj_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
+        self.obj.target_config()
+    }
+
     fn type_align(&self, t: TypeId) -> u64 {
         self.layout(t).map(|l| l.align).unwrap_or(1)
     }
@@ -792,10 +1144,32 @@ impl<'a> Backend<'a> {
     /// this slice does not lower yet (`REAL`, `CHAR`, `SET`, PLAN.md W9.2c).
     fn value_type(&self, t: TypeId) -> Option<ir::Type> {
         match self.types.get(t) {
+            // `int32_t`, and `BOOLEAN`'s 0/1 (DESIGN §9.2).
             Type::Basic(Basic::Integer) | Type::Basic(Basic::Boolean) => Some(I32),
+            // A `SET` is the C back end's `uint32_t` mask.
+            Type::Basic(Basic::Set) => Some(I32),
+            // One byte: the C back end's `char`/`uint8_t`. Comparisons read it
+            // unsigned, which is what its `(unsigned char)` casts are for.
+            Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) => Some(types::I8),
+            // The C back end's `float`.
+            Type::Basic(Basic::Real) => Some(types::F32),
             Type::Pointer { .. } => Some(self.ptr),
             _ => None,
         }
+    }
+
+    /// Whether a type's values are *ordinal* in the C back end's sense, which is
+    /// what decides a comparison's signedness: `CHAR` and `BYTE` are read
+    /// unsigned (report §8.2.4's ordinal order), and a `SET` is a `uint32_t`.
+    fn unsigned(&self, t: TypeId) -> bool {
+        matches!(
+            self.types.get(t),
+            Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) | Type::Basic(Basic::Set)
+        )
+    }
+
+    fn is_real(&self, t: TypeId) -> bool {
+        matches!(self.types.get(t), Type::Basic(Basic::Real))
     }
 
     /// What a variable or a field of this type occupies, or a refusal. A record
@@ -804,6 +1178,8 @@ impl<'a> Backend<'a> {
     fn storable(&self, t: TypeId, span: Span) -> Result<u64, Diagnostic> {
         match self.types.get(t) {
             Type::Basic(Basic::Integer) | Type::Basic(Basic::Boolean) => Ok(4),
+            Type::Basic(Basic::Set) | Type::Basic(Basic::Real) => Ok(4),
+            Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) => Ok(1),
             Type::Pointer { .. } => Ok(self.ptr_bytes),
             Type::Record { .. } | Type::Array { .. } => match self.layout(t) {
                 Some(l) => Ok(l.size),
@@ -942,33 +1318,49 @@ impl<'a> Backend<'a> {
         }
         // The checker's flattened signature is what names the parameters, and
         // it is what the C back end reads for the same purpose.
-        let (params, result) = self.signature_of(p)?;
-        let types: Vec<TypeId> = params.iter().map(|(_, ty)| *ty).collect();
-        let id = self.declare_function(&self.symbol(&p.name), p.export, &types, result, p.name_span)?;
+        let (formals, result) = self.formals(p)?;
+        let abi = self.abi_params(&formals, p.name_span)?;
+        let id = self.declare_function(&self.symbol(&p.name), p.export, &abi, result, p.name_span)?;
         self.procs.insert(p.name.clone(), id);
+        self.proc_formals.insert(p.name.clone(), formals);
         Ok(())
     }
 
     /// A procedure's parameters, as the checker flattened them, and its result.
-    /// A `VAR` parameter needs an address in the IR and a pointer on the C side
-    /// (report §10.1), which is PLAN.md W9.2's.
-    fn signature_of(&self, p: &Proc) -> Result<(Vec<Formal>, Option<TypeId>), Diagnostic> {
+    fn formals(&self, p: &Proc) -> Result<(Vec<Formal>, Option<TypeId>), Diagnostic> {
         let sig = self
             .sema
             .signatures
             .get(&span_key(p.span))
             .ok_or_else(|| host(format!("no signature for `{}`", p.name)))?;
-        let mut params = Vec::new();
-        for (name, pm) in &sig.params {
-            if pm.by_var {
-                return Err(not_yet(
-                    &format!("the VAR parameter `{name}`"),
-                    p.name_span,
-                ));
-            }
-            params.push((name.clone(), pm.ty));
-        }
+        let params = sig
+            .params
+            .iter()
+            .map(|(name, pm)| Formal {
+                name: name.clone(),
+                ty: pm.ty,
+                by_var: pm.by_var,
+            })
+            .collect();
         Ok((params, sig.result))
+    }
+
+    /// The C ABI a formal gets, which is DESIGN §9.7's table: an open array is a
+    /// pointer and a length, a `VAR` parameter and a structured value parameter
+    /// are an address, and anything else is its own width.
+    fn abi_params(&self, formals: &[Formal], span: Span) -> Result<Vec<AbiParam>, Diagnostic> {
+        let mut out = Vec::new();
+        for f in formals {
+            if f.open(self.types).is_some() {
+                out.push(AbiParam::new(self.ptr));
+                out.push(AbiParam::new(I32));
+            } else if f.by_var || f.structured(self.types) {
+                out.push(AbiParam::new(self.ptr));
+            } else {
+                out.push(AbiParam::new(self.scalar(f.ty, span)?));
+            }
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------- entry points
@@ -990,6 +1382,7 @@ impl<'a> Backend<'a> {
         let register_ref = self.obj.declare_func_in_func(register, &mut ctx.func);
         let name_gv = self.obj.declare_data_in_func(name_data, &mut ctx.func);
         let table_gv = self.obj.declare_data_in_func(commands, &mut ctx.func);
+
         let mut fn_ctx = FunctionBuilderContext::new();
         {
             let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
@@ -1060,7 +1453,7 @@ impl<'a> Backend<'a> {
     // ----------------------------------------------------------- functions
 
     fn lower_proc(&mut self, p: &Proc) -> Result<(), Diagnostic> {
-        let (params, result) = self.signature_of(p)?;
+        let (formals, result) = self.formals(p)?;
         let mut locals = Vec::new();
         for v in &p.decls.vars {
             let ty = self.decl_type(&v.ty);
@@ -1073,7 +1466,7 @@ impl<'a> Backend<'a> {
             .get(&p.name)
             .expect("a declared procedure has a symbol");
         let body = p.body.clone();
-        self.lower_function(id, &params, &locals, result, &body, p.name_span)
+        self.lower_function(id, &formals, &locals, result, &body, p.name_span)
     }
 
     /// Lower one function: parameters and locals as SSA variables, the body as
@@ -1081,7 +1474,7 @@ impl<'a> Backend<'a> {
     fn lower_function(
         &mut self,
         id: FuncId,
-        params: &[(String, TypeId)],
+        formals: &[Formal],
         locals: &[(String, TypeId)],
         result: Option<TypeId>,
         body: &[Stmt],
@@ -1090,12 +1483,17 @@ impl<'a> Backend<'a> {
         // Every symbol the body can name is declared *before* the builder
         // exists: a Cranelift function reference is part of the function, and
         // the frontend does not hand the `ir::Function` back once it holds it.
+        // The string literals are data objects for the same reason — a literal
+        // used where a pointer is expected (`ARRAY OF CHAR`) has to name one.
+        let uses = uses_of(self.sema, self.types, self.module, body);
+        let mut string_ids = Vec::new();
+        for (at, text) in &uses.strings {
+            string_ids.push((*at, self.declare_string(&format!("str_{at}"), text)?));
+        }
+
         let mut ctx = self.obj.make_context();
         let mut sig = self.obj.make_signature();
-        for (_, ty) in params {
-            sig.params
-                .push(AbiParam::new(self.scalar(*ty, span)?));
-        }
+        sig.params = self.abi_params(formals, span)?;
         if let Some(r) = result {
             sig.returns.push(AbiParam::new(self.scalar(r, span)?));
         }
@@ -1126,11 +1524,61 @@ impl<'a> Backend<'a> {
             let n = self.region_fields(self.var_ty[&name], 0).len() as i32;
             roots.insert(
                 name,
-                (
-                    self.obj.declare_data_in_func(mid, &mut ctx.func),
-                    n,
-                ),
+                (self.obj.declare_data_in_func(mid, &mut ctx.func), n),
             );
+        }
+
+        // Other modules' procedures the body calls: an import needs its ABI
+        // before the builder can name it (an interface's procedure has no
+        // declaration in this module otherwise).
+        let mut imported_ids = Vec::new();
+        let mut imported_var_ids = Vec::new();
+        for (symbol, ty, is_call) in &uses.imports {
+            if !is_call {
+                // An interface's variable: the defining module's data, named the
+                // way its header declares it.
+                let id = self
+                    .obj
+                    .declare_data(symbol, Linkage::Import, true, false)
+                    .map_err(|e| host(format!("{e}")))?;
+                imported_var_ids.push((symbol.clone(), id, *ty));
+                continue;
+            }
+            let params = match self.types.get(*ty) {
+                Type::Proc { params, .. } => params.clone(),
+                _ => continue,
+            };
+            let formals: Vec<Formal> = params
+                .iter()
+                .enumerate()
+                .map(|(i, pm)| Formal {
+                    name: format!("a{i}"),
+                    ty: pm.ty,
+                    by_var: pm.by_var,
+                })
+                .collect();
+            let abi = self.abi_params(&formals, span)?;
+            let result = match self.types.get(*ty) {
+                Type::Proc { result, .. } => *result,
+                _ => None,
+            };
+            let id = self.declare_import(symbol, &abi, result, span)?;
+            imported_ids.push((symbol.clone(), id));
+        }
+
+        let mut strings_gv = HashMap::new();
+        for (at, sid) in string_ids {
+            strings_gv.insert(at, self.obj.declare_data_in_func(sid, &mut ctx.func));
+        }
+        let mut imported = HashMap::new();
+        for (symbol, id) in imported_ids {
+            imported.insert(symbol, self.obj.declare_func_in_func(id, &mut ctx.func));
+        }
+        let mut imported_vars = HashMap::new();
+        let mut imported_var_tys = HashMap::new();
+        for (symbol, id, ty) in imported_var_ids {
+            imported_vars.insert(symbol.clone(), self.obj.declare_data_in_func(id, &mut ctx.func));
+            imported_var_tys.insert(symbol, ty);
         }
 
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -1139,14 +1587,28 @@ impl<'a> Backend<'a> {
             let entry = bcx.create_block();
             bcx.append_block_params_for_function_params(entry);
             bcx.switch_to_block(entry);
+            let values: Vec<ir::Value> = bcx.block_params(entry).to_vec();
             let mut vars = HashMap::new();
             let mut local_tys: HashMap<String, TypeId> = HashMap::new();
-            let values: Vec<ir::Value> = bcx.block_params(entry).to_vec();
-            for (i, (pname, pty)) in params.iter().enumerate() {
-                let var = bcx.declare_var(self.scalar(*pty, span)?);
-                bcx.def_var(var, values[i]);
-                vars.insert(pname.clone(), var);
-                local_tys.insert(pname.clone(), *pty);
+            let mut var_params: HashMap<String, (ir::Value, TypeId)> = HashMap::new();
+            let mut open: HashMap<String, (ir::Value, ir::Value, TypeId)> = HashMap::new();
+            let mut at = 0;
+            for f in formals {
+                local_tys.insert(f.name.clone(), f.ty);
+                if let Some(elem) = f.open(self.types) {
+                    // An open array arrives as the element pointer and the length
+                    // the caller passed (report §10.1).
+                    open.insert(f.name.clone(), (values[at], values[at + 1], elem));
+                    at += 2;
+                } else if f.by_var || f.structured(self.types) {
+                    var_params.insert(f.name.clone(), (values[at], f.ty));
+                    at += 1;
+                } else {
+                    let var = bcx.declare_var(self.scalar(f.ty, span)?);
+                    bcx.def_var(var, values[at]);
+                    vars.insert(f.name.clone(), var);
+                    at += 1;
+                }
             }
             let mut slots: HashMap<String, ir::Value> = HashMap::new();
             let mut regions: Vec<(TypeId, ir::Value)> = Vec::new();
@@ -1161,8 +1623,6 @@ impl<'a> Backend<'a> {
                         not_yet(&format!("the local `{lname}`"), span)
                     })?;
                     if size > u64::from(u32::MAX) {
-                        // A frame slot's size is a 32-bit field in Cranelift's
-                        // IR; the C path's local is a `sizeof`-sized object.
                         return Err(Diagnostic::error(
                             span,
                             format!(
@@ -1171,11 +1631,7 @@ impl<'a> Backend<'a> {
                             ),
                         ));
                     }
-                    let align = self
-                        .layout(*ty)
-                        .map(|_| self.type_align(*ty))
-                        .unwrap_or(1)
-                        .trailing_zeros() as u8;
+                    let align = self.type_align(*ty).trailing_zeros() as u8;
                     let slot = bcx.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         size as u32,
@@ -1200,43 +1656,36 @@ impl<'a> Backend<'a> {
                 }
             }
             let mut l = Lower::new(
-                self, bcx, vars, slots, local_tys, gvs, frefs, rts, msgs, descs, roots, result,
+                self, bcx, vars, slots, local_tys, var_params, open, strings_gv, imported,
+                imported_vars, imported_var_tys, gvs, frefs, rts, msgs, descs, roots, result,
             );
             for (ty, addr) in regions {
                 l.desc_init(ty, addr, span)?;
             }
-            // A module body registers its variables' roots before anything can
-            // allocate (DESIGN §15.4), and gives every record variable its
-            // descriptor — the C back end's `__init` preamble.
             if id == self.init {
                 l.init_preamble(span)?;
             }
             l.stmts(body)?;
-            // A path that reaches the end of a body returns zero: the C back
-            // end zero-initialises its result accumulator for the same reason,
-            // since a function the checker accepted may reach no `RETURN` at all
-            // (W8.4) and the report defines no value for that path.
+            // A path that reaches the end of a body returns zero: the C back end
+            // zero-initialises its result accumulator for the same reason, since a
+            // function the checker accepted may reach no `RETURN` at all (W8.4)
+            // and the report defines no value for that path.
             if !l.ended() {
                 if result.is_some() {
-                    let zero = l.bcx.ins().iconst(I32, 0);
+                    let rty = self.value_type(result.unwrap_or(TypeId(0))).unwrap_or(I32);
+                    let zero = if rty == types::F32 {
+                        l.bcx.ins().f32const(0.0)
+                    } else {
+                        l.bcx.ins().iconst(rty, 0)
+                    };
                     l.bcx.ins().return_(&[zero]);
                 } else {
                     l.bcx.ins().return_(&[]);
                 }
             }
-            // Sealing at the end rather than block by block is the frontend's
-            // own lazy mode, which is what a lowering that reaches a loop's
-            // header after the back edge, or an `IF`'s join after its arms,
-            // wants: the SSA construction then resolves the block arguments in
-            // one pass instead of guessing at each branch.
             l.bcx.seal_all_blocks();
             l.bcx.finalize(l.b.obj.target_config());
         }
-        // A codegen failure here is a bug in *this* file — the module checked
-        // and the lowering is what wrote the IR — and the driver is handed the
-        // Debug form, because the `Display` of a verifier failure is the words
-        // "Verifier errors" and nothing else: the instruction index and the type
-        // it got wrong are the diagnosis.
         self.obj
             .define_function(id, &mut ctx)
             .map_err(|e| host(format!("{e:?}")))
@@ -1306,6 +1755,22 @@ struct Lower<'b, 'f, 'a> {
     roots: HashMap<String, (ir::GlobalValue, i32)>,
     /// The type of every local, a value local or a region one.
     local_tys: HashMap<String, TypeId>,
+    /// A `VAR` parameter, or a structured value parameter: what the body names is
+    /// the storage the caller passed (the caller's own for a `VAR`, a copy of the
+    /// actual for a value).
+    var_params: HashMap<String, (ir::Value, TypeId)>,
+    /// An open-array parameter: the element pointer, the length the caller
+    /// passed, and the element type (report §10.1's hidden length).
+    open: HashMap<String, (ir::Value, ir::Value, TypeId)>,
+    /// The data object of every string literal the body mentions, by its byte.
+    strings: HashMap<u32, ir::GlobalValue>,
+    /// The procedures of other modules the body calls, by their symbol, and the
+    /// variables of other modules it reads (`Oberon.Log` is one: an interface's
+    /// variable is the defining module's storage).
+    imported: HashMap<String, ir::FuncRef>,
+    imported_vars: HashMap<String, ir::GlobalValue>,
+    /// The type each of those variables has, as the interface declares it.
+    imported_var_tys: HashMap<String, TypeId>,
     /// The narrowing a type-`CASE` arm gives the case variable (report §9.5).
     narrow: Vec<HashMap<String, TypeId>>,
     /// The result type, which is what `RETURN` answers with.
@@ -1323,6 +1788,13 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         vars: HashMap<String, Variable>,
         slots: HashMap<String, ir::Value>,
         local_tys: HashMap<String, TypeId>,
+        var_params: HashMap<String, (ir::Value, TypeId)>,
+        open: HashMap<String, (ir::Value, ir::Value, TypeId)>,
+        strings: HashMap<u32, ir::GlobalValue>,
+        imported: HashMap<String, ir::FuncRef>,
+        imported_vars: HashMap<String, ir::GlobalValue>,
+    // (the types of those variables travel with them)
+    imported_var_tys: HashMap<String, TypeId>,
         gv: HashMap<String, ir::GlobalValue>,
         frefs: HashMap<String, ir::FuncRef>,
         rt: HashMap<Rt, ir::FuncRef>,
@@ -1336,13 +1808,19 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             bcx,
             vars,
             slots,
+            local_tys,
+            var_params,
+            open,
+            strings,
+            imported,
+            imported_vars,
+            imported_var_tys,
             gv,
             frefs,
             rt,
             msgs,
             descs,
             roots,
-            local_tys,
             narrow: Vec::new(),
             result,
             loops: Vec::new(),
@@ -1415,6 +1893,52 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     fn assign(&mut self, target: &Designator, value: &Expr) -> Result<(), Diagnostic> {
         let place = self.place(target, target.span)?;
         let ty = place_ty(&place);
+        // A `CHAR` array is copied by the runtime's bounded helpers (§9.5): a
+        // string literal is length-checked and zero-padded, and an array-to-array
+        // copy moves at most the destination's length and implies no terminator
+        // (R14).
+        if let Type::Array { len, elem } = self.b.types.get(ty) {
+            if self.b.types.is_char(*elem) {
+                let (len, _) = (*len, *elem);
+                let (dst, _) = self.address_of(&place, target.span)?;
+                match &value.kind {
+                    ExprKind::Str(text) => {
+                        let src = self.string_ptr(text, value.span)?;
+                        let n = self.bcx.ins().iconst(I32, i64::from(len));
+                        let fref = self.rt_ref(Rt::StrCopy);
+                        self.bcx.ins().call(fref, &[dst, n, src]);
+                        return Ok(());
+                    }
+                    ExprKind::Designator(_) => {
+                        // A full-length array-to-array copy is a byte copy and
+                        // implies no terminator (R14) — the C back end's struct
+                        // assignment. There is no runtime helper for it: the
+                        // design's table names an `rt_charcopy`, but the header
+                        // has only `rt_strcopy`/`rt_charcmp`, because C never
+                        // needed one.
+                        let (src, _) = self.char_array_operand(value)?;
+                        let size = len as u64;
+                        self.bcx.emit_small_memory_copy(
+                            self.b.obj_config(),
+                            dst,
+                            src,
+                            size,
+                            1,
+                            1,
+                            false,
+                            ir::MemFlagsData::new(),
+                        );
+                        return Ok(());
+                    }
+                    _ => {
+                        return Err(not_yet(
+                            "this value assigned to a character array",
+                            value.span,
+                        ))
+                    }
+                }
+            }
+        }
         // A record is a region, not a value: assigning one is a copy, and
         // `rt_rec_copy` is the call the C back end makes for an up-cast — it
         // moves the fields and leaves the destination's own descriptor in place,
@@ -1456,8 +1980,36 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// record's or array's frame slot, or a heap object reached through a
     /// pointer.
     fn place(&mut self, d: &Designator, span: Span) -> Result<Place, Diagnostic> {
+        // A qualified base is another module's variable, which this object
+        // imports: its type is the interface's.
+        if d.base.len() == 2 {
+            let symbol = format!("{}__{}", d.base[0], mangle(&d.base[1]));
+            let gv = *self.imported_vars.get(&symbol).ok_or_else(|| {
+                not_yet(
+                    &format!("the designator `{}`", d.base.join(".")),
+                    span,
+                )
+            })?;
+            let ty = *self.imported_var_tys.get(&symbol).ok_or_else(|| {
+                not_yet(&format!("the type of `{}`", d.base.join(".")), span)
+            })?;
+            let mut place = Place::Addr(self.bcx.ins().symbol_value(self.b.ptr, gv), ty);
+            for sel in &d.sels {
+                place = self.select(place, sel, d.span)?;
+            }
+            return Ok(place);
+        }
         let name = self.base_name(d)?;
-        let mut place = if let Some(var) = self.vars.get(name).copied() {
+        let mut place = if let Some((ptr, ty)) = self.var_params.get(name).copied() {
+            // A `VAR` parameter is the caller's storage; a structured *value*
+            // parameter is the address of the copy the caller made. Either way
+            // the body addresses through what it was handed.
+            Place::Addr(ptr, self.narrowed(name, ty))
+        } else if let Some((ptr, _len, elem)) = self.open.get(name).copied() {
+            // An open array is its element pointer: the first selector must be an
+            // index, which adds the checked stride to it.
+            Place::Addr(ptr, self.narrowed(name, elem))
+        } else if let Some(var) = self.vars.get(name).copied() {
             let ty = self.local_ty(name, span)?;
             Place::Local(var, self.narrowed(name, ty))
         } else if let Some(addr) = self.slots.get(name).copied() {
@@ -1541,6 +2093,29 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 ))
             }
             Selector::Index(ix) => {
+                // An open array's bound is the *hidden length* the caller passed
+                // (report §10.1), not a dimension of a fixed type — which is what
+                // makes an index past the end of a shorter actual trap.
+                if let Some((ptr, len, elem)) = self.open_by_place(&place) {
+                    if ix.len() != 1 {
+                        return Err(not_yet(
+                            &format!("an open array with {} subscripts", ix.len()),
+                            span,
+                        ));
+                    }
+                    let i = self.expr(&ix[0])?;
+                    let i = if self.b.checks.index {
+                        let at = self.bcx.ins().iconst(I32, i64::from(span.lo));
+                        self.call_rt(Rt::Index, &[i, len, at])
+                            .expect("a bounds check answers with the index")
+                    } else {
+                        i
+                    };
+                    let stride = self.b.layout(elem).map(|l| l.size).unwrap_or(0);
+                    let wide = self.bcx.ins().sextend(self.b.ptr, i);
+                    let off = self.bcx.ins().imul_imm_s(wide, stride as i64);
+                    return Ok(Place::Addr(self.bcx.ins().iadd(ptr, off), elem));
+                }
                 let (base, ty) = self.base_of(&place, span)?;
                 let (addr, elem) = self.index_addr(base, ty, ix, span)?;
                 Ok(Place::Addr(addr, elem))
@@ -1560,6 +2135,16 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                     .qident_type(q)
                     .ok_or_else(|| not_yet("a guard's type", span))?;
                 self.guard_check(&place, t, span)?;
+                let subject_is_ptr =
+                    matches!(self.b.types.get(place_ty(&place)), Type::Pointer { .. });
+                let target_is_ptr = matches!(self.b.types.get(t), Type::Pointer { .. });
+                if subject_is_ptr && !target_is_ptr {
+                    // `p(S)`: the view is the object `p` points at, so what the
+                    // rest of the designator works on is the pointer read as the
+                    // record — the C back end's `(*((S *)(void *)(p)))`.
+                    let (p, _) = self.pointer_value(&place, span)?;
+                    return Ok(Place::Addr(p, t));
+                }
                 Ok(match place {
                     Place::Local(v, _) => Place::Local(v, t),
                     Place::Addr(a, _) => Place::Addr(a, t),
@@ -1569,6 +2154,20 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 Err(not_yet("a call inside a designator", span))
             }
         }
+    }
+
+    /// The open array a place came from, when it is one: the element pointer, the
+    /// hidden length, and the element type. A place that names an open-array
+    /// parameter directly is the only case — a field or an element of one is a
+    /// fixed type again.
+    fn open_by_place(&self, place: &Place) -> Option<(ir::Value, ir::Value, TypeId)> {
+        let Place::Addr(ptr, _) = place else {
+            return None;
+        };
+        self.open
+            .values()
+            .find(|(p, _, _)| p == ptr)
+            .copied()
     }
 
     /// The base a `Field` or an `Index` selector works on: for a pointer the
@@ -1822,11 +2421,16 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             return Ok(());
         }
         let subject = place_ty(place);
-        let by_ptr = matches!(self.b.types.get(target), Type::Pointer { .. });
-        let held = if by_ptr {
-            matches!(self.b.types.get(subject), Type::Pointer { .. })
+        // Four spellings, three of them legal (report §8.1): a pointer tested
+        // against a pointer or against the *record* it points at, and a record
+        // tested against a record. A pointer subject is read through its NIL
+        // check first, which is what the C back end's pointer spelling does.
+        let subject_is_ptr = matches!(self.b.types.get(subject), Type::Pointer { .. });
+        let target_is_ptr = matches!(self.b.types.get(target), Type::Pointer { .. });
+        let held = if subject_is_ptr {
+            true
         } else {
-            matches!(self.b.types.get(subject), Type::Record { .. })
+            !target_is_ptr && matches!(self.b.types.get(subject), Type::Record { .. })
         };
         if !held {
             return Err(not_yet(
@@ -1840,7 +2444,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         }
         let target_desc = self.desc_ptr(target, span)?;
         let fref = self.rt_ref(Rt::Is);
-        let desc = if by_ptr {
+        let desc = if subject_is_ptr {
             let (p, _) = self.pointer_value(place, span)?;
             let some = self.bcx.create_block();
             let none = self.bcx.create_block();
@@ -2447,10 +3051,20 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// A call used as a statement: a procedure of this module, or one of the
     /// predeclared proper procedures this slice lowers — `ASSERT` and `NEW`.
     fn call_stmt(&mut self, d: &Designator) -> Result<(), Diagnostic> {
-        let name = self.base_name(d)?;
         let args = self.call_args(d)?.to_vec();
+        // A call to another module's procedure: the symbol is the C back end's
+        // (`Texts__WriteString`), and its ABI is the interface's — the checker
+        // recorded the callee's type at this call site (`call_types`).
+        if d.base.len() == 2 {
+            let symbol = format!("{}__{}", d.base[0], mangle(&d.base[1]));
+            let fref = self.imported_ref(&symbol, d)?;
+            let vals = self.pass_args(d, &args)?;
+            self.bcx.ins().call(fref, &vals);
+            return Ok(());
+        }
+        let name = self.base_name(d)?;
         if let Some(fref) = self.frefs.get(name).copied() {
-            let vals = self.arg_values(&args)?;
+            let vals = self.pass_args(d, &args)?;
             self.bcx.ins().call(fref, &vals);
             return Ok(());
         }
@@ -2469,10 +3083,45 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                     return Ok(());
                 }
                 "NEW" => return self.new_stmt(&args, d.span),
+                "INC" | "DEC" | "INCL" | "EXCL" => {
+                    let target = args
+                        .first()
+                        .ok_or_else(|| not_yet(&format!("{name} without an operand"), d.span))?;
+                    let place = self.actual_place(target)?;
+                    let ty = place_ty(&place);
+                    let amount = match args.get(1) {
+                        Some(k) => self.expr(k)?,
+                        None => self.bcx.ins().iconst(I32, 1),
+                    };
+                    let step = if self.b.types.is_set(ty) {
+                        // `INCL`/`EXCL` add or remove one bit: the mask of the
+                        // element `k` is `{k .. k}`, which is the runtime's rule.
+                        let fref = self.rt_ref(Rt::Set);
+                        let call = self.bcx.ins().call(fref, &[amount, amount]);
+                        self.bcx.inst_results(call)[0]
+                    } else if self.b.value_type(ty) == Some(types::I8) {
+                        self.bcx.ins().ireduce(types::I8, amount)
+                    } else {
+                        amount
+                    };
+                    let (current, _) = self.read_place(&place, d.span)?;
+                    let next = if name == "DEC" {
+                        self.bcx.ins().isub(current, step)
+                    } else if name == "EXCL" {
+                        let not = self.bcx.ins().bxor_imm_s(step, -1);
+                        self.bcx.ins().band(current, not)
+                    } else {
+                        self.bcx.ins().iadd(current, step)
+                    };
+                    return self.write_place(&place, next, d.span);
+                }
                 _ => {}
             }
         }
-        Err(not_yet(&format!("the call to `{name}`"), d.span))
+        Err(not_yet(
+            &format!("the call to `{name}` ({} selectors, base {:?})", d.sels.len(), d.base),
+            d.span,
+        ))
     }
 
     /// A call's formal actual parameters: the resolver turned the parenthesised
@@ -2480,16 +3129,163 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     fn call_args<'d>(&self, d: &'d Designator) -> Result<&'d [Expr], Diagnostic> {
         match d.sels.as_slice() {
             [Selector::Call(args)] => Ok(args),
-            _ => Err(not_yet(&format!("the call `{}`", d.base.join(".")), d.span)),
+            // A parameterless procedure is called without parentheses (report
+            // §9.2), so the resolver has no `Call` selector to make.
+            [] => Ok(&[]),
+            other => Err(not_yet(
+                &format!("the call `{}` ({other:?})", d.base.join(".")),
+                d.span,
+            )),
         }
     }
 
-    fn arg_values(&mut self, args: &[Expr]) -> Result<Vec<ir::Value>, Diagnostic> {
-        let mut vals = Vec::with_capacity(args.len());
-        for a in args {
-            vals.push(self.expr(a)?);
+    /// A call's actual parameters, expanded to the ABI the callee expects
+    /// (DESIGN §9.7): a value is the value, a `VAR` actual is the caller's
+    /// address, a structured value actual is a copy the caller makes and passes
+    /// the address of, and an open array is a pointer and its length. The callee's
+    /// formals come from the checker (`call_types`, keyed by the designator),
+    /// which is where the C back end reads them too — an imported procedure's
+    /// are not in this module.
+    fn pass_args(&mut self, d: &Designator, args: &[Expr]) -> Result<Vec<ir::Value>, Diagnostic> {
+        // A procedure of this module: its formals are the ones it was declared
+        // with. Another module's: the checker recorded the callee's type at this
+        // call site (`call_types`), which is the same source the C back end reads.
+        let local = if d.base.len() == 1 {
+            self.b.proc_formals.get(&d.base[0]).cloned()
+        } else {
+            None
+        };
+        let params: Vec<crate::types::Param> = match local {
+            Some(formals) => formals
+                .iter()
+                .map(|f| crate::types::Param {
+                    by_var: f.by_var,
+                    ty: f.ty,
+                })
+                .collect(),
+            None => {
+                let pty = self
+                    .b
+                    .sema
+                    .call_types
+                    .get(&span_key(d.span))
+                    .copied()
+                    .ok_or_else(|| {
+                        not_yet(&format!("the call `{}`", d.base.join(".")), d.span)
+                    })?;
+                match self.b.types.get(pty) {
+                    Type::Proc { params, .. } => params.clone(),
+                    _ => return Err(not_yet("a call to a non-procedure", d.span)),
+                }
+            }
+        };
+        let mut out = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            let Some(pm) = params.get(i) else { break };
+            match self.b.types.get(pm.ty) {
+                Type::OpenArray { elem } => {
+                    let elem = *elem;
+                    let (ptr, len) = self.open_actual(arg, elem)?;
+                    out.push(ptr);
+                    out.push(len);
+                }
+                _ if pm.by_var => {
+                    let place = self.actual_place(arg)?;
+                    let (addr, _) = self.address_of(&place, arg.span)?;
+                    out.push(addr);
+                }
+                Type::Record { .. } | Type::Array { .. } => {
+                    // A structured value parameter is a copy the *caller* makes
+                    // (report §10.1): the callee may write to it, and the actual
+                    // must not see that. The copy is the formal's size, which is
+                    // what a C struct assignment of the formal's type does.
+                    let place = self.actual_place(arg)?;
+                    let (src, _) = self.address_of(&place, arg.span)?;
+                    let size = self.b.layout(pm.ty).map(|l| l.size).ok_or_else(|| {
+                        not_yet("a copy of an argument without a layout", arg.span)
+                    })?;
+                    let align = self.b.type_align(pm.ty).trailing_zeros() as u8;
+                    let slot = self.bcx.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        size as u32,
+                        align,
+                    ));
+                    let dst = self.bcx.ins().stack_addr(self.b.ptr, slot, 0);
+                    // The two sides are fresh locals and a caller's actual, so
+                    // the copy is not assumed to be non-overlapping — the C back
+                    // end's struct assignment is `memmove`'s contract.
+                    self.bcx.emit_small_memory_copy(
+                        self.b.obj_config(),
+                        dst,
+                        src,
+                        size,
+                        align,
+                        align,
+                        false,
+                        ir::MemFlagsData::new(),
+                    );
+                    out.push(dst);
+                }
+                _ => out.push(self.expr(arg)?),
+            }
         }
-        Ok(vals)
+        Ok(out)
+    }
+
+    /// A `VAR` or structured actual: a designator, whose place the caller hands
+    /// over (its storage, or a copy of it).
+    fn actual_place(&mut self, arg: &Expr) -> Result<Place, Diagnostic> {
+        match &arg.kind {
+            ExprKind::Designator(d) => self.place(d, arg.span),
+            _ => Err(not_yet("this actual parameter, which needs a place", arg.span)),
+        }
+    }
+
+    /// An open-array actual: the element pointer and the length. A string
+    /// literal is a data object, a fixed array (or a field, or an element of one)
+    /// is its own storage with its outermost dimension's length, and a formal
+    /// that is itself an open array is forwarded unchanged.
+    fn open_actual(&mut self, arg: &Expr, _elem: TypeId) -> Result<(ir::Value, ir::Value), Diagnostic> {
+        match &arg.kind {
+            ExprKind::Str(text) => {
+                let ptr = self.string_ptr(text, arg.span)?;
+                let len = self.bcx.ins().iconst(I32, text.len() as i64 + 1);
+                Ok((ptr, len))
+            }
+            ExprKind::Designator(d) => {
+                let name = self.base_name(d)?;
+                if d.sels.is_empty() {
+                    if let Some((ptr, len, _)) = self.open.get(name).copied() {
+                        return Ok((ptr, len));
+                    }
+                }
+                let place = self.place(d, arg.span)?;
+                let (addr, ty) = self.address_of(&place, arg.span)?;
+                let n = self
+                    .b
+                    .array_dims(ty)
+                    .map(|(dims, _)| dims[0])
+                    .ok_or_else(|| not_yet("an open array from a non-array", arg.span))?;
+                let len = self.bcx.ins().iconst(I32, i64::from(n));
+                Ok((addr, len))
+            }
+            _ => Err(not_yet("this open-array actual", arg.span)),
+        }
+    }
+
+    /// The reference to another module's procedure, which the body's walk
+    /// declared.
+    fn imported_ref(
+        &self,
+        symbol: &str,
+        d: &Designator,
+    ) -> Result<ir::FuncRef, Diagnostic> {
+        self.imported.get(symbol).copied().ok_or_else(|| {
+            not_yet(
+                &format!("the call to `{}`", d.base.join(".")),
+                d.span,
+            )
+        })
     }
 
     /// Whether a name is a module-level object of this module (a variable or a
@@ -2511,7 +3307,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         let name = self.base_name(d)?.to_string();
         if let Some(fref) = self.frefs.get(&name).copied() {
             let args = self.call_args(d)?.to_vec();
-            let vals = self.arg_values(&args)?;
+            let vals = self.pass_args(d, &args)?;
             let call = self.bcx.ins().call(fref, &vals);
             return self
                 .bcx
@@ -2535,9 +3331,59 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             // enough; the C path needs a helper for exactly the same reason.
             "ABS" => {
                 let x = self.expr(&args[0])?;
+                // `ABS` keeps its operand's type (report §10.2), and reads it
+                // once — which is why the C path needs a helper for the integer
+                // case and why this is a single IR conditional.
+                if self.b.is_real(self.type_of(&args[0], span)?) {
+                    return Ok(self.bcx.ins().fabs(x));
+                }
                 let neg = self.bcx.ins().ineg(x);
                 let below = self.bcx.ins().icmp_imm_s(IntCC::SignedLessThan, x, 0);
                 Ok(self.bcx.ins().select(below, neg, x))
+            }
+            // `FLOOR(x)` is `x DIV 2^0`'s cousin: the C back end truncates
+            // `rt_floor`'s float, so a value outside INTEGER's range is
+            // undefined there; here it saturates, which is a defined answer.
+            "FLOOR" => {
+                let x = self.expr(&args[0])?;
+                let floor = self.bcx.ins().floor(x);
+                Ok(self.bcx.ins().fcvt_to_sint_sat(I32, floor))
+            }
+            // `FLT(i)`: the C back end's `((float)(i))`.
+            "FLT" => {
+                let x = self.expr(&args[0])?;
+                Ok(self.bcx.ins().fcvt_from_sint(types::F32, x))
+            }
+            // `ORD` of a CHAR reads it *unsigned* (§9.5), and of a BOOLEAN is
+            // the 0/1 the C back end already holds.
+            "ORD" => {
+                let t = self.type_of(&args[0], span)?;
+                if let ExprKind::Str(text) = &args[0].kind {
+                    let first = text.as_bytes().first().copied().unwrap_or(0);
+                    return Ok(self.bcx.ins().iconst(I32, i64::from(first)));
+                }
+                let x = self.expr(&args[0])?;
+                if self.b.types.is_char(t) || self.b.types.is_char_like(t) {
+                    return Ok(self.bcx.ins().uextend(I32, x));
+                }
+                Ok(x)
+            }
+            // `CHR(x)` truncates like the C back end's `(char)x`.
+            "CHR" => {
+                let x = self.expr(&args[0])?;
+                Ok(self.bcx.ins().ireduce(types::I8, x))
+            }
+            // `LEN` of a fixed array is folded by the checker; of an open array
+            // it is the hidden length the caller passed (§9.2).
+            "LEN" => {
+                let name = match &args[0].kind {
+                    ExprKind::Designator(d) => d.base[0].clone(),
+                    _ => return Err(not_yet("LEN of this expression", span)),
+                };
+                match self.open.get(&name) {
+                    Some((_, len, _)) => Ok(*len),
+                    None => Err(not_yet("LEN of something that is not an array", span)),
+                }
             }
             "ODD" => {
                 let x = self.expr(&args[0])?;
@@ -2631,15 +3477,7 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     /// fall out of `branch`.
     fn truth(&mut self, e: &Expr) -> Result<ir::Value, Diagnostic> {
         match &e.kind {
-            ExprKind::Binary(op, l, r) if is_relation(*op) => {
-                let a = self.expr(l)?;
-                let b = self.expr(r)?;
-                // A pointer comparison is an address comparison, and the two
-                // operands are the same IR type because the checker made them the
-                // same Oberon type (an `INTEGER` against `NIL` never reaches here:
-                // `NIL` is only comparable with a pointer).
-                Ok(self.bcx.ins().icmp(relation_cc(*op), a, b))
-            }
+            ExprKind::Binary(op, l, r) if is_relation(*op) => self.relation(*op, l, r, e.span),
             ExprKind::Unary(UnOp::Not, x) => {
                 let t = self.truth(x)?;
                 Ok(self.bcx.ins().bxor_imm_s(t, 1))
@@ -2650,6 +3488,80 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 Ok(self.bcx.ins().icmp_imm_s(IntCC::NotEqual, v, 0))
             }
         }
+    }
+
+    /// A relation as the `i8` a branch takes. The signedness follows the
+    /// operand type — a `CHAR` is read unsigned, which is what the C back end's
+    /// `(unsigned char)` casts are for, and report §8.2.4's ordinal order is the
+    /// same answer — a REAL comparison is `fcmp` (and so says false for a NaN,
+    /// as C does), and two character *arrays* go to the runtime's bounded
+    /// comparison (`rt_charcmp`, which touches neither operand past its length).
+    fn relation(
+        &mut self,
+        op: BinOp,
+        l: &Expr,
+        r: &Expr,
+        span: Span,
+    ) -> Result<ir::Value, Diagnostic> {
+        let lt = self.type_of(l, span)?;
+        if self.b.types.is_char_array(lt) {
+            let (a, na) = self.char_array_operand(l)?;
+            let (b, nb) = self.char_array_operand(r)?;
+            let fref = self.rt_ref(Rt::CharCmp);
+            let call = self.bcx.ins().call(fref, &[a, na, b, nb]);
+            let cmp = self.bcx.inst_results(call)[0];
+            let zero = self.bcx.ins().iconst(I32, 0);
+            return Ok(self.bcx.ins().icmp(relation_cc(op), cmp, zero));
+        }
+        let a = self.expr(l)?;
+        let b = self.expr(r)?;
+        let value_type = self.b.value_type(lt).unwrap_or(I32);
+        if value_type == types::F32 {
+            return Ok(self.bcx.ins().fcmp(float_cc(op), a, b));
+        }
+        let cc = if self.b.unsigned(lt) {
+            unsigned_cc(op)
+        } else {
+            relation_cc(op)
+        };
+        Ok(self.bcx.ins().icmp(cc, a, b))
+    }
+
+    /// The address of a character array and its length, for the bounded
+    /// comparison: a fixed array is its own storage, and a string literal is a
+    /// data object (which is what the C back end's literal is too).
+    fn char_array_operand(&mut self, e: &Expr) -> Result<(ir::Value, ir::Value), Diagnostic> {
+        match &e.kind {
+            ExprKind::Str(text) => {
+                let ptr = self.string_ptr(text, e.span)?;
+                let n = self.bcx.ins().iconst(I32, text.len() as i64 + 1);
+                Ok((ptr, n))
+            }
+            ExprKind::Designator(d) => {
+                let place = self.place(d, e.span)?;
+                let (addr, ty) = self.address_of(&place, e.span)?;
+                let n = self
+                    .b
+                    .types
+                    .array_len(ty)
+                    .map(|n| self.bcx.ins().iconst(I32, i64::from(n)))
+                    .unwrap_or_else(|| self.bcx.ins().iconst(I32, 0));
+                Ok((addr, n))
+            }
+            _ => Err(not_yet("a character array in a comparison", e.span)),
+        }
+    }
+
+    /// The address of a string literal's bytes, as a data object the module
+    /// carries (the C back end's literal is the same bytes in `.rodata`).
+    fn string_ptr(&mut self, text: &str, span: Span) -> Result<ir::Value, Diagnostic> {
+        let gv = *self.strings.get(&span.lo).ok_or_else(|| {
+            not_yet(
+                &format!("the string {text:?} where a pointer is expected"),
+                span,
+            )
+        })?;
+        Ok(self.bcx.ins().symbol_value(self.b.ptr, gv))
     }
 
     /// Branch on a condition. `&` and `OR` become control flow here, and that is
@@ -2689,6 +3601,46 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             ExprKind::Int(v) => Ok(self.bcx.ins().iconst(I32, i64::from(*v as i32))),
             ExprKind::Bool(b) => Ok(self.bcx.ins().iconst(I32, i64::from(*b))),
             ExprKind::Nil => Ok(self.bcx.ins().iconst(self.b.ptr, 0)),
+            // The C back end writes `((float)3.5f)`, so a literal is narrowed to
+            // the back end's REAL here too.
+            ExprKind::Real(v) => Ok(self.bcx.ins().f32const(*v as f32)),
+            ExprKind::Char(c) => Ok(self.bcx.ins().iconst(types::I8, i64::from(*c))),
+            // A string where a value is expected is a one-character string read
+            // as its `CHAR` (report §10.1's `ch <= "9"`, `ORD("0")`), which is the
+            // C back end's `"x"[0]`. A longer one is a character *array*, and an
+            // array's value is a copy — the assignment's business, not an
+            // expression's.
+            ExprKind::Str(text) => {
+                let first = text.as_bytes().first().copied().unwrap_or(0);
+                if text.len() <= 1 {
+                    Ok(self.bcx.ins().iconst(types::I8, i64::from(first)))
+                } else {
+                    Err(not_yet("a string used as a value", e.span))
+                }
+            }
+            // `{a .. b}`: the C back end ORs one `rt_set` call per element, and
+            // the mask arithmetic (clamping, and the width-32 case) is the
+            // runtime's.
+            ExprKind::Set(elems) => {
+                let fref = self.rt_ref(Rt::Set);
+                let mut bits: Option<ir::Value> = None;
+                for el in elems {
+                    let lo = self.expr(&el.lo)?;
+                    let hi = match &el.hi {
+                        Some(h) => self.expr(h)?,
+                        None => lo,
+                    };
+                    let call = self.bcx.ins().call(fref, &[lo, hi]);
+                    let one = self.bcx.inst_results(call)[0];
+                    bits = Some(match bits {
+                        None => one,
+                        Some(b) => self.bcx.ins().bor(b, one),
+                    });
+                }
+                // `{}` is the empty set, and a SET literal with no elements has
+                // no calls at all.
+                Ok(bits.unwrap_or_else(|| self.bcx.ins().iconst(I32, 0)))
+            }
             ExprKind::Designator(d) => self.designator_value(d, e.span),
             ExprKind::TypeTest(x, q) => {
                 let target = self
@@ -2698,8 +3650,13 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
             }
             ExprKind::Unary(op, x) => {
                 let v = self.expr(x)?;
+                let ty = self.type_of(x, e.span)?;
                 Ok(match op {
                     UnOp::Plus => v,
+                    // `-` on a REAL is the float negate; on a SET it is the
+                    // complement (report §8.2.3), which is every bit of the word.
+                    UnOp::Neg if self.b.is_real(ty) => self.bcx.ins().fneg(v),
+                    UnOp::Neg if self.b.types.is_set(ty) => self.bcx.ins().bxor_imm_s(v, -1),
                     UnOp::Neg => self.bcx.ins().ineg(v),
                     // `~` is the boolean negation (report §8.2.1) and a BOOLEAN
                     // is 0 or 1, so one bit does it.
@@ -2707,7 +3664,6 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
                 })
             }
             ExprKind::Binary(op, l, r) => self.binary_value(*op, l, r, e),
-            other => Err(not_yet(expression_name(other), e.span)),
         }
     }
 
@@ -2724,8 +3680,52 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         if is_relation(op) || matches!(op, BinOp::And | BinOp::Or) {
             return self.bool_value(whole);
         }
+        let lt = self.type_of(l, whole.span)?;
         let a = self.expr(l)?;
         let b = self.expr(r)?;
+        // A REAL arithmetic is the float instructions, and the C back end's
+        // checker guarantees both operands are the same type (a mixed
+        // INTEGER/REAL expression is a diagnostic there, not a conversion).
+        if self.b.is_real(lt) {
+            return Ok(match op {
+                BinOp::Add => self.bcx.ins().fadd(a, b),
+                BinOp::Sub => self.bcx.ins().fsub(a, b),
+                BinOp::Mul => self.bcx.ins().fmul(a, b),
+                BinOp::Div => self.bcx.ins().fdiv(a, b),
+                other => {
+                    return Err(not_yet(
+                        &format!("the operator {other:?} on REAL"),
+                        whole.span,
+                    ))
+                }
+            });
+        }
+        // report §8.2.3: with a SET operand, `+ - * /` are union, difference,
+        // intersection and symmetric difference.
+        if self.b.types.is_set(lt) {
+            return Ok(match op {
+                BinOp::Add => self.bcx.ins().bor(a, b),
+                BinOp::Sub => {
+                    let not = self.bcx.ins().bxor_imm_s(b, -1);
+                    self.bcx.ins().band(a, not)
+                }
+                BinOp::Mul => self.bcx.ins().band(a, b),
+                BinOp::Div => self.bcx.ins().bxor(a, b),
+                other => {
+                    return Err(not_yet(
+                        &format!("the operator {other:?} on SET"),
+                        whole.span,
+                    ))
+                }
+            });
+        }
+        // `x IN s` is the mask test: bit `x & 31` of the word (§9.5).
+        if op == BinOp::In {
+            let shift = self.bcx.ins().band_imm_s(a, 31);
+            let word = self.bcx.ins().ushr(b, shift);
+            let v = self.bcx.ins().band_imm_s(word, 1);
+            return Ok(self.bcx.ins().uextend(I32, v));
+        }
         Ok(match op {
             BinOp::Add => self.bcx.ins().iadd(a, b),
             BinOp::Sub => self.bcx.ins().isub(a, b),
@@ -2865,6 +3865,33 @@ fn is_relation(op: BinOp) -> bool {
 
 /// The fragment's relations are over `INTEGER`, which is signed (DESIGN §9.2),
 /// and over `BOOLEAN`, where equality is equality either way.
+/// The unsigned pair: a `CHAR` or a `BYTE` is read as its ordinal (report
+/// §8.2.4), and a `SET` is a `uint32_t` mask.
+fn unsigned_cc(op: BinOp) -> IntCC {
+    match op {
+        BinOp::Eq => IntCC::Equal,
+        BinOp::Ne => IntCC::NotEqual,
+        BinOp::Lt => IntCC::UnsignedLessThan,
+        BinOp::Le => IntCC::UnsignedLessThanOrEqual,
+        BinOp::Gt => IntCC::UnsignedGreaterThan,
+        _ => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
+/// The float pair, for a REAL comparison: `fcmp` says false for a NaN, which is
+/// what C's `<` on floats says too.
+fn float_cc(op: BinOp) -> ir::condcodes::FloatCC {
+    use ir::condcodes::FloatCC as F;
+    match op {
+        BinOp::Eq => F::Equal,
+        BinOp::Ne => F::NotEqual,
+        BinOp::Lt => F::LessThan,
+        BinOp::Le => F::LessThanOrEqual,
+        BinOp::Gt => F::GreaterThan,
+        _ => F::GreaterThanOrEqual,
+    }
+}
+
 fn relation_cc(op: BinOp) -> IntCC {
     match op {
         BinOp::Eq => IntCC::Equal,
@@ -2886,19 +3913,3 @@ fn case_label(l: &CaseLabel, span: Span) -> Result<i32, Diagnostic> {
     }
 }
 
-/// The name a refused expression reads with.
-fn expression_name(e: &ExprKind) -> &'static str {
-    match e {
-        ExprKind::Real(_) => "a REAL literal",
-        ExprKind::Char(_) => "a CHAR literal",
-        ExprKind::Str(_) => "a string",
-        ExprKind::Nil => "NIL",
-        ExprKind::Set(_) => "a SET",
-        ExprKind::TypeTest(..) => "an IS test",
-        ExprKind::Int(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Designator(_)
-        | ExprKind::Unary(..)
-        | ExprKind::Binary(..) => "this expression",
-    }
-}
