@@ -1013,6 +1013,19 @@ found two holes (W7.1, W7.2) and confirmed two static checks are in place.
 | a failed *type guard* | traps with the offset, and the pointer spelling tests `v != NULL` first (§9.5) |
 | a **plain dereference of `NIL`** (`p.x := 1`, `p^ := p^`) | **nothing**: no check is emitted, so the process dies of SIGSEGV with no message — see W7.1 |
 
+**W7.2 a guard on a VAR record parameter of an *imported* type** — **open, found by
+`e2e`'s mixed-back-end rows (the layout question that produced them)**
+Why: the reclassification of `b(T0)` — guard or call, D2/D3 — works for a parameter
+whose record type is declared in the same module and not for an imported one, so the
+one legal way to reach an imported type's descriptor from a client is refused:
+`PROCEDURE P*(VAR b: Def.Base); BEGIN b(Def.Ext).x := 1 END P` reports "a designator
+cannot be applied twice: the result of a call cannot be selected from" (§8.1), while
+the identical procedure with `Base`/`Ext` declared locally checks clean. Fixing it
+needs care — a guard mistaken for a call is worse than a refusal — so it is its own
+item, and the shape belongs in `e2e` with the refusal removed.
+Done when: that procedure checks, runs, and its guard reads the descriptor of the
+imported type.
+
 **W7.1 a plain pointer dereference is not `NIL`-checked — done**
 Why: `rt_trap`'s own comment in the emitted header lists its reasons as
 "bounds, NIL, case, ASSERT", and §9.5 checks `NIL` on the *guard* path, but the

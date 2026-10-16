@@ -625,7 +625,7 @@ impl<'a> Emitter<'a> {
                 };
                 let _ = writeln!(
                     self.descriptors,
-                    "const ObDesc TD_{name} = {{ {base_ref}, {}u, \"{name}\", {fields_ref}, {} }};",
+                    "extern const ObDesc TD_{name};\nconst ObDesc TD_{name} = {{ {base_ref}, {}u, \"{name}\", {fields_ref}, {} }};",
                     t.0,
                     map.len()
                 );

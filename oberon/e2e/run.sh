@@ -1107,8 +1107,8 @@ fi
 # *defined* symbols are compared: what each calls is its own business (they reach
 # different runtime helpers), but a name that differs or is missing would be an
 # ABI disagreement, and an undefined one would fail the link below.
-nm "$MIX/c/MixLib.o" | awk '$2 ~ /^[TDB]$/ {print $2, $3}' | sort > "$MIX/sym.c"
-nm "$MIX/k/MixLib.o" | awk '$2 ~ /^[TDB]$/ {print $2, $3}' | sort > "$MIX/sym.k"
+nm "$MIX/c/MixLib.o" | awk '$2 ~ /^[TDBR]$/ {print ($2 == "R" ? "D" : $2), $3}' | sort > "$MIX/sym.c"
+nm "$MIX/k/MixLib.o" | awk '$2 ~ /^[TDBR]$/ {print ($2 == "R" ? "D" : $2), $3}' | sort > "$MIX/sym.k"
 check "mixed-backend-same-symbols[init, load, Take, Twice, its variable]" "same" \
     "$(cmp -s "$MIX/sym.c" "$MIX/sym.k" && echo same || echo differ)"
 check "mixed-backend-symbols-present" "yes" "$([ "$(wc -l < "$MIX/sym.k")" -ge 5 ] && echo yes || echo no)"

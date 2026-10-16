@@ -321,6 +321,10 @@ document for users:
 * `p(T)` — guard when `T` is a type.
 * `t(T).f`, `t(T)^` — guard followed by selectors.
 * `f(x)(y)` parses but is rejected by the checker ("designator applied twice").
+* The same rule fires on a *legal* shape: guarding a `VAR` record parameter whose
+  type is **imported** (`PROCEDURE P(VAR b: M.Base); … b(M.Ext).x …`) is taken as a
+  call and then "applied twice". A parameter of a type declared in the same module
+  is reclassified correctly, so the gap is the imported one (PLAN.md W7.2).
   The report does not define it either, so a diagnosed rejection is the honest
   behaviour.
 
@@ -1045,6 +1049,12 @@ Rules:
   `*(ObDesc **)p` is the same word whether `p` is a `Base *`, a `Derived *` or the
   address of a record variable — which is exactly what `IS`, a guard and a type
   `CASE` read.
+* A descriptor is emitted as `extern const ObDesc TD_M;` followed by its definition,
+  so it has the external linkage the header it is declared in promises. (A bare
+  `const` definition would be *internal* linkage in C — and `extern const … = {…}` on
+  one line is what `-Werror` rejects — so the pair is the shape.) A client module that
+  references an imported type's descriptor needs it, which is what `e2e`'s
+  `mixed-backend-*` rows compare with `nm`.
 * Every record **variable** carries its static type's descriptor in that word,
   and so does a `NEW`-allocated object: the descriptor sits *inside* the record,
   not in a header in front of it, so `sizeof` a record is its Oberon size plus
