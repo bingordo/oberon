@@ -1217,6 +1217,28 @@ else
     fail=$((fail + 1))
 fi
 
+# 27. Larger algorithm programs exercise recursive search and real-valued
+#     iterated-function computation in end-to-end builds. Their output values
+#     are fixed semantic results, not merely successful process exits.
+for complex_mod in NQueens Fern; do
+    case "$complex_mod" in
+        NQueens) expected=" 92" ;;
+        Fern) expected=" 100000  1018  85031  6919  7032  180  489  75  714  7632" ;;
+    esac
+    complex_out="$DRV/$complex_mod-$BACKEND_MODE"
+    if "$OBC" build "$complex_mod.mod" -I ../lib -I . --out "$complex_out" \
+            -o "$complex_out.bin" 2>"$complex_out.log"; then
+        if complex_got=$("$complex_out.bin" 2>&1); then
+            check "complex-program-runs[$complex_mod,$BACKEND_MODE]" "$expected" "$complex_got"
+        else
+            check "complex-program-runs[$complex_mod,$BACKEND_MODE]" "$expected" "process failed: $complex_got"
+        fi
+    else
+        echo "FAIL complex-program-builds[$complex_mod,$BACKEND_MODE]: $(tail -1 "$complex_out.log")"
+        fail=$((fail + 1))
+    fi
+done
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

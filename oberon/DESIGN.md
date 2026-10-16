@@ -3028,3 +3028,12 @@ build and run on both back ends. `lib/Out.mod` is the other half of the same ide
 the `Out` those programs import is a convention of the implementations rather than
 part of the report, so it is a module in a directory a build puts on the search
 path, not something the compiler knows.
+
+The larger program fixtures exercise more than module loading. `NQueens.mod`
+counts all eight-queen boards by recursive backtracking; `Fern.mod` adapts
+`lboasso/oberonc`'s four-transform Barnsley fern to headless output, preserving its
+deterministic random sequence and 100,000 affine iterations while reporting
+transform counts, coordinate bounds and a checksum in place of pixels. The latter
+runs identically on C and clif, including its `REAL` arithmetic and `FLOOR`
+conversions. The source attribution and complete MIT notice are in
+`e2e/THIRD_PARTY_NOTICES.txt`.
