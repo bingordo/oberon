@@ -1417,6 +1417,24 @@ module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`
 Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
+**W9.4 inlining, if it is wanted** — **open, named by `bench/run.sh`; the payoff is
+bounded and the policy is the work**
+Why: `bench/CallArray.mod` calls a procedure once per iteration and this back end emits
+the call. Cranelift ships the machinery but not the decision — `cranelift-codegen`'s
+`inline.rs` calls itself "inlining as a library", says compilation is per-function so it
+"does not know which functions are hot and which are cold", and leaves the choice to the
+embedder through an `Inline` trait; `Context::inline` is the entry point. Using it here
+means keeping every procedure's IR (this back end lowers each into its own `Context` and
+defines it, so no callee body survives), writing that policy — small, non-recursive,
+call sites one deep is the obvious start — and running the pass before finalising.
+Risks to state before anyone writes it: recursion needs a width or depth limit; inlining
+does not change `VAR` semantics, since the address is still the caller's, but it does
+change code size, and a bad policy costs more than it saves. The payoff is bounded: of
+the ~10x gap on that benchmark, inlining is one of three causes, and neither
+vectorisation nor the check lowering (W9.3) is affected by it.
+Done when: a benchmark says so — the call-heavy ratio moves and `e2e`, the corpus and
+the gate are unmoved.
+
 **W9.3 the second back end's runtime checks are calls, not branches** — **open, found
 by `bench/run.sh` (DESIGN §16)**
 Why: on `bench/CallArray.mod` the second back end runs at ~10x the C back end's time

@@ -2195,7 +2195,14 @@ loop with no calls and no arrays, the second back end runs at **1.1x–1.6x** th
 across runs, with the runtime checks on or off: straight-line code is close. On a loop
 that calls a procedure and indexes an array each iteration it is **~10x** without checks
 and **~21x** with them, and the reasons are structural rather than per-instruction. `gcc`
-inlines the call and vectorises the loop, which this back end does not do at all, and
+inlines the call and vectorises the loop. Neither happens here, and the first is not a
+switch that is off: Cranelift ships inlining *as a library* — `Context::inline`, with an
+`Inline` trait the embedder writes — and deliberately defines no heuristics for it,
+because its compilation is per-function and it "does not know which functions are hot and
+which are cold"; the policy is the embedder's. This back end lowers each procedure into
+its own `Context` and defines it, keeping no callee body to splice, so using it would
+mean retaining every procedure's IR, writing that policy and running the pass before
+finalising (PLAN.md W9.4). What is left *is* structural, and
 the checks are *calls* to `rt_index`/`rt_*` per access where the C back end's are an
 inline compare to a cold trap — which is why the ratio roughly doubles when they are on,
 and why that is a named item (PLAN.md W9.3) rather than a mystery. The loop-heavy ratios
