@@ -1,18 +1,17 @@
-//! The front-end façade and the driver's shared API (DESIGN §2, §3): the three
-//! phase crates tied together for the `obc`, `obgen` and `oberon-front`
-//! binaries. Everything a phase owns stays in that phase; this crate names the
-//! pipeline — parse, check, emit — and offers it as one call.
+//! The front-end facade and the driver's shared API (DESIGN 2, 3): the phase
+//! crates used by the `obc`, `obgen` and `oberon-front` binaries. Each phase
+//! defines its own work. This crate joins them into one pipeline: parse, check
+//! and emit.
 //!
-//! The crate is also where the front-end tests live: they exercise the phases
-//! through this façade, so a change in one phase is still tested against the
-//! others.
+//! The front-end tests also live here. They exercise the phases through this
+//! facade, so changes in one phase are checked against the others.
 
-use cgen::cgen::{emit_module_checked, interface_of, Checks};
+use cgen::cgen::{emit_module_checked, emit_module_checked_with_lines, interface_of, Checks};
 use sema::sema::Sema;
 
-// The façade re-exports the phase items its callers and its own tests name, so
-// the pipeline reads the same whether it is used from a binary or a test, and
-// so a phase can move without every caller changing.
+// The facade re-exports the phase items used by its callers and tests.
+// Binaries and tests use the same pipeline, and phases can move without
+// requiring every caller to change.
 pub use sema::resolve;
 pub use sema::sym;
 pub use sema::{check_module, check_module_recovering, check_module_recovering_dialect};
@@ -60,7 +59,7 @@ pub fn emit_c<'input>(
 
 /// The same, with the runtime checks under the caller's control: `-Ochecks=n`
 /// removes the index, `NIL` and guard checks and the type-`CASE` fallback
-/// (DESIGN §9.4, PLAN.md W3.1).
+/// (DESIGN 9.4, PLAN.md W3.1).
 pub fn emit_c_with_checks<'input>(
     input: &'input str,
     interfaces: &[sym::Interface],
@@ -76,17 +75,41 @@ pub fn emit_c_full<'input>(
     checks: Checks,
     dialect: Dialect,
 ) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
+    emit_c_impl(input, interfaces, checks, dialect, None)
+}
+
+/// Emit C with `#line` directives mapping source statements to `file`.
+pub fn emit_c_full_with_line_directives<'input>(
+    input: &'input str,
+    interfaces: &[sym::Interface],
+    checks: Checks,
+    dialect: Dialect,
+    file: &str,
+) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
+    emit_c_impl(input, interfaces, checks, dialect, Some(file))
+}
+
+fn emit_c_impl<'input>(
+    input: &'input str,
+    interfaces: &[sym::Interface],
+    checks: Checks,
+    dialect: Dialect,
+    source_file: Option<&str>,
+) -> Result<Result<(String, String), Vec<Diagnostic>>, ParseErr<'input>> {
     let mut m = parse_module_dialect(input, dialect)?;
     let sema = Sema::check_owned(&mut m, interfaces);
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return Ok(Err(sema.diags.clone()));
     }
-    let (c, h) = emit_module_checked(&m, &sema.types, &sema, checks);
+    let (c, h) = match source_file {
+        Some(file) => emit_module_checked_with_lines(&m, &sema.types, &sema, checks, input, file),
+        None => emit_module_checked(&m, &sema.types, &sema, checks),
+    };
     Ok(Ok((c, h)))
 }
 
 /// The same module through the Cranelift back end: an object file's bytes, or
-/// the diagnostics that say why not (DESIGN §16.2, PLAN.md W9.1).
+/// the diagnostics that say why not (DESIGN 16.2, PLAN.md W9.1).
 ///
 /// The two `Result`s are the C back end's too, and mean the same thing: the
 /// outer one is a parse failure, the inner one the module's diagnostics. A
@@ -109,11 +132,12 @@ pub fn emit_object_full<'input>(
 }
 
 /// The layout table `obc emit --layout` prints: the C ABI's size, alignment and
-/// member offsets for the module's `TYPE` section (DESIGN §16, `layout.rs`).
+/// member offsets for the module's `TYPE` section (DESIGN 16, `layout.rs`).
 ///
-/// The two `Result`s are the emitters': a parse failure outside, the module's
-/// diagnostics inside, so the driver reports a module that does not check
-/// exactly as it does for either back end.
+/// Both results work like those from the C emitter: the outer result reports a
+/// parse failure, and the inner result reports diagnostics for the module.
+/// Unsupported constructs arrive as diagnostics with spans. The driver can then
+/// show where and why they failed, just as it does for a type error.
 pub fn layout_table_full<'input>(
     input: &'input str,
     interfaces: &[sym::Interface],
@@ -156,8 +180,8 @@ REPEAT DEC(i); Texts.Write(W, a[i]) UNTIL i = 0
 BEGIN Texts.OpenWriter(W) END Out.
 "#;
 
-/// Declarations, types, control flow, sets, type tests and type guards --
-/// every construct the report describes, in one module.
+/// Declarations, types, control flow, sets, type tests and guards, all
+/// constructs described in the report, in one module.
 #[allow(dead_code)]
 const KITCHEN_SINK: &str = r#"
 MODULE Demo;
@@ -279,8 +303,8 @@ mod tests {
         assert_eq!(m.decls.vars.len(), 8);
         assert_eq!(m.decls.procs.len(), 2);
 
-        // Matrix is the report's abbreviation ARRAY 10 OF ARRAY 20 OF INTEGER
-        // spelled as two lengths; the AST keeps both dimensions.
+        // Matrix is the report's abbreviation ARRAY 10 OF ARRAY 20 OF INTEGER,
+        // spelled as two lengths. The AST keeps both dimensions.
         match &m.decls.types[1].ty {
             TypeExpr::Array { dims, elem, .. } => {
                 assert_eq!(dims.len(), 2);
@@ -307,8 +331,8 @@ mod tests {
         // `OPEN: ARRAY OF CHAR` is one open array of CHAR.
         assert_eq!(walk.params[2].ty.open, 1);
         assert_eq!(walk.params[2].ty.base, vec!["CHAR"]);
-        // `RETURN` is a statement now (W8.4), so what this pins is that the body
-        // has none — the report's tail clause was optional too.
+        // `RETURN` is a statement now (W8.4), so this confirms the body has
+        // none. The report's tail clause was optional too.
         assert!(walk
             .body
             .iter()
@@ -372,7 +396,7 @@ mod tests {
                    PROCEDURE f(a: INTEGER): INTEGER; BEGIN RETURN a END f;
                    BEGIN t := t(T); x := f(1) END M.";
         let m = parse_module(src).expect("guard and call must parse");
-        // `t(T)`: selector Args with one bare designator, no further selectors.
+        // `t(T)`: selector Args with one bare designator.
         let assign_stmt = &m.body[0];
         match &assign_stmt.kind {
             StmtKind::Assign { value, .. } => match &value.kind {
@@ -384,7 +408,7 @@ mod tests {
             },
             other => panic!("expected assignment, got {other:?}"),
         }
-        // `f(1)`: same shape, so the grammar needs no separate call rule.
+        // `f(1)`: the same shape lets the grammar use one call rule.
         match &m.body[1].kind {
             StmtKind::Assign { value, .. } => match &value.kind {
                 ExprKind::Designator(d) => {
@@ -409,9 +433,9 @@ mod tests {
 
     #[test]
     fn type_guard_can_be_followed_by_selectors() {
-        // The report's `t(CenterNode).subnode (Tree)`: a guard sits in the
-        // middle of a designator, which is why `( ... )` has to be a selector
-        // rather than a trailing "actual parameters" production.
+        // The report's `t(CenterNode).subnode (Tree)` puts a guard in the
+        // middle of a designator. So `( ... )` must be a selector rather than
+        // a trailing "actual parameters" production.
         let src = "MODULE M; VAR t: Tree; r: Node;
                    BEGIN r := t(CenterNode).subnode^.left END M.";
         let m = parse_module(src).expect("guarded designator must parse");
@@ -475,12 +499,12 @@ END M.
             other => panic!("expected a designator, got {other:?}"),
         };
 
-        // 0: `t := t(T)` - a single argument that names a type is a guard.
+        // 0: `t := t(T)` - an argument naming a type is a guard.
         let d = designator_of(&value_of(0));
         assert_eq!(d.base, vec!["t".to_string()]);
         assert_eq!(d.sels, vec![Sel::Guard(vec!["T".to_string()])]);
 
-        // 1: `x := g(1)` - a single argument that is not a type is a call.
+        // 1: `x := g(1)` - an argument that is not a type is a call.
         let d = designator_of(&value_of(1));
         assert_eq!(d.base, vec!["g".to_string()]);
         match &d.sels[..] {
@@ -527,9 +551,8 @@ END M.
             other => panic!("statement 5 is not a call: {other:?}"),
         }
 
-        // 6: `SYSTEM.SIZE(T)` - report §11.1's `SIZE` takes a *type*, so rule
-        // (b) would read `(T)` as a guard; the entry's name is what keeps it a
-        // call (DESIGN §9.10).
+        // 6: `SYSTEM.SIZE(T)` takes a type (report 11.1), so rule (b) would read
+        // `(T)` as a guard. The entry's name keeps it a call (DESIGN 9.10).
         let d = designator_of(&value_of(6));
         assert_eq!(d.base, vec!["SYSTEM".to_string(), "SIZE".to_string()]);
         match &d.sels[..] {
@@ -675,7 +698,7 @@ END M.
 
     #[test]
     fn an_inherited_private_field_and_a_qualified_label_behave() {
-        // Three defects found by review of the visibility rule, all in one place.
+        // Review found defects in three visibility cases, all covered here.
         let iface = sym::parse(
             "MODULE M\nVERSION 1\nTYPE Base = RECORD secret: INTEGER END\nTYPE Node = RECORD child*: RECORD hidden: INTEGER END; next*: POINTER TO Node END\nTYPE DerivedPtr = POINTER TO Derived\nTYPE Derived = RECORD (Base) extra*: INTEGER END\n",
         )
@@ -717,9 +740,9 @@ END M.
 
     #[test]
     fn a_private_field_of_an_imported_record_cannot_be_named() {
-        // ✔ rows 4 and 14, the private-field halves: a field declared without the
-        // report's `*` is private to its module (report §6.3), and the mark
-        // travels through the interface.
+        // Rows 4 and 14 cover the private-field cases: a field declared without
+        // the report's `*` is private to its module (report 6.3), and its mark
+        // is preserved in the interface.
         let iface = sym::parse(
             "MODULE Texts\nVERSION 1\nTYPE Buffer = ARRAY 64 OF CHAR\nTYPE Writer = RECORD buf: Buffer; pos*: INTEGER END\n",
         )
@@ -764,11 +787,27 @@ mod emit_tests {
     }
 
     #[test]
+    fn line_directives_map_nested_statements_to_source_lines() {
+        let src = "MODULE M;\nVAR x: INTEGER;\nBEGIN\n  IF x = 0 THEN\n    x := 1\n  END\nEND M.\n";
+        let (mapped, _) = emit_c_full_with_line_directives(
+            src,
+            &[],
+            Checks::ALL,
+            Dialect::Report,
+            "a\"b.mod",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mapped.contains("#line 4 \"a\\\"b.mod\""), "{mapped}");
+        assert!(mapped.contains("#line 5 \"a\\\"b.mod\""), "{mapped}");
+        assert!(!c_of(src).contains("#line"), "default C output changed");
+    }
+
+    #[test]
     fn a_pointer_access_is_checked_for_nil() {
-        // R21: `p.f` and `p^` used to be emitted as a plain dereference, so a NIL
-        // pointer faulted instead of trapping with a location. The check is part
-        // of the access, which is why an assignment to a field of a pointer
-        // target still compiles.
+        // R21: `p.f` and `p^` used to be plain dereferences, so NIL caused a
+        // fault instead of a location-aware trap. The check is part of the
+        // access. An assignment to a pointer target's field still compiles.
         let src = "MODULE M;\n  TYPE R = RECORD x: INTEGER END;\n  VAR p: POINTER TO R;\nBEGIN\n  p.x := 1;\n  p^ := p^\nEND M.\n";
         let c = c_of(src);
         assert!(c.contains("rt_nil("), "{c}");
@@ -794,9 +833,9 @@ BEGIN\n  a[Next()].x := 1\nEND M.\n";
         // `ABS` is a predefined name, but a nested procedure or a parameter may
         // legally shadow it. Folding by *spelling* would remove the call and its
         // side effect: the emitted C must contain the call.
-        // A module-level declaration shadows the predefined name (report §4:
-        // the universe of predefined identifiers is the outermost scope), and so
-        // does a nested one.
+        // A module-level declaration shadows the predefined name (report 4:
+        // predefined identifiers belong to the outermost scope), as does a
+        // nested declaration.
         let src = "MODULE M;\n  VAR m0: INTEGER;\n\
   PROCEDURE ABS(x: INTEGER): INTEGER;\n  BEGIN m0 := m0 + 1; RETURN 42 END ABS;\n\
 BEGIN\n  m0 := 0; m0 := ABS(1)\nEND M.\n";
@@ -881,10 +920,9 @@ mod diag_tests {
 
     #[test]
     fn a_missing_separator_is_reported_with_both_notes() {
-        // The commonest defect of all: two statements in a row. The reader needs
-        // to know what would have fitted (`;` first) *and* what the recovery
-        // discarded, because the discarded statement is the innocent one and its
-        // own errors are never reported.
+        // When statements follow without a separator, the reader must say what
+        // would have fitted (`;` first) and what recovery discarded. The
+        // discarded statement is innocent, so its errors are not shown.
         let src = "MODULE M;\n  VAR x, y: INTEGER;\nBEGIN\n  x := 1\n  y := 2;\n  z := 3\nEND M.\n";
         let (text, diags) = report(src);
         assert_eq!(messages(&diags).len(), 2, "{text}");
@@ -902,8 +940,8 @@ mod diag_tests {
     #[test]
     fn a_missing_separator_in_a_declaration_names_what_followed() {
         // `CONST a = 1 b = 2;`: the parse cannot recover inside a declaration
-        // list (DESIGN §5 D7), but the message still has to say what the parser
-        // was doing when it gave up.
+        // list (DESIGN 5 D7), but the message must say what the parser was doing
+        // when it gave up.
         let src = "MODULE M;\n  CONST a = 1\n        b = 2;\nBEGIN\nEND M.\n";
         let (text, diags) = report(src);
         assert_eq!(messages(&diags).len(), 1, "{text}");
@@ -913,9 +951,8 @@ mod diag_tests {
 
     #[test]
     fn a_legal_identifier_named_error_survives_in_the_recovery_note() {
-        // `Token` has no synthetic variants, so a dropped token is always input:
-        // filtering by display string hid the name of the statement that was
-        // discarded, and `error`/`Eof` are legal identifiers (report §3).
+        // Filtering by display string hid the name of the discarded statement.
+        // `error` and `Eof` are legal identifiers (report 3).
         let src = "MODULE M;\n  VAR x, error: INTEGER;\nBEGIN\n  x := 1\n  error := 2\nEND M.\n";
         let (text, _) = report(src);
         assert!(text.contains("the parser skipped `error := 2` to carry on"), "{text}");
@@ -924,12 +961,12 @@ mod diag_tests {
     #[test]
     fn one_occurrence_counts_as_one_use_even_when_resolved_twice() {
         // A type-`CASE` label is resolved for the arm's view and again for the
-        // label check; only a new span is another use.
+        // label check. Another span counts as another use.
         let src = "MODULE M; TYPE R = RECORD END; P = POINTER TO R; VAR p: P;\nBEGIN CASE p OF Zz: END END M.\n";
         let (text, _) = report(src);
         assert!(!text.contains("further use of `Zz`"), "{text}");
 
-        // Two genuine occurrences still count, including two labels of one arm
+        // Repeated uses count too, including two labels of one arm
         // (which share the arm's span).
         let src = "MODULE M; VAR x: INTEGER;\nBEGIN x := Zz; x := Zz END M.\n";
         let (text, _) = report(src);
@@ -962,9 +999,8 @@ mod diag_tests {
 
     #[test]
     fn a_failed_type_or_constant_poisons_its_uses() {
-        // The poison rule is deliberate, not incidental (DESIGN §10, PLAN.md
-        // W5.2): a type that failed to resolve must not produce one error per
-        // use of it.
+        // The poison rule is deliberate (DESIGN 10, PLAN.md W5.2): a type that
+        // fails to resolve must not cause a new error at each use.
         let src = "MODULE M;\n  TYPE T = Unknown;\n  VAR a: T;\nBEGIN\n  a := 1\nEND M.\n";
         let (text, diags) = report(src);
         assert_eq!(messages(&diags).len(), 1, "{text}");
@@ -1008,9 +1044,9 @@ mod diag_tests {
 
     #[test]
     fn procedure_uses_are_tracked_by_identity_not_by_name() {
-        // Two procedures of the same name at different levels: the one that is
-        // called must not warn, and the one that is not must. A name-keyed check
-        // would get this wrong in one direction or the other.
+        // Procedures with the same name at different levels: the called one
+        // must not warn, while the unused one must. A name-keyed check would
+        // get one of these cases wrong.
         let src = "MODULE M;\n\
   PROCEDURE P;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN Inner END P;\n\
   PROCEDURE Q;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN END Q;\n\
@@ -1023,8 +1059,8 @@ BEGIN P; Q END M.\n";
             .collect();
         assert_eq!(warnings.len(), 1, "{text}");
         assert!(warnings[0].contains("procedure `Inner` is never used"), "{warnings:?}");
-        // Q's Inner is on line 6 (indented four spaces, so column 15), P's on
-        // line 3 — the caret has to be on the one that is not called.
+        // Q's Inner is on line 6 (column 15). P's is on line 3. The caret
+        // belongs on the unused procedure.
         assert!(text.contains("M.mod:6:15: warning: procedure `Inner`"), "{text}");
     }
 
@@ -1041,9 +1077,9 @@ BEGIN P; Q END M.\n";
 
     #[test]
     fn only_a_local_procedure_is_rejected_as_a_procedure_actual() {
-        // The report's rule is narrow: a globally declared procedure and a
-        // procedure *variable* are both legal actuals, and a procedure passed
-        // where an INTEGER is expected is an ordinary type error (one message).
+        // The report allows globally declared procedures and procedure
+        // variables as actuals. A procedure passed where INTEGER is expected
+        // causes an ordinary type error (one message).
         let src = "MODULE M; TYPE F = PROCEDURE; VAR f: F;\n\
   PROCEDURE P0; BEGIN END P0;\n\
   PROCEDURE Taker(g: F); BEGIN END Taker;\n\
@@ -1069,10 +1105,9 @@ BEGIN Outer END M.\n";
 
     #[test]
     fn a_constant_index_out_of_range_warns_and_still_traps() {
-        // PLAN.md W7.2: a constant index the compiler can see is out of range is
-        // a mistake worth naming, but the run-time check stays (report §8.1
-        // leaves bounds checking to the implementation), so the warning must not
-        // replace it.
+        // PLAN.md W7.2: a constant index known to be out of range warrants a
+        // warning, but the runtime check stays (report 8.1 leaves bounds
+        // checking to the compiler), so the warning must not replace it.
         let src = "MODULE M;\n  CONST k = 7;\n  VAR a: ARRAY 4 OF INTEGER; i: INTEGER;\nBEGIN\n  a[10] := 1;\n  a[(-1)] := 2;\n  a[k] := 3;\n  a[i] := 4;\n  a[3] := 5\nEND M.\n";
         let (text, diags) = report(src);
         let warnings: Vec<String> = diags
@@ -1086,8 +1121,8 @@ BEGIN Outer END M.\n";
         assert!(warnings[2].contains("the index is 7"), "{warnings:?}");
         assert!(diags.iter().all(|d| !d.is_error()), "{text}");
 
-        // A compound index of a named constant, and the classic `a[LEN(a)]`,
-        // where `LEN` is the predefined one.
+        // A compound index of a constant, and the classic `a[LEN(a)]`,
+        // where `LEN` is predefined.
         let src = "MODULE M;\n  CONST k = 7;\n  VAR a: ARRAY 4 OF INTEGER;\nBEGIN\n  a[k + 1] := 1;\n  a[-k] := 2;\n  a[LEN(a)] := 3\nEND M.\n";
         let (text, diags) = report(src);
         let warnings: Vec<String> = diags
@@ -1100,9 +1135,8 @@ BEGIN Outer END M.\n";
         assert!(warnings[1].contains("the index is -7"), "{warnings:?}");
         assert!(warnings[2].contains("the index is 4"), "{warnings:?}");
 
-        // A *shadowed* predefined name is not folded, so `ABS` here returns 0 and
-        // there is nothing to warn about: the folder recognises a builtin by its
-        // spelling, which is why calls are excluded.
+        // There is nothing to warn about: the folder recognises builtins by
+        // spelling, so it excludes calls.
         let src = "MODULE M;\n  VAR a: ARRAY 4 OF INTEGER;\n  PROCEDURE ABS(x: INTEGER): INTEGER; BEGIN RETURN 0 END ABS;\nBEGIN\n  a[ABS(10)] := 1\nEND M.\n";
         let (text, diags) = report(src);
         assert!(diags.iter().all(|d| !d.is_error()), "{text}");
@@ -1122,9 +1156,10 @@ BEGIN Outer END M.\n";
 
     #[test]
     fn an_uncalled_procedure_warns_and_a_used_one_does_not() {
-        // ✔ row 54, the other half: the report has no way to mark a procedure as
-        // deliberately unused. A call, a use as a value, an exported procedure
-        // and a nested one are all covered here.
+        // Row 54: the report has no way to mark a procedure as deliberately
+        // unused. A call, use as a value, export, and nested procedure are
+        // covered here.
+        // covered here.
         let src = "MODULE M;\n  VAR p: PROCEDURE;\n  PROCEDURE Unused; BEGIN END Unused;\n  PROCEDURE Used; BEGIN END Used;\n  PROCEDURE AsValue; BEGIN END AsValue;\n  PROCEDURE Exported*; BEGIN END Exported;\n  PROCEDURE Outer;\n    PROCEDURE Inner; BEGIN END Inner;\n  BEGIN\n    Used;\n    p := AsValue\n  END Outer;\nBEGIN\n  Outer\nEND M.\n";
         let (text, diags) = report(src);
         let warnings: Vec<String> = diags
@@ -1143,7 +1178,7 @@ BEGIN Outer END M.\n";
             warnings[1].contains("procedure `Inner` is never used"),
             "{warnings:?}"
         );
-        // and the caret is on the *name*, not on the whole declaration
+        // The diagnostic points to the *name* rather than the whole declaration.
         assert!(
             text.contains("M.mod:3:13: warning: procedure `Unused` is never used"),
             "{text}"
@@ -1152,8 +1187,8 @@ BEGIN Outer END M.\n";
 
     #[test]
     fn a_field_that_hides_an_inherited_field_warns() {
-        // Report §6.3 permits it, so it stays legal — but `x.f` then means the
-        // derived field, which is worth saying (DESIGN §13).
+        // Report 6.3 permits it, so the program stays legal. `x.f` then means
+        // the derived field (DESIGN 13).
         let src = "MODULE M;\n  TYPE B = RECORD f: INTEGER END;\n       D = RECORD (B) f: CHAR END;\nBEGIN\nEND M.\n";
         let (text, diags) = report(src);
         assert!(diags.iter().all(|d| !d.is_error()), "{text}");
@@ -1175,8 +1210,8 @@ BEGIN Outer END M.\n";
 
     #[test]
     fn several_notes_are_all_rendered() {
-        // One note per line: a diagnostic used to keep only the last one, so the
-        // expected-token note vanished whenever a recovery added its own.
+        // A diagnostic used to keep only the last note, so recovery could
+        // discard the expected-token note.
         let src = "MODULE M;\nBEGIN\n  x := 1\n  y := 2\nEND M.\n";
         let (text, _) = report(src);
         assert_eq!(text.matches("= note: ").count(), 2, "{text}");
@@ -1229,7 +1264,7 @@ BEGIN Outer END M.\n";
 
     #[test]
     fn the_common_mistakes_explain_themselves() {
-        // Report §8.2.2's rule is the one that surprises people.
+        // Report 8.2.2 contains a rule that often surprises people.
         let src = "MODULE M;\n  VAR x: INTEGER; r: REAL;\nBEGIN\n  x := r\nEND M.\n";
         let (text, _) = report(src);
         assert!(text.contains("cannot assign a REAL to an INTEGER"), "{text}");
@@ -1244,11 +1279,10 @@ BEGIN Outer END M.\n";
 
     #[test]
     fn one_mistake_is_reported_once() {
-        // A call statement used to be looked up twice, so an unknown callee was
-        // reported twice; and until PLAN.md W5.2 every *use* of an undeclared
-        // name was reported, so two statements meant two diagnostics. Both
-        // properties now hold at once: one name, one diagnostic, with the count
-        // of the rest on it.
+        // A call statement used to be looked up twice, reporting an unknown
+        // callee twice. Before PLAN.md W5.2 each use of an undeclared name also
+        // got its own diagnostic. Now each name gets one diagnostic with a
+        // count of the suppressed repeats.
         let src = "MODULE M;\n  VAR x: INTEGER;\nBEGIN\n  Get(x)\nEND M.\n";
         let msgs = messages(&report(src).1);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
@@ -1298,9 +1332,8 @@ mod check_tests {
         sym::parse(&text).unwrap_or_else(|e| panic!("fixture interface: {e}"))
     }
 
-    /// The interfaces the report's own example modules need. `Texts.Writer` is
-    /// a real record here, and `Oberon.Log` is typed through `Texts`, which is
-    /// what makes the interface import list load-bearing.
+    /// The report's examples need these interfaces. `Texts.Writer` is a real
+    /// record, and `Oberon.Log` uses types from `Texts`.
     fn report_interfaces() -> Vec<Interface> {
         vec![
             iface("MODULE Texts\n\
@@ -1340,10 +1373,10 @@ PROC Append(p: Writer; b: Buffer)\n"),
 
     #[test]
     fn a_procedure_name_stays_visible_for_the_rest_of_its_scope() {
-        // The other half of the declaration-order rule (report §4): a procedure's
-        // name is visible to the declarations after it and to the body — here a
-        // procedure named like a *predefined* type shadows it for both, so
-        // `Take(INTEGER)` passes the procedure, not the type.
+        // The declaration-order rule also covers this case (report 4). The
+        // procedure name is visible to later declarations and the body. Here,
+        // a procedure named like a *predefined* type shadows it, so
+        // `Take(INTEGER)` passes the procedure instead of the type.
         let src = "MODULE M;\n  TYPE F = PROCEDURE;\n\
   PROCEDURE Take(f: F); BEGIN END Take;\n\
   PROCEDURE INTEGER;\n  BEGIN\n  END INTEGER;\n\
@@ -1354,10 +1387,9 @@ BEGIN\n  Take(INTEGER)\nEND M.\n";
 
     #[test]
     fn a_later_sibling_procedure_does_not_shadow_a_type() {
-        // Report §4: a declaration is visible from where it stands. Inside `Use`,
-        // the module type `T` is still the type, even though a *later* sibling
-        // procedure is named `T` — classifying that as a call would reject a legal
-        // guard.
+        // Report 4 makes a declaration visible from where it stands. Inside
+        // `Use`, the module type `T` remains a type even though a later sibling
+        // procedure is named `T`. Treating it as a call would reject a valid guard.
         let src = "MODULE M;\n  TYPE R = RECORD a: INTEGER END;\n       T = RECORD (R) f: INTEGER END;\n\
   VAR p: POINTER TO R;\n\
   PROCEDURE Outer;\n    PROCEDURE Use;\n    BEGIN\n      p(T).f := 1\n    END Use;\n\
@@ -1387,9 +1419,9 @@ BEGIN Outer END M.\n";
         assert!(e.is_empty(), "a local `T` shadows the type: {e:#?}");
     }
 
-    /// Report §11.1's SYSTEM, in full (W4.1): every entry of the table's portable
-    /// six, the entry the report does not define, both spellings of the import
-    /// alias, and the qualified type name in `SIZE`.
+    /// Report 11.1's SYSTEM set (W4.1): its portable entries, an entry the
+    /// report does not define, both import-alias spellings and qualified type
+    /// names in `SIZE`.
     #[test]
     fn system_entries_check_clean() {
         let src = "MODULE M;\n  IMPORT SYSTEM, S := SYSTEM;\n\
@@ -1433,10 +1465,9 @@ END M.\n";
         let src = "MODULE M;\n  CONST a = 1\n        b = 2;\n        c = ;\n        d = 4;\n\
   VAR x: INTEGER\n      y: REAL;\nBEGIN\n  x := 1; y := 0.0\nEND M.\n";
         let (parsed, diags) = parse_with_diagnostics(src);
-        // The module is not rebuilt — a missing `;` between declarations is fatal
-        // to the *module* parse, and the statement-level recovery works inside a
-        // body, not in a section. What the item asks for is that the errors after
-        // the first one are reported, and three are.
+        // A missing `;` makes the module parse fail. Recovery applies to
+        // statements in a body. This case checks that later declaration errors
+        // are still reported, including three errors.
         assert!(parsed.is_none(), "the module parse fails: {diags:#?}");
         let errors: Vec<&str> = diags
             .iter()
@@ -1459,9 +1490,9 @@ END M.\n";
         );
     }
 
-    /// W8.10: the default dialect is the report's, so a reserved word spelled in
-    /// lower case is an identifier there — which is what makes the switch, rather
-    /// than the change, the safe direction.
+    /// W8.10: the default dialect is the report dialect. There, a reserved
+    /// word in lower case is an identifier; that lets users opt into the
+    /// case-folding dialect without changing the default.
     #[test]
     fn lower_case_keywords_need_the_dialect() {
         let src = "module M;\n  var i: INTEGER;\nbegin\n  i := 1\nend M.\n";
@@ -1484,10 +1515,8 @@ END M.\n";
         );
         assert!(mixed.is_ok(), "Foo and foo remain distinct: {mixed:?}");
 
-        // ... and the predeclared *identifiers* are not folded with them: a
-        // declaration named `integer` is a different name from `INTEGER`, in
-        // either dialect. (Aliasing those is the separate, additive half W8.10
-        // describes; it is not in this change.)
+        // The predeclared *identifiers* are not folded: `integer` differs from
+        // `INTEGER` in either dialect. W8.10's separate change adds aliasing.
         let shadow = parse_module_dialect(
             "module M;\n  var integer: INTEGER;\nbegin\n  integer := 1\nend M.\n",
             Dialect::Lower,
@@ -1495,9 +1524,9 @@ END M.\n";
         assert!(shadow.is_ok(), "a lowercase `integer` is an identifier: {shadow:?}");
     }
 
-    /// W8.10: when a reserved word *is* a collision — the dialect folds case, and an
-    /// identifier was spelled like a keyword — the diagnostic says why, because
-    /// otherwise "unexpected `BEGIN`" is a puzzle.
+    /// W8.10: when a reserved word conflicts with an identifier in the
+    /// case-folding dialect, the diagnostic explains why "unexpected `BEGIN`"
+    /// appeared.
     #[test]
     fn a_folded_collision_explains_itself() {
         let src = "module M;\n  var begin: INTEGER;\nbegin\n  begin := 1\nend M.\n";
@@ -1507,10 +1536,8 @@ END M.\n";
         });
         assert!(noted, "a folded collision must name the dialect: {diags:#?}");
 
-        // An honestly upper-case keyword gets no such note: it is a reserved word
-        // in either dialect, so nothing about the dialect explains it.
-        // Spelled the way the report spells it: a reserved word in either dialect,
-        // so nothing about the dialect explains it.
+        // An upper-case keyword is reserved in either dialect. Its spelling
+        // matches the report, so the dialect does not change the diagnostic.
         let (_, upper) = parse_with_diagnostics_dialect(
             "MODULE M;\n  VAR BEGIN: INTEGER;\nBEGIN\n  BEGIN := 1\nEND M.\n",
             Dialect::Lower,
@@ -1523,8 +1550,8 @@ END M.\n";
         );
     }
 
-    /// W8.2: `MIN(T)`/`MAX(T)` name the extreme of an ordinal type, and the value
-    /// is a constant — in a constant declaration as much as in a statement.
+    /// W8.2: `MIN(T)` and `MAX(T)` give the extreme value of an ordinal type.
+    /// They are constant expressions in declarations and statements.
     #[test]
     fn min_and_max_are_constants_of_ordinal_types() {
         let src = "MODULE M;\n  CONST Low = MIN(INTEGER); High = MAX(INTEGER);\n\
@@ -1545,8 +1572,8 @@ BEGIN\n  i := MIN(INTEGER); i := MAX(BYTE); i := MIN(CHAR);\n\
         assert!(bad.iter().any(|d| d.contains("must be a type name")), "{bad:#?}");
     }
 
-    /// W8.2: a program that declares its own `MIN` shadows the predefined one —
-    /// the scoping rule every predeclared name already has.
+    /// W8.2: declaring `MIN` shadows the predefined name, as with any
+    /// predeclared name.
     #[test]
     fn a_declared_min_shadows_the_predefined_one() {
         let src = "MODULE M;\n  VAR i: INTEGER;\n\
@@ -1556,8 +1583,8 @@ BEGIN\n  i := MIN(41)\nEND M.\n";
         assert!(e.is_empty(), "a user MIN takes a value, not a type: {e:#?}");
     }
 
-    /// W8.1: `CASE … ELSE` is report §9.5's default arm under a keyword LALR(1)
-    /// can parse, and two defaults are one answer too many.
+    /// W8.1: `CASE ... ELSE` is report 9.5's default arm. The grammar accepts
+    /// one default, but rejects two.
     #[test]
     fn case_else_is_the_default_arm_and_there_is_only_one() {
         let src = "MODULE M;\n  VAR i: INTEGER;\nBEGIN\n\
@@ -1589,9 +1616,9 @@ BEGIN\n  i := MIN(41)\nEND M.\n";
         assert!(w.is_empty(), "the qualified name is a use of `Texts`: {w:#?}");
     }
 
-    /// SYSTEM is built in, so an interface file *named* SYSTEM is not what the
-    /// import resolves to (DESIGN §9.10): the report's entries are there, and
-    /// anything else is refused by name rather than looked up in that file.
+    /// SYSTEM is built in, so an interface file called SYSTEM is not used for
+    /// the import (DESIGN 9.10). The report's entries are available, and other
+    /// names are rejected rather than looked up in that file.
     #[test]
     fn system_import_is_not_an_interface_lookup() {
         let interfaces = vec![iface("MODULE SYSTEM\nPROC Nope\n")];
@@ -1607,11 +1634,10 @@ BEGIN\n  i := MIN(41)\nEND M.\n";
         assert!(e[0].contains("SYSTEM.Nope is not implemented"), "{e:#?}");
     }
 
-    /// R17 applies to this pass's SYSTEM set as well: a declaration named SYSTEM
-    /// shadows the import alias, so `SYSTEM.SIZE` there is a field select on that
-    /// declaration. The test is the *absence* of a diagnostic: report §11.1's
-    /// entry written without its argument list would be row 51's error, so
-    /// resolving it as the record's field is the only way this checks clean.
+    /// R17 also applies to SYSTEM. A declaration of SYSTEM shadows the import
+    /// alias, making `SYSTEM.SIZE` a field select. Row 51 rejects the builtin
+    /// without its argument list, so this test checks that the record field
+    /// resolves.
     #[test]
     fn an_inner_declaration_shadows_the_system_alias() {
         let src = "MODULE M;\n  IMPORT SYSTEM;\n  TYPE T = RECORD SIZE: INTEGER END;\n\
@@ -1637,16 +1663,16 @@ BEGIN Use END M.\n";
         assert_eq!(w.len(), 2, "{w:#?}");
     }
 
-    /// One case per catalogue row of DESIGN.md §8.5. The row number is in the
-    /// test name so a failure points straight at the rule.
+    /// One case per DESIGN.md 8.5 catalogue row. The row number is in each test
+    /// name, so a failure points to the rule.
     #[test]
     fn catalogue_rows_report_what_they_should() {
         let cases: &[(u32, &str, &str)] = &[
             (1, "MODULE M; VAR x: INTEGER; BEGIN y := 1 END M.", "`y` is not declared"),
             (2, "MODULE M; VAR x, x: INTEGER; END M.", "`x` is already declared"),
-            // row 3 has two shapes: a qualifier that is not a module, and a
-            // module referenced without importing it (which is simply an
-            // undeclared name, because nothing folds the qualifier then).
+            // Row 3 covers a qualifier that is not a module, plus a reference
+            // to a module that was not imported. That reference is undeclared
+            // because the qualifier is not folded.
             (3, "MODULE M; TYPE T = INTEGER.N; BEGIN END M.", "is not a module"),
             (3, "MODULE M; VAR x: INTEGER; BEGIN x := Texts.N END M.", "`Texts` is not declared"),
             (4, "MODULE M; IMPORT Texts; VAR c: CHAR; BEGIN c := Texts.Nope END M.", "is not exported by module `Texts`"),
@@ -1726,7 +1752,7 @@ BEGIN Use END M.\n";
             (46, "MODULE M; PROCEDURE P; BEGIN RETURN 1 END P; BEGIN END M.", "may not return a value"),
             (47, "MODULE M; PROCEDURE P; BEGIN END Q; BEGIN END M.", "identifier after END is `Q`"),
             (48, "MODULE M; PROCEDURE P; VAR x*: INTEGER; BEGIN END P; BEGIN END M.", "export mark is only allowed at module scope"),
-            // report §6.3: a field's `*` marks it public, so it is *not* an error.
+            // Report 6.3: a field's `*` marks it public, so this is allowed.
             (
                 48,
                 "MODULE M; TYPE R = RECORD x*: INTEGER END; BEGIN END M.",
@@ -1741,10 +1767,9 @@ BEGIN Use END M.\n";
                  BEGIN END M.",
                 "cannot be assigned to a procedure variable",
             ),
-            // row 50's other half: the report's rule is about the *value*, so it
-            // holds for an actual parameter too (report §10.1, "must be either a
-            // procedure declared globally, or a variable of that procedure
-            // type").
+            // Row 50's other case follows the report's rule for procedure
+            // values (report 10.1): a global procedure or a variable of that
+            // procedure type may be passed.
             (
                 50,
                 "MODULE M; TYPE F = PROCEDURE;\n\
@@ -1755,9 +1780,9 @@ BEGIN Use END M.\n";
                 "cannot be passed as a procedure parameter",
             ),
             (51, "MODULE M; VAR i: INTEGER; BEGIN i := ABS END M.", "cannot be used as a value"),
-            // Row 51 covers report §11.1's entries too: they are predeclared
-            // procedures as well, and one the report lists as
-            // implementation-specific is refused by row 53's message instead.
+            // Row 51 includes SYSTEM entries, which are predeclared
+            // procedures. Row 53's message rejects an entry that varies by
+            // compiler version.
             (
                 51,
                 "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN i := SYSTEM.ADR END M.",
@@ -1820,9 +1845,8 @@ BEGIN Use END M.\n";
                 "MODULE M; IMPORT SYSTEM; BEGIN SYSTEM.GET END M.",
                 "`SYSTEM.GET` needs an actual parameter list",
             ),
-            // ... and row 31's its functions: a call, which the statement path
-            // asks about by name; and the bare name, which no argument list
-            // follows at all.
+            // Row 31 covers a function call used as a statement and a bare
+            // function name without an argument list.
             (
                 31,
                 "MODULE M; IMPORT SYSTEM; VAR i: INTEGER; BEGIN SYSTEM.ADR(i) END M.",

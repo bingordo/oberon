@@ -61,7 +61,7 @@ int ob_run_command(const char *module, const char *name);
 
 /* The program's arguments, and the `Args` module over them (DESIGN 11). The
  * loader calls `ob_set_args` with what the host passed; a program reads them
- * through `Args`, whose interface is `Args.sym` — an ordinary imported module,
+ * through `Args`, whose interface is `Args.sym`. It is an ordinary imported module,
  * not a name the compiler knows. */
 void ob_set_args(int argc, char **argv);
 int32_t Args__Count(void);
@@ -136,7 +136,7 @@ static inline int32_t rt_mod(int32_t x, int32_t y) {
 
 #define rt_mod_at(x, y, at) rt_mod_checked((x), (y), (at))
 
-/* The report's table (§8.2.2) defines these as `x * 2^n` and `x DIV 2^n`, so a
+/* The report's table (section 8.2.2) defines these as `x * 2^n` and `x DIV 2^n`, so a
  * count of 32 or more is defined rather than a no-op: multiplying by 2^32 wraps
  * to zero, and `x DIV 2^32` is 0 or -1. Only a *negative* count is undefined,
  * and masking it keeps the C defined too (R22). */
@@ -165,7 +165,7 @@ static inline int32_t rt_abs(int32_t x) {
 }
 
 /* `ABS` is defined for REAL as well and keeps the operand's type (report
- * §10.2), so REAL gets its own helper rather than an int conversion. */
+ * section 10.2), so REAL gets its own helper rather than an int conversion. */
 static inline float rt_absf(float x) {
     return (x < 0.0f) ? -x : x;
 }
@@ -242,7 +242,7 @@ static inline int32_t rt_is(const ObDesc *d, const ObDesc *target) {
 /* NEW(p): the block carries the descriptor of p's static base type in its first
  * word, and failure yields NULL, which is what the report says (6.4). */
 /* `OB_ALLOC_FAIL_AT=n` makes the n-th allocation fail, so that `NEW`'s specified
- * failure (report §6.4: the pointer becomes NIL) is testable at all — otherwise
+ * failure (report section 6.4: the pointer becomes NIL) is testable at all. Without
  * it needs an exhausted heap, which no suite should arrange (PLAN.md W7.4). */
 /* `NEW`'s allocator, defined in `oberon_runtime.c` and deliberately *not* inline
  * here. gcc folds an inlined `malloc(sizeof(T))` and can then prove statically
@@ -305,7 +305,7 @@ static inline void rt_unpk(float *x, int32_t *n) {
 /* A guard's test, usable as an expression so that it keeps its place in a
  * short-circuit operand: `(rt_guard_is(cond, msg), value)`. */
 /* A pointer access is checked for NIL. The report makes using NIL an error
- * (§6.4) and the design traps rather than faulting (R21), with the source offset
+ * (section 6.4) and the design traps rather than faulting (R21), with the source offset
  * of the designator so a failure is locatable without a debugger.
  *
  * A macro rather than a helper function, and not because of speed: the result has

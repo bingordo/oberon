@@ -1,27 +1,26 @@
-//! Constant-expression evaluation (report §5: "can be evaluated by a mere
+//! Constant-expression evaluation (report 5: "can be evaluated by a
 //! textual scan without actually executing the program").
 //!
-//! Four contexts need it: constant declarations (§5), array lengths (§6.2),
-//! `CASE` labels (§9.5) and the `BY` increment of `FOR` (§9.8). The design also
-//! claims something specific and checkable here: **the folder and the generated
-//! C compute the same values**, because both implement the report's `DIV`/`MOD`
-//! (floor), the shifts defined by the report (`x * 2^n` and `x DIV 2^n`, the
-//! rotation mod 32), and the set operations the same
-//! way. `tests::agrees_with_the_emitted_c` checks that claim against a table
+//! The folder is used for constant declarations (5), array lengths (6.2),
+//! `CASE` labels (9.5), and the `BY` increment of `FOR` (9.8). The design makes
+//! a specific, checkable claim: **the folder and generated C compute the same
+//! values**, because both use the report's `DIV`/`MOD` (floor), shifts (`x * 2^n`
+//! and `x DIV 2^n`, with rotation modulo 32), and set operations.
+//! `tests::agrees_with_the_emitted_c` checks that claim against a table
 //! produced by the C back end's own helpers.
 //!
-//! Decisions the report leaves open, made here and listed in DESIGN.md §13:
+//! Decisions the report leaves open, made here and listed in DESIGN.md 13:
 //!
 //! * `x / y` on two integers is `x DIV y`. The report says `/` applies to
 //!   numeric types and that the result has the operands' type, but defines only
-//!   `DIV`/`MOD` precisely; the reference compilers implement integer `/` with
-//!   the same code as `DIV`, so we do too.
+//!   `DIV`/`MOD` precisely. Reference compilers use the same code for integer
+//!   `/` and `DIV`, so we do too.
 //! * `CHR(x)` truncates like the emitted `(char)x` rather than rejecting an
 //!   ordinal above 255, so the folder cannot disagree with the running program.
 //! * Arithmetic on `INTEGER` wraps (`wrapping_*`), matching the `-fwrapv` C the
-//!   back end is compiled with. `ABS` and `-` on `MIN(INTEGER)` wrap likewise.
+//!   back end is compiled with. `ABS` and `-` on `MIN(INTEGER)` wrap as well.
 //! * `ORD` of a `SET` is not folded: the report lists `SET` in the argument
-//!   types but a set has no single ordinal number, so no constant is produced.
+//!   types but a set has no ordinal number, so no constant is produced.
 
 use syntax::ast::*;
 
@@ -78,7 +77,7 @@ fn not_const(what: &str) -> String {
     format!("{what} is not a constant expression (report 5)")
 }
 
-// ---------------------------------------------------------------- semantics
+// semantics
 
 /// `x DIV y`, floor division: the report's `x = q*y + r, 0 <= r < y` for `y > 0`,
 /// extended to negative `y` by flooring. Identical to the C `rt_div`.
@@ -107,7 +106,7 @@ pub fn modulo(x: i32, y: i32) -> EvalResult {
     Ok(Const::Int(if r != 0 && (r < 0) != (y < 0) { r + y } else { r }))
 }
 
-/// `x * 2^n` (report §8.2.2), so a count of 32 or more wraps to zero; only a
+/// `x * 2^n` (report 8.2.2), so a count of 32 or more wraps to zero; only a
 /// negative count is undefined and stays masked, as the runtime does (R22).
 fn lsl(x: i32, n: i32) -> i32 {
     if n >= 32 {
@@ -129,8 +128,8 @@ fn asr(x: i32, n: i32) -> i32 {
 }
 fn ror(x: i32, n: i32) -> i32 {
     // `rotate_right` is the same operation as the emitted
-    // `(x >> n) | (x << (32 - n))` with the count taken mod 32, and clippy
-    // insists on it; the mod-32 count is what makes the two agree.
+    // `(x >> n) | (x << (32 - n))` with the count taken modulo 32. Clippy
+    // requires this form. The modulo-32 count makes the operations agree.
     (x as u32).rotate_right((n & 31) as u32) as i32
 }
 
@@ -153,19 +152,19 @@ pub fn range(a: i32, b: i32) -> Result<u32, String> {
 fn ord_of(c: &Const) -> Result<i32, String> {
     match c {
         Const::Char(ch) => Ok(*ch as i32),
-        // report §9.1.2: a single-character string may be used where a CHAR is
-        // expected - `ORD("0")` appears in the report's own example (§10.1).
+        // report 9.1.2: a one-character string may be used where a CHAR is
+        // expected - `ORD("0")` appears in the report's own example (10.1).
         Const::Str(t) if t.len() == 1 => Ok(t.as_bytes()[0] as i32),
         Const::Bool(b) => Ok(*b as i32),
         _ => Err("ORD needs a constant CHAR or BOOLEAN".into()),
     }
 }
 
-// ------------------------------------------------------------------- folder
+// folder
 
 /// The folder, with a way to look up a designator that names a constant. The
 /// checker and the emitter are the callers that have one; `eval` is the same
-/// thing without (DESIGN §8.3: the folder itself resolves nothing).
+/// thing without (DESIGN 8.3: the folder itself resolves nothing).
 pub fn eval_with(e: &Expr, resolve: &dyn Fn(&Expr) -> Option<Const>) -> EvalResult {
     eval_inner(e, resolve)
 }
@@ -201,8 +200,8 @@ fn eval_inner(e: &Expr, resolve: &dyn Fn(&Expr) -> Option<Const>) -> EvalResult 
         }
         ExprKind::Designator(d) => {
             if d.base.len() == 1 && d.sels.is_empty() {
-                // A lone designator may be a named constant, which only the
-                // caller can know: it owns the scope.
+                // A designator may name a constant, which only the caller can
+                // know because it holds the scope.
                 if let Some(c) = resolve(e) {
                     return Ok(c);
                 }
@@ -381,7 +380,7 @@ fn call(name: &str, args: &[Const]) -> EvalResult {
             arity(1)?;
             match &args[0] {
                 Char(_) | Bool(_) | Str(_) => Ok(Int(ord_of(&args[0])?)),
-                // A SET has no single ordinal number; see the module header.
+                // A SET has no ordinal number. See the module header.
                 Set(_) => Err("ORD of a SET has no ordinal number".into()),
                 _ => Err("ORD needs a constant CHAR or BOOLEAN".into()),
             }
@@ -415,7 +414,7 @@ mod tests {
         assert_eq!(eval_src("1 + 2*3").unwrap(), Const::Int(7));
         assert_eq!(eval_src("(1 + 2)*3").unwrap(), Const::Int(9));
         assert_eq!(eval_src("- 5 + 8").unwrap(), Const::Int(3));
-        // report §3: hexadecimal integers are bit patterns
+        // report 3: hexadecimal integers are bit patterns
         assert_eq!(eval_src("0FFFFFFFFH").unwrap(), Const::Int(-1));
         // wrapping, as the -fwrapv build of the emitted C
         assert_eq!(
@@ -428,7 +427,7 @@ mod tests {
     fn div_and_mod_are_floor_and_match_the_c_helpers() {
         assert_eq!(eval_src("7 DIV 3").unwrap(), Const::Int(2));
         assert_eq!(eval_src("7 MOD 3").unwrap(), Const::Int(1));
-        // report §8.2: `SimpleExpression = ["+"|"-"] term {AddOperator term}`,
+        // report 8.2: `SimpleExpression = ["+"|"-"] term {AddOperator term}`,
         // so a leading sign applies to the whole term: `-7 DIV 3` is
         // `-(7 DIV 3)`, not `(-7) DIV 3`. Parenthesise to test the dividend.
         assert_eq!(eval_src("-7 DIV 3").unwrap(), Const::Int(-2));
@@ -457,7 +456,7 @@ mod tests {
         assert_eq!(eval_src("{0 .. 8*4 - 1}").unwrap(), Const::Set(0xFFFF_FFFF));
         assert!(eval_src("{0 .. 32}").unwrap_err().contains("outside 0..31"));
         assert!(eval_src("{-1}").unwrap_err().contains("outside 0..31"));
-        // set operators (report §8.2.3)
+        // set operators (report 8.2.3)
         assert_eq!(eval_src("{1} + {2}").unwrap(), Const::Set(0b110));
         assert_eq!(eval_src("{1 .. 3} - {2}").unwrap(), Const::Set(0b1010));
         assert_eq!(eval_src("{1 .. 3} * {2 .. 4}").unwrap(), Const::Set(0b1100));

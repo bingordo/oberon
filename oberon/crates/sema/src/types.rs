@@ -3,29 +3,29 @@
 //! This module is the part of "type checking and semantic checking" that the
 //! design states as *rules* and that is worth pinning down with tests before any
 //! resolver feeds it: type identity, the extension relation, assignment
-//! compatibility (report §9.1), parameter matching (report §10.1), the operand
-//! rules of the operators (report §8.2) and the signatures of the predeclared
-//! procedures (report §10.2).
+//! compatibility (report section 9.1), parameter matching (report section 10.1), the operand
+//! rules of the operators (report section 8.2) and the signatures of the predeclared
+//! procedures (report section 10.2).
 //!
-//! It is deliberately independent of the AST: it takes `TypeId`s, so the same
-//! rules serve the checker, the constant folder and the back end's layout pass.
+//! The type module is independent of the AST and accepts `TypeId`s. These rules
+//! serve the checker and constant folder. The back end uses them for layout.
 //!
-//! Nominal versus structural, and why (report §6):
+//! Nominal versus structural, and why (report section 6):
 //!
-//! * **records** are nominal. Report §6.3 defines extension ("T extends T0 if it
-//!   equals T0, or if it directly extends an extension of T0") and §6.3's whole
+//! * **records** are nominal. Report section 6.3 defines extension ("T extends T0 if it
+//!   equals T0, or if it directly extends an extension of T0") and section 6.3's whole
 //!   point is that a *declaration* creates a type; two records with identical
 //!   fields written twice are two types.
 //! * **pointers** are equal when their base types are equal. The report defines
-//!   pointer types only through the base (§6.4: "P is said to be bound to T",
+//!   pointer types only through the base (section 6.4: "P is said to be bound to T",
 //!   "Pointer types inherit the extension relation of their base types"), so
 //!   `POINTER TO T` written twice denotes the same type, and `P` extends `P0`
 //!   exactly when its base extends `P0`'s base.
-//! * **arrays** and **procedure types** are structural: §9.1.4 and §10.1 compare
+//! * **arrays** and **procedure types** are structural: sections 9.1.4 and 10.1 compare
 //!   their components, and nothing in the report gives an array declaration an
 //!   identity beyond its shape.
-//! * **basic types** are their names; `BYTE` and `INTEGER` are additionally
-//!   *compatible* in both directions (§6.1) without being the same type.
+//! * **basic types** are their names. The report treats `BYTE` and `INTEGER` as
+//!   *compatible* in both directions (section 6.1), but they are not the same type.
 
 use std::collections::HashMap;
 
@@ -46,14 +46,14 @@ pub enum Basic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Param {
-    /// `VAR` parameter (report §10.1).
+    /// `VAR` parameter (report section 10.1).
     pub by_var: bool,
     pub ty: TypeId,
 }
 
-/// One record field: its name, its type, and whether the declaration carried the
-/// report's public mark (report §6.3). The mark travels through an interface so a
-/// client can tell which fields it may name (DESIGN §7).
+/// A record field has a name and type. It also records whether the declaration has
+/// the report's public mark (report section 6.3). The mark travels through an interface so a
+/// client can tell which fields it may name (DESIGN section 7).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
     pub name: String,
@@ -66,9 +66,9 @@ pub enum Type {
     Basic(Basic),
     /// `ARRAY len OF elem`
     Array { len: u32, elem: TypeId },
-    /// `ARRAY OF elem` - only legal as a formal type (report §10.1).
+    /// `ARRAY OF elem` - only legal as a formal type (report section 10.1).
     OpenArray { elem: TypeId },
-    /// Nominal; `def` is the declaration identity.
+    /// Nominal type. `def` identifies its declaration.
     Record {
         def: u32,
         base: Option<TypeId>,
@@ -79,9 +79,9 @@ pub enum Type {
         params: Vec<Param>,
         result: Option<TypeId>,
     },
-    /// The type of `NIL` (report §6.4).
+    /// The type of `NIL` (report section 6.4).
     Nil,
-    /// The type of a string literal: its length counts (report §9.1.2).
+    /// The type of a string literal: its length counts (report section 9.1.2).
     StringLit(usize),
     /// Poison, used after reporting an error so one mistake does not cascade.
     Error,
@@ -191,18 +191,18 @@ impl Types {
             Type::Proc { params, result },
         )
     }
-    /// A new record type. Two calls produce two *different* types, exactly as
-    /// two `TYPE` declarations do (report §6.3).
+    /// Each call to `record` creates a *different* type, as does each `TYPE`
+    /// declaration (report section 6.3).
     pub fn record(&mut self, base: Option<TypeId>, fields: Vec<Field>) -> TypeId {
         let id = self.record_placeholder();
         self.define_record(id, base, fields);
         id
     }
 
-    /// Allocate a record's *identity* before its fields are known. The report
-    /// allows exactly one forward reference inside a scope - a pointer's base
-    /// type (report §6.4: "the identifier T can be declared textually following
-    /// the declaration of P") - so the resolver needs the identity first and
+    /// Allocate a record's *identity* before its fields have been declared. The report
+    /// allows one forward reference inside a scope: a pointer's base type
+    /// (report section 6.4: "the identifier T can be declared textually following
+    /// the declaration of P"). The resolver needs the identity first and
     /// the fields later.
     pub fn record_placeholder(&mut self) -> TypeId {
         let def = self.next_def;
@@ -232,7 +232,7 @@ impl Types {
         }
     }
 
-    /// A pointer type. Its identity comes from its base (§6.4), so this is
+    /// A pointer type is identified by its base (section 6.4), so this is
     /// interned by base rather than given a fresh identity.
     pub fn pointer(&mut self, base: TypeId) -> TypeId {
         let id = TypeId(self.types.len() as u32);
@@ -249,7 +249,7 @@ impl Types {
         id
     }
 
-    // ---------------------------------------------------------------- queries
+    // queries
 
     pub fn is_error(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Error)
@@ -260,8 +260,8 @@ impl Types {
     pub fn is_char(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Basic(Basic::Char))
     }
-    /// `INTEGER` or `BYTE` - report §6.1 makes them compatible, and §8.2.2
-    /// makes `DIV`/`MOD` apply to "integer operands", which includes `BYTE`.
+    /// `INTEGER` or `BYTE`: report section 6.1 makes them compatible, and section 8.2.2
+    /// makes `DIV`/`MOD` apply to "integer operands", including `BYTE`.
     pub fn is_integer_like(&self, t: TypeId) -> bool {
         matches!(
             self.get(t),
@@ -279,9 +279,9 @@ impl Types {
     pub fn is_set(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Basic(Basic::Set))
     }
-    /// report §6.1's basic types — what report §11.1 lets `SYSTEM.GET` and
-    /// `SYSTEM.PUT` read and write ("v: any basic type"), as opposed to a record,
-    /// an array or a pointer.
+    /// Report section 6.1 defines the basic types accepted by SYSTEM.GET and
+    /// SYSTEM.PUT (their argument may be "any basic type"), but not records,
+    /// arrays or pointers.
     pub fn is_basic(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Basic(_))
     }
@@ -297,14 +297,14 @@ impl Types {
     pub fn is_nil(&self, t: TypeId) -> bool {
         matches!(self.get(t), Type::Nil)
     }
-    /// A `CHAR` value: the type `CHAR`, or a one-character string, which the
-    /// report's own code uses wherever a `CHAR` is expected - §10.1's `WriteInt`
-    /// compares `ch <= "9"` and calls `ORD("0")`.
+    /// A `CHAR` value can also be a one-character string. The report's `WriteInt`
+    /// procedure uses one where `CHAR` is expected (section 10.1). It compares
+    /// `ch <= "9"` and calls `ORD("0")`.
     pub fn is_char_like(&self, t: TypeId) -> bool {
         self.is_char(t) || matches!(self.get(t), Type::StringLit(1))
     }
-    /// A `CHAR` array, i.e. a string (report §3: strings are sequences of
-    /// characters; §9.1.2 assigns them to "any array of characters").  A string
+    /// A `CHAR` array is a string. Report section 3 defines strings as sequences of
+    /// characters. Section 9.1.2 assigns them to "any array of characters". A string
     /// *literal* is one too, which is what makes the report's own
     /// `text < "abd"` a character-array relation.
     pub fn is_char_array(&self, t: TypeId) -> bool {
@@ -327,19 +327,19 @@ impl Types {
         }
     }
     /// The type a `^` selector produces, or the record a `.field` applies to
-    /// (the report's `.` implies dereferencing, §8.1).
+    /// (the report's `.` implies dereferencing, section 8.1).
     pub fn deref(&self, t: TypeId) -> Option<TypeId> {
         match self.get(t) {
             Type::Pointer { base } => Some(*base),
             _ => None,
         }
     }
-    /// Field lookup, searching the record and then its base types. The most
-    /// derived declaration wins, which is what "the scope of field identifiers
-    /// is the record definition itself" implies for an extension (§6.3).
+    /// Field lookup searches the record and its base types. A more derived
+    /// declaration wins. Report section 6.3 scopes field names to the record
+    /// definition itself.
     /// A field's type *and* the record that declares it: for an inherited field
     /// that is the base's declaration, which is the one whose export mark counts
-    /// (report §6.3).
+    /// (report section 6.3).
     pub fn field_decl(&self, mut t: TypeId, name: &str) -> Option<(TypeId, TypeId)> {
         let mut guard = 0;
         loop {
@@ -378,9 +378,9 @@ impl Types {
         }
     }
 
-    // ------------------------------------------------------------- relations
+    // relations
 
-    /// `same_type` is the report's "is the same type" (used by §6.2 and §10.1).
+    /// `same_type` matches the report's "is the same type" (used by sections 6.2 and 10.1).
     pub fn same_type(&self, a: TypeId, b: TypeId) -> bool {
         if a == b {
             // Covers the basics, the hash-consed structural kinds, NIL and
@@ -396,7 +396,7 @@ impl Types {
         }
     }
 
-    /// `t` extends `base` (report §6.3, §6.4), which is reflexive.
+    /// `t` extends `base` (report sections 6.3 and 6.4), which is reflexive.
     pub fn extends(&self, t: TypeId, base: TypeId) -> bool {
         let mut cur = t;
         let mut guard = 0;
@@ -410,8 +410,8 @@ impl Types {
             }
             match self.get(cur) {
                 Type::Record { base: Some(b), .. } => cur = *b,
-                // report §6.4: pointer types inherit the extension relation of
-                // their base types.
+                // Report section 6.4: pointer types inherit the extension relation
+                // of their base types.
                 Type::Pointer { base: pb } => match self.get(base) {
                     Type::Pointer { base: qb } => {
                         if !self.extends(*pb, *qb) {
@@ -428,7 +428,7 @@ impl Types {
 
     /// The report's `T0` ranges over `v IS T0`, guards and type `CASE` labels:
     /// the tested type must be an extension of the declared type, and the
-    /// designator must be a pointer or a `VAR` record parameter (§8.1, §8.2.4).
+    /// designator must be a pointer or a `VAR` record parameter (sections 8.1 and 8.2.4).
     pub fn test_applicable(&self, declared: TypeId, tested: TypeId) -> bool {
         let designator_ok = self.is_pointer(declared)
             || self.is_record(declared) // the VAR-record-parameter half is the checker's
@@ -437,10 +437,10 @@ impl Types {
         designator_ok && self.extends(tested, declared)
     }
 
-    // ---------------------------------------------------------- assignments
+    // assignments
 
-    /// Report §9.1 with its four exceptions, plus the `BYTE`/`INTEGER`
-    /// compatibility of §6.1.
+    /// Report section 9.1 has four exceptions, plus the `BYTE`/`INTEGER`
+    /// compatibility of section 6.1.
     pub fn is_assignable(&self, dst: TypeId, src: TypeId) -> bool {
         if self.is_error(dst) || self.is_error(src) {
             return true; // already reported
@@ -448,28 +448,28 @@ impl Types {
         if self.same_type(dst, src) {
             return true;
         }
-        // report §6.1: BYTE is compatible with INTEGER, and vice-versa.
+        // Report section 6.1: BYTE is compatible with INTEGER, and vice-versa.
         if self.is_integer_like(dst) && self.is_integer_like(src) {
             return true;
         }
         match self.get(src) {
-            // §9.1.1: NIL may be assigned to any pointer or procedure variable.
+            // Section 9.1.1: NIL may be assigned to any pointer or procedure variable.
             Type::Nil => self.is_pointer(dst) || self.is_proc(dst),
-            // §9.1.2: a string may be assigned to any array of characters if it
+            // Section 9.1.2: a string may be assigned to any array of characters if it
             // is shorter than the array (a NUL is appended), and a
-            // single-character string to a CHAR.
+            // one-character string to a CHAR.
             Type::StringLit(n) => match self.get(dst) {
                 Type::Array { len, elem } if self.is_char(*elem) => (*n as u32) < *len,
                 Type::OpenArray { elem } => self.is_char(*elem),
                 Type::Basic(Basic::Char) => *n == 1,
                 _ => false,
             },
-            // §9.1.3: the source must be an extension of the destination.
-            // Records and - by §6.4, "pointer types inherit the extension
-            // relation of their base types" - pointers as well.
+            // Section 9.1.3: the source must be an extension of the destination.
+            // Records and pointers follow this relation. Section 6.4 says that pointer
+            // types inherit the extension relation of their base types.
             Type::Record { .. } => self.is_record(dst) && self.extends(src, dst),
             Type::Pointer { .. } => self.is_pointer(dst) && self.extends(src, dst),
-            // §9.1.4: an open array may be assigned to an array of equal base
+            // Section 9.1.4: an open array may be assigned to an array of equal base
             // type.
             Type::OpenArray { elem } => match self.get(dst) {
                 Type::Array { elem: de, .. } | Type::OpenArray { elem: de } => {
@@ -481,7 +481,7 @@ impl Types {
         }
     }
 
-    /// Report §10.1. `actual` is the actual parameter's type; whether a `VAR`
+    /// Report section 10.1. `actual` is the actual parameter's type; whether a `VAR`
     /// actual is a *variable* is the checker's business, not this predicate's.
     pub fn param_ok(&self, formal: &Param, actual: TypeId) -> bool {
         if self.is_error(formal.ty) || self.is_error(actual) {
@@ -511,10 +511,10 @@ impl Types {
         self.is_assignable(formal.ty, actual)
     }
 
-    // ------------------------------------------------------------ operators
+    // operators
 
-    /// The `SimpleExpression`/`term` operator rules of report §8.2.1-§8.2.3.
-    /// `Err` carries the reason, which becomes the diagnostic's note.
+    /// The operator rules for `SimpleExpression` and `term` are in report sections
+    /// 8.2.1-8.2.3. `Err` carries the reason, which becomes the diagnostic's note.
     pub fn operator_ok(&self, op: BinOp, l: TypeId, r: TypeId) -> Result<(), &'static str> {
         use BinOp::*;
         if self.is_error(l) || self.is_error(r) {
@@ -530,9 +530,9 @@ impl Types {
                 }
             }
             Add | Sub | Mul | Div => {
-                // numeric, both operands of the same type (§8.2.2), or SET
-                // (§8.2.3: union, difference, intersection, symmetric
-                // difference).
+                // Numeric operands must have the same type (section 8.2.2); SET
+                // operands use union, difference, intersection or symmetric difference
+                // (section 8.2.3).
                 let numeric_same_type = self.is_numeric(l) && same;
                 let both_sets = self.is_set(l) && self.is_set(r);
                 if numeric_same_type || both_sets {
@@ -558,10 +558,9 @@ impl Types {
                 }
             }
             Eq | Ne => {
-                // report §8.2.4: `=` and `#` apply to BOOLEAN, SET, the numeric
-                // types, CHAR (and character arrays), and to pointer and
-                // procedure types - but the *two operands* must be of the same
-                // type (a relation is not an implicit conversion).
+                // Section 8.2.4 applies `=` and `#` to BOOLEAN, SET, numeric types,
+                // CHAR and character arrays, and pointer and procedure types.
+                // Both operands must have the same type. A relation is not a conversion.
                 let comparable = |this: &Self, a: TypeId, b: TypeId| -> bool {
                     if this.is_error(a) || this.is_error(b) {
                         return true;
@@ -620,8 +619,8 @@ impl Types {
         }
     }
 
-    /// Unary `-` and `~` (report §8.2.1, §8.2.2, §8.2.3: a single SET operand
-    /// makes `-` the complement; `+` is the identity on numerics).
+    /// Unary operators (report sections 8.2.1, 8.2.2 and 8.2.3). A SET operand makes
+    /// `-` the complement. The `+` operator is the identity on numeric operands.
     pub fn unary_ok(&self, op: syntax::ast::UnOp, t: TypeId) -> Result<(), &'static str> {
         use syntax::ast::UnOp::*;
         if self.is_error(t) {
@@ -652,11 +651,10 @@ impl Types {
         }
     }
 
-    // ------------------------------------------------- predeclared procedures
+    // predeclared procedures
 
-    /// The signatures of report §10.2. Returns the result type, or the reason
-    /// the arguments do not fit. `LEN` of a fixed array folds to a constant and
-    /// is handled by the folder; here it only has to type-check.
+    /// This method checks the signatures in report section 10.2. It returns the result
+    /// type or the reason the arguments do not fit. `LEN` of a fixed array folds to a
     pub fn predefined(&mut self, name: &str, args: &[TypeId]) -> Result<TypeId, String> {
         let arity = |n: usize| -> Result<(), String> {
             if args.len() == n {
@@ -753,7 +751,7 @@ mod tests {
         }
     }
 
-    /// A small universe that mirrors the report's own examples (§6.3, §6.4).
+    /// A small universe modeled on the report's own examples (sections 6.3 and 6.4).
     struct World {
         t: Types,
         node: TypeId,
@@ -792,10 +790,10 @@ mod tests {
         assert!(t.same_type(i, i));
         assert!(!t.same_type(i, b), "BYTE is compatible with, not equal to, INTEGER");
         assert!(!t.same_type(i, r));
-        // report §6.1, both directions
+        // Report section 6.1: both directions.
         assert!(t.is_assignable(i, b));
         assert!(t.is_assignable(b, i));
-        // report §8.2.2: no implicit REAL/INTEGER conversion
+        // Report section 8.2.2: no implicit REAL/INTEGER conversion.
         assert!(!t.is_assignable(r, i));
         assert!(!t.is_assignable(i, r));
     }
@@ -811,7 +809,7 @@ mod tests {
         assert!(!t.same_type(a, c));
         assert!(!t.same_type(a, d));
 
-        // Two records with identical fields are two types (report §6.3).
+        // Records with identical fields remain distinct types (report section 6.3).
         let f = vec![field("x", t.integer())];
         let r1 = t.record(None, f.clone());
         let r2 = t.record(None, f);
@@ -822,7 +820,7 @@ mod tests {
     #[test]
     fn pointer_identity_and_extension_follow_the_base() {
         let mut w = world();
-        // report §6.4: `POINTER TO T` is the same type however it is written.
+        // Report section 6.4: `POINTER TO T` is the same type however it is written.
         let again = w.t.pointer(w.node);
         assert!(w.t.same_type(again, w.p_node));
         // and P extends P0 exactly when its base extends P0's base
@@ -867,7 +865,7 @@ mod tests {
         assert!(w.t.is_assignable(pp, w.t.nil()));
         assert!(!w.t.is_assignable(w.t.integer(), w.t.nil()));
 
-        // 9.1.2: shorter than the array, NUL appended; a single character to CHAR
+        // 9.1.2: shorter than the array, NUL appended; a one-character string to CHAR
         assert!(w.t.is_assignable(w.char4, three));
         assert!(!w.t.is_assignable(w.char4, four), "len(src) < n is required");
         let one = w.t.string_lit(1);
@@ -878,7 +876,7 @@ mod tests {
         // 9.1.3: records, source extends destination
         assert!(w.t.is_assignable(w.node, w.center));
         assert!(!w.t.is_assignable(w.center, w.node));
-        // and, by §6.4, pointer types: `p := q` with q: POINTER TO CenterNode
+        // Section 6.4 also gives pointers this rule: `p := q` with q: POINTER TO CenterNode
         assert!(w.t.is_assignable(w.p_node, w.p_center));
         assert!(!w.t.is_assignable(w.p_center, w.p_node), "a base pointer needs a guard");
         // pointers do not mix with records
@@ -954,7 +952,7 @@ mod tests {
         assert!(w.t.operator_ok(Ne, char, int).is_err());
         assert!(w.t.operator_ok(Eq, int, int).is_ok());
         assert!(w.t.operator_ok(Lt, set, set).is_err());
-        // = and # additionally: BOOLEAN, SET, pointers, procedures, NIL
+        // `=` and `#` also apply to BOOLEAN, SET, pointers, procedures and NIL.
         assert!(w.t.operator_ok(Eq, bool_, bool_).is_ok());
         assert!(w.t.operator_ok(Eq, set, set).is_ok());
         assert!(w.t.operator_ok(Eq, w.p_node, w.p_node).is_ok());
@@ -971,7 +969,7 @@ mod tests {
     #[test]
     fn type_tests_and_guards_need_the_extension_relation() {
         let w = world();
-        // report §8.1/§8.2.4: T0 must be an extension of v's declared type
+        // Report sections 8.1 and 8.2.4: T0 must extend v's declared type.
         assert!(w.t.test_applicable(w.p_node, w.p_center));
         assert!(w.t.test_applicable(w.p_node, w.p_node));
         assert!(!w.t.test_applicable(w.p_center, w.p_node));
@@ -1000,7 +998,7 @@ mod tests {
         assert!(w.t.operator_ok(Or, bool_, bool_).is_ok());
         assert!(w.t.operator_ok(Or, int, int).is_err());
         assert!(w.t.operator_ok(And, bool_, bool_).is_ok());
-        // report §8.2.3: set operators are spelled like the arithmetic ones
+        // Report section 8.2.3: set operators use the same symbols as arithmetic.
         assert!(w.t.operator_ok(Add, set, set).is_ok());
         assert!(w.t.operator_ok(Sub, set, set).is_ok());
         assert!(w.t.operator_ok(Mul, set, set).is_ok());

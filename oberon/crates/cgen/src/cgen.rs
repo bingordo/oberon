@@ -1,29 +1,29 @@
-//! The C back end (DESIGN §9): walk the checked module and emit C11.
+//! The C back end (DESIGN 9): walk the checked module and emit C11.
 //!
-//! Every emission rule here is the one verified in `oberon/csmoke` (runtime
-//! semantics: DIV/MOD, sets, shifts, descriptors, links, parameter modes) and
-//! `oberon/golden` (statement lowering, module and command model). The emitter
-//! performs no optimisation: the C compiler does that.
+//! Runtime cases checked in `oberon/csmoke` include DIV/MOD, sets, shifts,
+//! descriptors, links, and parameter modes. `oberon/golden` checks statement
+//! lowering and the module and command model.
 //!
 //! One Oberon module becomes `Foo.c` + `Foo.h` + `Foo.sym`; the shared runtime
 //! is `oberon.h` + `oberon_runtime.c` (the two `.inc` files next to this one),
 //! so the registry and the descriptors have one identity across modules.
 //!
-//! Three representation decisions shape everything below:
+//! The representation decisions below shape everything else:
 //!
-//! * A fixed-size `ARRAY n OF T` becomes a **named struct with one field**,
+//! * A fixed-size `ARRAY n OF T` becomes a **struct with one field**,
 //!   `struct { T e[n]; }`. Assignment is then C struct assignment (a copy, no
 //!   `memcpy` bookkeeping), passing is passing a pointer, and indexing is
 //!   `x.e[i]`. The name is derived from the type's id, so two variables of the
 //!   same Oberon array type have the same C type and assign to each other. An
 //!   Oberon identifier cannot contain `__`, which makes generated names
 //!   collision-free.
-//! * An open-array parameter becomes two C parameters, `T *a, int32_t a__len`
-//!   (report §10.1); `LEN(a)` is that hidden length.
-//! * A procedure that declares nested procedures owns a frame struct and keeps
-//!   its storage in it; a nested procedure takes a hidden `void *sl` and reaches
-//!   enclosing storage by walking links — the scheme `oberon/csmoke` verified,
-//!   including that a link-taking procedure is not command-shaped.
+//! * An open-array parameter becomes two C parameters, `T *a, int32_t a__len`.
+//!   `LEN(a)` reads the hidden length (report 10.1).
+//! * A procedure that declares nested procedures stores its variables in a
+//!   frame struct. A nested procedure takes a hidden `void *sl` and reaches
+//!   enclosing storage by walking links, as verified in `oberon/csmoke`.
+//!   A procedure that takes a link cannot be command-shaped.
+//!
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -42,9 +42,8 @@ const PREDEFINED_PROPER: &[&str] = &["INC", "DEC", "INCL", "EXCL", "NEW", "ASSER
 const PREDEFINED_FUNCTIONS: &[&str] =
     &["ABS", "ODD", "LEN", "LSL", "ASR", "ROR", "FLOOR", "FLT", "ORD", "CHR"];
 
-/// Report §11.1's entries, split the only way the emitter needs: a call to one of
-/// the functions is a *value* and a call to one of the proper procedures is a
-/// *statement*. Neither is called through a signature — see `sys_function` and
+/// Report 11.1: function calls return values; proper procedure calls are
+/// statements. Neither is called through a signature. See `sys_function` and
 /// `sys_proper`.
 const SYSTEM_FUNCTIONS: &[&str] = &["ADR", "SIZE", "BIT"];
 const SYSTEM_PROPER: &[&str] = &["GET", "PUT", "COPY"];
@@ -52,7 +51,7 @@ const SYSTEM_PROPER: &[&str] = &["GET", "PUT", "COPY"];
 /// What an identifier means at emission time.
 #[derive(Clone)]
 struct Sym {
-    /// How the name is written at this point in the output.
+    /// The emitted spelling of the name at this point in the output.
     cname: String,
     ty: TypeId,
     /// Nesting level of the declaring procedure (0 = module).
@@ -78,32 +77,70 @@ struct Frame {
     path: String,
 }
 
+struct SourceMap {
+    file: String,
+    line_starts: Vec<u32>,
+}
+
+impl SourceMap {
+    fn new(source: &str, file: &str) -> SourceMap {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n').then_some((i + 1) as u32)),
+        );
+        SourceMap {
+            file: escape_line_file(file),
+            line_starts,
+        }
+    }
+
+    fn directive(&self, span: Span, out: &mut String) {
+        let line = self.line_starts.partition_point(|start| *start <= span.lo);
+        let _ = writeln!(out, "#line {line} \"{}\"", self.file);
+    }
+}
+
+fn escape_line_file(file: &str) -> String {
+    let mut out = String::new();
+    for byte in file.bytes() {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => {
+                let _ = write!(out, "\\{byte:03o}");
+            }
+        }
+    }
+    out
+}
+
 pub struct Emitter<'a> {
     types: &'a Types,
     sema: &'a Sema<'a>,
     module: String,
     /// C struct names for record and array types.
     type_names: HashMap<TypeId, String>,
-    /// Whether a type reaches a pointer at all, memoized: it decides whether a
-    /// record needs a pointer map and whether a variable is a root, and the walk
-    /// that answers it is exponential in the depth of a type graph without the
-    /// memo (DESIGN §15.2).
+    /// Whether a type reaches a pointer, memoized because the walk is
+    /// exponential in the depth of a type graph (DESIGN 15.2). This determines
+    /// whether a record needs a pointer map and a variable is a root.
     reaches: HashMap<TypeId, bool>,
     /// The Oberon name of every type this module declares, so an interface can
     /// refer to it the way its reader spells it.
     oberon_names: HashMap<TypeId, String>,
-    /// How many type references the emitter could not resolve. A checked module
-    /// has none; if one appears, the emitted C carries a `#error` rather than
-    /// silently doing something else.
+    /// Number of unresolved type references. A checked module has none; an
+    /// unresolved reference produces a `#error` in the emitted C.
     unresolved: usize,
     /// Import alias -> the module it stands for.
     aliases: HashMap<String, String>,
-    /// The name each *declared* type will be given, filled before any type is
-    /// visited. A composite reached through a pointer — `ARRAY 2 OF P` where
-    /// `P = POINTER TO R` and `R` comes later in the same `TYPE` section — would
-    /// otherwise be met before its declaration and named `Anon_n`, so the
-    /// emitter would use one name and every other use another (DESIGN R32,
-    /// PLAN.md W2.4).
+    /// The name each *declared* type will be given, filled before visiting it.
+    /// Otherwise a composite reached through a pointer before its declaration
+    /// (`ARRAY 2 OF P`, where `P = POINTER TO R` and `R` comes later in the same
+    /// `TYPE` section) would otherwise be named `Anon_n`. Later uses would then
+    /// have a different name (DESIGN R32, PLAN.md W2.4).
     declared_names: HashMap<TypeId, String>,
     /// Emitted into the header: struct definitions, constants, externs.
     typedefs: String,
@@ -116,37 +153,36 @@ pub struct Emitter<'a> {
     trailer: String,
     scopes: Vec<HashMap<String, Sym>>,
     frames: Vec<Frame>,
-    /// Statements hoisted before the construct being emitted (the temporaries
-    /// for structured value parameters). Flushed exactly where the construct is
-    /// evaluated once — never out of a loop.
+    /// Statements hoisted before the construct being emitted (temporaries for
+    /// structured value parameters). Flush them where the construct is evaluated,
+    /// never out of a loop.
     prelude: String,
     anon: usize,
     /// Non-zero while rendering the right operand of `&&` or `||`, whose value
     /// must not be computed unless the operand is reached.
     in_conditional: usize,
-    /// The result type of the procedure being emitted, and whether its body
-    /// returns anywhere: `RETURN` is a statement now (PLAN.md W8.4), and every
-    /// return in a procedure funnels through one site so that §5 D6's
-    /// single-exit property survives the change.
+    /// The result type of the current procedure and whether its body returns.
+    /// through one site to preserve the single-exit property (D6 in section 5).
     cur_ret: Option<TypeId>,
     ret_label: bool,
-    /// Runtime checks (DESIGN §9.4, PLAN.md W3.1). On by default; `-Ochecks=n`
-    /// removes the index, `NIL` and guard checks and the type-`CASE` fallback, so
-    /// a violation becomes the program's problem instead of a located trap. The
-    /// divisor checks stay: they keep C's arithmetic *defined* rather than merely
-    /// unchecked (R4's stance), and `ASSERT` is a statement, not a check.
+    /// Runtime checks (DESIGN 9.4, PLAN.md W3.1). On by default; `-Ochecks=n`
+    /// removes index, `NIL`, guard, and type-`CASE` fallback checks. Violations
+    /// then become the program's responsibility instead of located traps.
+    /// Divisor checks remain to keep C arithmetic defined (R4). `ASSERT` is a
+    /// statement that performs a check.
     checks: Checks,
+    line_directives: Option<SourceMap>,
 }
 
 pub fn emit_module(module: &Module, types: &Types, sema: &Sema<'_>) -> (String, String) {
     emit_module_checked(module, types, sema, Checks::ALL)
 }
 
-/// Which runtime checks the emitter writes (PLAN.md W3.1, refined by W8.3). All of
-/// them by default; `-Ochecks=n` is the empty set, and `-Ochecks=index,guard` the
-/// subset that leaves the `NIL` check and the type-`CASE` fallback out. The divisor
-/// checks are not in the set: they keep C's arithmetic *defined* rather than merely
-/// unchecked (R4's stance), and `ASSERT` is a statement rather than a check.
+/// Which runtime checks the emitter writes (PLAN.md W3.1, refined by W8.3). All
+/// checks are enabled by default. `-Ochecks=n` disables them, while
+/// `-Ochecks=index,guard` keeps the `NIL` check and type-`CASE` fallback.
+/// Divisor checks stay enabled to keep C arithmetic defined (R4). `ASSERT`
+/// performs a check as a statement.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Checks {
     pub index: bool,
@@ -159,9 +195,8 @@ impl Checks {
     pub const ALL: Checks = Checks { index: true, nil: true, guard: true, case_: true };
     pub const NONE: Checks = Checks { index: false, nil: false, guard: false, case_: false };
 
-    /// The set named by `-Ochecks=<list>`. `all` and `none` are the whole and the
-    /// empty set; any other name that is not a check is `None`, so the driver can
-    /// say which one it did not know.
+    /// The set named by `-Ochecks=<list>`. `all` and `none` select the whole or
+    /// empty set. An unknown name returns `None` so the driver can report it.
     pub fn parse(list: &str) -> Option<Checks> {
         let mut c = Checks::NONE;
         for name in list.split(',') {
@@ -195,6 +230,21 @@ pub fn emit_module_checked(
     e.run(module)
 }
 
+/// Emit the checked module with C line directives for its source statements.
+pub fn emit_module_checked_with_lines(
+    module: &Module,
+    types: &Types,
+    sema: &Sema<'_>,
+    checks: Checks,
+    source: &str,
+    file: &str,
+) -> (String, String) {
+    let mut e = Emitter::new(module.name.clone(), types, sema);
+    e.checks = checks;
+    e.line_directives = Some(SourceMap::new(source, file));
+    e.run(module)
+}
+
 impl<'a> Emitter<'a> {
     fn new(module: String, types: &'a Types, sema: &'a Sema<'a>) -> Emitter<'a> {
         Emitter {
@@ -221,30 +271,29 @@ impl<'a> Emitter<'a> {
             in_conditional: 0,
             cur_ret: None,
             ret_label: false,
+            line_directives: None,
         }
     }
 
-    // ------------------------------------------------------------- top level
+    // Top-level emission
 
     fn run(&mut self, module: &Module) -> (String, String) {
         for imp in &module.imports {
             self.aliases.insert(imp.alias.clone(), imp.module.clone());
         }
-        // 1. Every composite type the module mentions, named, then emitted in
-        //    dependency order (element before array, base before derived).
-        //    The declared names go in *first*, so a type reached through a
-        //    pointer before its declaration still gets its own name.
+        // 1. Name each composite type, then emit them in dependency order
+        //    (element before array, base before derived). Set declared names
+        //    first so pointer references retain them.
         for t in &module.decls.types {
             let ty = self.decl_type(&t.ty);
             self.declared_names.insert(ty, self.cname(&t.name));
         }
         let mut wanted = Vec::new();
         self.collect_types(&module.decls, &mut wanted);
-        // Every named composite gets its forward declaration before any of them
-        // is defined: an array of pointers can then name a record declared later
-        // in the module, which is what `type_rank`'s ordering alone cannot give
-        // (a pointer imposes no order, so the array is emitted first). The
-        // definition repeats the same typedef, which C11 allows.
+        // Forward-declare every composite. Arrays of pointers can then refer to
+        // later record declarations. `type_rank` cannot ensure this because
+        // pointers don't constrain the order. C11 permits repeating the typedef
+        // with the definition.
         for t in self.type_names.keys().copied().collect::<Vec<_>>() {
             if matches!(self.types.get(t), Type::Array { .. } | Type::Record { .. }) {
                 let name = self.type_names[&t].clone();
@@ -310,26 +359,24 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        // 4. Procedures in declaration order: Oberon always declares before use,
-        //    so C needs no forward declarations beyond the header's prototypes.
+        // 4. Procedures follow their declarations. Oberon declares before use,
+        //    so C only needs the header's prototypes.
         let mut procs = String::new();
         for p in &module.decls.procs {
             self.procedure(p, &mut procs);
         }
 
-        // 5. The module body and the command table (report §11).
         let mut tail = String::new();
+        // 5. Emit the module body and command table (report 11).
         self.frames.push(Frame { frame: String::new(), level: 1, path: "init".into() });
         self.push_scope();
         let _ = writeln!(tail, "void {}__init(void) {{", self.module);
-        // The collector's roots, before the body can allocate (DESIGN §15.4):
-        // every module-level variable whose storage can reach the heap, with the
-        // map of that storage — a pointer variable's single slot at offset 0, a
-        // record variable's own type, an ARRAY OF RECORD's element type. A
-        // variable whose type reaches no pointer is not registered, so a module
-        // that holds no pointers registers nothing at all. It is emitted here
-        // rather than in the interface because the storage is this module's, and
-        // a client of an exported variable never allocates through it.
+        // Register collector roots before the body can allocate (DESIGN 15.4).
+        // Include module variables whose storage can reach the heap, with a map
+        // for that storage. Use the pointer slot, record type, or array element
+        // map as appropriate. Skip variables whose types contain no pointers.
+        // Register roots here because this module defines the storage. Clients
+        // don't allocate through exported variables.
         for v in &module.decls.vars {
             let ty = self.decl_type(&v.ty);
             for (name, _) in &v.names {
@@ -350,10 +397,9 @@ impl<'a> Emitter<'a> {
                 );
             }
         }
-        // Oberon does not require a module to read its own variables, and a
-        // `static` C variable the file never mentions is a `-Werror` failure
-        // (R20). Marking them costs a read of a zeroed static, exactly as the
-        // parameter marks do (PLAN.md W6.2).
+        // Mark unexported variables even if the module never reads them. C flags
+        // an unreferenced `static` variable under `-Werror` (R20). Reading its
+        // zero-initialized value costs the same as the parameter marks (PLAN.md W6.2).
         for v in &module.decls.vars {
             for (name, export) in &v.names {
                 if !*export {
@@ -403,10 +449,9 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(h, "#ifndef {guard}");
         let _ = writeln!(h, "#define {guard}");
         h.push_str("#include \"oberon.h\"\n");
-        // The modules this one imports, so their types and prototypes are
-        // visible to whoever includes this header (DESIGN §9.8). SYSTEM has no
-        // header: it is the compiler's own module (§9.10), and the import list of
-        // the emitted `.sym` is what records that a client depended on it.
+        // Include imported modules so their types and prototypes are available
+        // to header users (DESIGN 9.8). SYSTEM has no header because it is a
+        // compiler module (9.10). The emitted `.sym` records SYSTEM imports.
         for imp in &module.imports {
             if imp.module == "SYSTEM" {
                 continue;
@@ -424,8 +469,8 @@ impl<'a> Emitter<'a> {
     fn commands(&mut self, m: &Module, out: &mut String) {
         let mut entries = Vec::new();
         for p in &m.decls.procs {
-            // Only a parameterless procedure can be a command, and only then is
-            // the `void (*)(void)` entry sound (report §11; risk R12).
+            // Only parameterless procedures are commands. The `void (*)(void)`
+            // entry matches their signature (report 11, risk R12).
             if p.export && p.params.is_empty() && p.result.is_none() {
                 entries.push((p.name.clone(), format!("{}__{}", self.module, mangle(&p.name))));
             }
@@ -442,7 +487,7 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(out, "}}");
     }
 
-    // ------------------------------------------------------------ new types
+    // Type emission
 
     fn collect_types(&mut self, decls: &ast::Decls, _wanted: &mut Vec<TypeId>) {
         for t in &decls.types {
@@ -456,9 +501,8 @@ impl<'a> Emitter<'a> {
         }
         for p in &decls.procs {
             for sec in &p.params {
-                // The checker recorded an FPSection's type under the procedure's
-                // span (it flattens the section there), which is the key used
-                // here too.
+                // The checker records the flattened FPSection type under the
+                // procedure's span, which is also the lookup key here.
                 let key = span_of_type(&TypeExpr::Named(sec.ty.base.clone(), p.span));
                 if let Some(t) = self.sema.type_at(key, self.types) {
                     self.name_type(t, "");
@@ -469,15 +513,15 @@ impl<'a> Emitter<'a> {
     }
 
     fn name_type(&mut self, t: TypeId, declared: &str) {
-        // A type that came from an interface file belongs to that module and is
-        // defined by its header; naming it here again would create a second,
-        // incompatible C type (DESIGN §9.8).
+        // A type from an interface file belongs to that module and its header
+        // defines it. Naming it here would create a second, incompatible C type
+        // (DESIGN 9.8).
         if self.sema.qualified_name(t).is_some() {
             return;
         }
-        // Naming a composite *before* visiting its dependencies is what makes
-        // recursive types terminate: `P = POINTER TO R; R = RECORD next: P END`
-        // comes back to R, which is already named and therefore already done.
+        // Name a composite before visiting its dependencies to handle recursive
+        // types. For `P = POINTER TO R; R = RECORD next: P END`, this finds R
+        // already named when it returns through P.
         match self.types.get(t).clone() {
             Type::Array { elem, .. } => {
                 let name = if declared.is_empty() {
@@ -521,8 +565,8 @@ impl<'a> Emitter<'a> {
                 }
             }
             Type::Pointer { base } => {
-                // The pointee may not be named yet — that is exactly the case this
-                // map exists for — so its *declared* name comes first.
+                // This map supplies a declared name when the pointee is not
+                // named yet. Use it before trying the generated C name.
                 let bname = self
                     .declared_names
                     .get(&base)
@@ -548,8 +592,8 @@ impl<'a> Emitter<'a> {
         match self.types.get(t) {
             Type::Array { elem, .. } => 100 + self.type_rank(*elem),
             Type::Record { base, fields, .. } => {
-                // A by-value field must be complete before this record, and so
-                // must the base it embeds. Pointer fields impose no order.
+                // By-value fields and embedded bases must be complete first.
+                // Pointer fields don't constrain the order.
                 let mut rank = 200;
                 if let Some(b) = base {
                     rank = rank.max(200 + self.type_rank(*b));
@@ -577,15 +621,14 @@ impl<'a> Emitter<'a> {
             Type::Record { base, fields, .. } => {
                 let _ = writeln!(self.typedefs, "typedef struct {name} {name};");
                 let _ = writeln!(self.typedefs, "struct {name} {{");
-                // The descriptor lives in the base-most record of the chain
-                // (oberon/csmoke's verified layout): a derived record starts
-                // with its base, so `*(ObDesc **)p` is the same word for a
-                // Base* and a Derived* - which is what `IS`, a guard and a
-                // type CASE rely on.
+                // The descriptor is stored in the first record in the base
+                // chain (verified in `oberon/csmoke`). Every derived record
+                // begins with its base, so `*(ObDesc **)p` reads the same word
+                // through a `Base*` or `Derived*`. `IS`, guards, and type CASE
+                // use that shared descriptor.
                 match base {
                     Some(b) => {
-                        // The base may belong to an imported module, in which
-                        // case its name comes from that module's namespace.
+                        // An imported base type uses its module's namespace.
                         let bname = self.type_c_name(b).unwrap_or_else(|| "void".into());
                         let _ = writeln!(self.typedefs, "    {bname} base;");
                     }
@@ -608,10 +651,9 @@ impl<'a> Emitter<'a> {
                     },
                     None => "NULL".into(),
                 };
-                // The pointer map the collector marks by (DESIGN §15.2). It is
-                // written from the same walk `desc_init` uses to give every
-                // nested record its descriptor, and a type that reaches no
-                // pointer gets no map at all rather than an empty one.
+                // The collector's pointer map (DESIGN 15.2) uses the same walk
+                // as `desc_init` to describe nested records. Types without
+                // pointers have no map.
                 let map = self.record_fields(t);
                 let fields_ref = if map.is_empty() {
                     "NULL".into()
@@ -635,11 +677,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    // ------------------------------------------------------------ C binding
+    // C bindings
 
     fn binding(&self, t: TypeId, name: &str) -> String {
-        // A procedure type is a *declarator*, not a type name, so the variable
-        // has to go inside it: `int32_t (*f)(int32_t)`.
+        // A procedure type is a declarator: place the variable name inside it,
+        // as in `int32_t (*f)(int32_t)`.
         if let Type::Proc { params, result } = self.types.get(t) {
             let r = match result {
                 Some(r) => self.c_type(*r),
@@ -714,13 +756,13 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The type of a declaration's `TypeExpr`: the semantic pass recorded every
-    /// type expression by span (DESIGN §6).
+    /// The type of a declaration's `TypeExpr`, recorded by the semantic pass
+    /// under its span (DESIGN 6).
     fn decl_type(&self, t: &TypeExpr) -> TypeId {
         self.sema.type_at(span_of_type(t), self.types).unwrap_or(TypeId(0))
     }
 
-    // ----------------------------------------------------------------- scope
+    // Scope helpers
 
     fn declare(&mut self, name: &str, sym: Sym) {
         self.scopes.last_mut().expect("a scope").insert(name.to_string(), sym);
@@ -738,7 +780,7 @@ impl<'a> Emitter<'a> {
         format!("{}__{}", self.module, mangle(name))
     }
 
-    // ----------------------------------------------------------- procedures
+    // Procedure emission
 
     fn procedure(&mut self, p: &ast::Proc, out: &mut String) {
         let (outer_ret, outer_label) = (self.cur_ret, self.ret_label);
@@ -770,7 +812,7 @@ impl<'a> Emitter<'a> {
         let mut args: Vec<String> = Vec::new();
         let mut proto_args: Vec<String> = Vec::new();
         if level > 1 {
-            // report §6.5 / DESIGN §9.7: a nested procedure takes a static link.
+            // A nested procedure takes a static link (report 6.5, DESIGN 9.7).
             args.push("void *sl".into());
             proto_args.push("void *".into());
         }
@@ -971,8 +1013,8 @@ impl<'a> Emitter<'a> {
         self.pop_scope();
     }
 
-    /// The type a name denotes at this point: a type declared in the current
-    /// procedure or module, or one imported as `M.T`.
+    /// The type a name refers to in this scope: one declared in the current
+    /// procedure or module, or imported as `M.T`.
     fn qident_type(&self, q: &QIdent) -> Option<TypeId> {
         if q.len() == 2 {
             let module = self.module_of_alias(&q[0])?;
@@ -985,28 +1027,26 @@ impl<'a> Emitter<'a> {
         self.lookup(&q[0]).map(|s| s.ty)
     }
 
-    // ----------------------------------------------------------- statements
+    // Statement emission
 
     fn take_prelude(&mut self) -> String {
         std::mem::take(&mut self.prelude)
     }
 
-    /// Fixes a value in the prelude and hands back the name it was fixed under.
+    /// Fixes a value in the prelude and returns the name used for it.
     ///
-    /// Oberon's reference compilers evaluate operands left to right, while C
-    /// leaves the order of the operands of `+`, `*`, `/` — and of a call's
-    /// arguments — unspecified, so `m0 + R(3)` where `R` writes `m0` may come out
-    /// either way. Fixing both operands in source order makes the emitted C say
-    /// what the language says (DESIGN R23; the generator found it, PLAN.md W6.2).
+    /// Oberon's reference compilers evaluate operands left to right, but C leaves
+    /// the order of `+`, `*`, `/`, and call arguments unspecified. `m0 + R(3)`
+    /// may differ when `R` writes `m0`. Fixing both operands in source order
+    /// preserves the language's evaluation order (DESIGN R23, PLAN.md W6.2).
     fn materialise(&mut self, t: TypeId, value: &str) -> String {
         self.anon += 1;
         let tmp = format!("tmp__{}", self.anon);
         let decl = self.binding(t, &tmp);
         if self.in_conditional > 0 {
-            // Inside a `&&`/`||` operand the value must not be computed unless
-            // that operand is reached, so only the declaration is hoisted (it
-            // evaluates nothing) and the assignment stays where the value is —
-            // a comma expression, which C sequences.
+            // Inside a `&&`/`||` operand, compute the value only when that
+            // operand is reached. Hoist only the declaration; keep the
+            // assignment in a comma expression, which C sequences.
             let _ = writeln!(self.prelude, "    {decl};");
             format!("(({tmp} = {value}), {tmp})")
         } else {
@@ -1037,6 +1077,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut String, level: usize) {
+        if let Some(source_map) = &self.line_directives {
+            source_map.directive(s.span, out);
+        }
         match &s.kind {
             StmtKind::Assign { target, value } => {
                 let dst = self.designator(target, level, true);
@@ -1045,20 +1088,32 @@ impl<'a> Emitter<'a> {
                 let pre = self.take_prelude();
                 out.push_str(&pre);
                 let dst_ty = self.sema.type_at(target.span, self.types);
-                // A string literal into a CHAR array is a padded copy, which is
-                // a call and not an assignment (report §9.1.2).
-                if let (Some(dt), ExprKind::Str(text)) = (dst_ty, &value.kind) {
+                // A string value assigned to a CHAR array needs a padded copy
+                // (report 9.1.2). Imported constants retain their designator in
+                // the AST, so use the checker's folded value as well.
+                let string_value = match &value.kind {
+                    ExprKind::Str(text) => Some(text.clone()),
+                    _ => match self.sema.const_at(value.span) {
+                        Some(sema::const_eval::Const::Str(text)) => Some(text),
+                        _ => None,
+                    },
+                };
+                if let (Some(dt), Some(text)) = (dst_ty, string_value.as_deref()) {
                     if let Type::Array { len, elem } = self.types.get(dt) {
                         if self.types.is_char(*elem) {
-                            let _ = writeln!(out, "    rt_strcopy({dst}.e, {len}, \"{}\");", escape_c(text));
+                            let _ = writeln!(
+                                out,
+                                "    rt_strcopy({dst}.e, {len}, \"{}\");",
+                                escape_c(text)
+                            );
                             return;
                         }
                     }
                 }
-                // A record assigned from another record *type* (an extension
-                // up-cast) keeps the destination's static descriptor: a plain C
-                // struct assignment would copy the source's, making a base
-                // variable advertise a derived dynamic type (DESIGN §9.3).
+                // Assigning an extended record to a base record must keep the
+                // destination's static descriptor. A plain C assignment would
+                // copy the source descriptor and give the base variable its
+                // derived type (DESIGN 9.3).
                 if let (Some(d), Some(sr)) = (dst_ty0, src_ty0) {
                     if self.types.is_record(d) && self.types.is_record(sr) && !self.types.same_type(d, sr) {
                         let pre = self.take_prelude();
@@ -1075,7 +1130,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 // A full-length array-to-array copy is C struct assignment and
-                // leaves no terminator (risk R14).
+                // doesn't write a terminator (risk R14).
                 let rhs = self.assign_rhs(value, dst_ty, level);
                 let pre2 = self.take_prelude();
                 out.push_str(&pre2);
@@ -1122,8 +1177,8 @@ impl<'a> Emitter<'a> {
                 out.push_str(&text);
             }
             StmtKind::While { arms } => {
-                // report §9.6: repeat until no guard is true. A guard's
-                // temporary goes inside the loop, so it is remade per iteration.
+                // Repeat until a guard is true. Recreate each guard's temporary
+                // inside the loop on every iteration.
                 let _ = writeln!(out, "    for (;;) {{");
                 for (i, (cond, body)) in arms.iter().enumerate() {
                     let c = self.expr(cond, Some(self.types.boolean()));
@@ -1140,8 +1195,7 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(out, "    }}");
             }
             StmtKind::Repeat { body, until } => {
-                // `do … while (!c)` would move a temporary out of the loop, so
-                // the explicit form is always emitted.
+                // An explicit loop keeps the condition's temporary inside it.
                 let _ = writeln!(out, "    for (;;) {{");
                 for s in body {
                     self.stmt(s, out, level);
@@ -1152,15 +1206,14 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(out, "        if ({c}) break;");
                 let _ = writeln!(out, "    }}");
             }
-            // `EXIT` (PLAN.md W8.5): C's `break` leaves the innermost loop, which
-            // is what every emitted loop is — a `for (;;)` with its guards inside,
-            // or a C `for` for the counted one — so no bookkeeping is needed.
+            // `EXIT` (PLAN.md W8.5) uses C's `break`, which exits the innermost
+            // loop. Every emitted loop is `for (;;)` or a counted C `for`, so
+            // no extra bookkeeping is needed.
             StmtKind::Exit => {
                 let _ = writeln!(out, "    break;");
             }
-            // Every return goes through the procedure's single exit: the value is
-            // left in the accumulator and control jumps to the one place that
-            // returns it (§5 D6, PLAN.md W8.4).
+            // Store each return value in the accumulator, then jump to the
+            // procedure's single exit point (section 5 D6, PLAN.md W8.4).
             StmtKind::Return(e) => {
                 self.ret_label = true;
                 if let (Some(e), Some(want)) = (e, self.cur_ret) {
@@ -1208,9 +1261,8 @@ impl<'a> Emitter<'a> {
         let pre = self.take_prelude();
         out.push_str(&pre);
         if is_type_case {
-            // DESIGN 9.3: switch on the descriptor id; inside an arm the case
-            // variable has the label's type (report §9.5), which is modelled by
-            // rebinding the name in an arm-local scope.
+            // DESIGN 9.3: switch on the descriptor id. Each arm's local variable
+            // has the label's type (report 9.5).
             let desc = self.dyn_of(&subj, sub_ty);
             // A NIL subject is of no type, so it matches no label: id 0 is the
             // "no type" sentinel and no label carries it, which leaves the default
@@ -1310,8 +1362,8 @@ impl<'a> Emitter<'a> {
             }
             if labels.is_empty() {
                 if default_taken {
-                    // A second label-less arm in one CASE is unreachable code in
-                    // Oberon too; C tolerates only one `default`.
+                    // A second label-less arm is unreachable in Oberon too.
+                    // C permits only one `default`.
                     let _ = writeln!(out, "    {{");
                 } else {
                     default_taken = true;
@@ -1332,10 +1384,9 @@ impl<'a> Emitter<'a> {
             }
             let _ = writeln!(out, "    break; }}");
         }
-        // A value that matches no label traps, as it does in the type-`CASE` above
-        // and as W2.5 decided: a silent fall-through is the one thing this design
-        // does not do with an undefined result. `self.checks.case_` still governs it,
-        // so `-Ochecks=…` can turn it off with the rest.
+        // A value matching no label traps, as in the type CASE above (W2.5).
+        // This avoids silent fall-through with an undefined result.
+        // `self.checks.case_` controls the fallback. `-Ochecks=...` disables it.
         if !default_taken && self.checks.case_ {
             let _ = writeln!(
                 out,
@@ -1346,8 +1397,8 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(out, "    }}");
     }
 
-    /// The descriptor of the record a designator denotes: for a POINTER, the
-    /// first word of the payload; for a record, the first word of its storage.
+    /// The record descriptor for a designator: read the first payload word for a
+    /// POINTER, or the first storage word for a record.
     fn dyn_of(&self, subj: &str, ty: TypeId) -> String {
         if self.types.is_pointer(ty) {
             format!("(*(const ObDesc *const *)(const void *)({subj}))")
@@ -1365,10 +1416,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The right-hand side of an assignment, adjusted where Oberon's and C's
-    /// type systems differ (DESIGN §9.6): a derived record into a base-typed
-    /// destination needs the base prefix, and two distinct pointer types need a
-    /// cast.
+    /// Adjusts the assignment's right-hand side where Oberon and C types differ
+    /// (DESIGN 9.6). A derived record assigned to a base destination needs the
+    /// base prefix. Distinct pointer types need a cast.
     fn assign_rhs(&mut self, value: &Expr, dst_ty: Option<TypeId>, level: usize) -> String {
         let dst = dst_ty.unwrap_or(TypeId(0));
         let src = self.sema.type_at(value.span, self.types).unwrap_or(TypeId(0));
@@ -1385,26 +1435,21 @@ impl<'a> Emitter<'a> {
         v
     }
 
-    // ---------------------------------------------------------- expressions
+    // Expression emission
 
     fn expr(&mut self, e: &Expr, want: Option<TypeId>) -> String {
-        // A constant expression is emitted as its value. The C compiler would
-        // fold it anyway; the point is that it also *warns* about the overflow it
-        // folds through (`-Woverflow`, and a tautological comparison), and the
-        // documented build line treats warnings as errors (R20, PLAN.md W6.2).
-        // The folder is the same one DESIGN §8.3 cross-checks against the
-        // runtime, so this cannot disagree with the emitted helpers.
-        // The resolver is the checker's use-site table: a designator that names a
-        // constant is folded to its value, which is what lets `MAX * (1 + c0)`
-        // become one literal instead of a C expression that overflows.
-        // Two limits on what may be folded, both of them correctness rather than
-        // taste: only *structurally* constant trees (`foldable`), because the
-        // folder recognises a builtin such as `ABS` by its spelling and a nested
-        // procedure or a parameter may legally shadow that name — and a call may
-        // have side effects, so it has to reach the emitted C; and only values
-        // that are INTEGER or BOOLEAN, emitted in their own C type, because a
-        // CHAR taken through `Const::int()` would come out as an `int32_t` and
-        // the narrowing assignment is a `-Werror` failure where `char` is signed.
+        // The C compiler would fold constants anyway, but it also warns about
+        // overflow (`-Woverflow`) and tautological comparisons. The documented
+        // build treats warnings as errors (R20, PLAN.md W6.2). The folder is
+        // checked against the runtime (DESIGN 8.3), so results match helpers.
+        // The resolver's use-site table folds designators that name constants.
+        // This turns `MAX * (1 + c0)` into one literal, avoiding C overflow.
+        // Fold only structurally constant trees (`foldable`). Builtins such as
+        // `ABS` may be shadowed by a nested procedure or parameter. Calls may
+        // also have side effects, so leave both for emitted C. Fold only INTEGER
+        // or BOOLEAN values in their own C type. `Const::int()` would emit a CHAR
+        // as `int32_t`, causing a narrowing assignment to fail under `-Werror`
+        // when `char` is signed.
         if self.foldable(e) {
             match const_eval::eval_with(e, &|x| self.sema.const_at(x.span)) {
                 Ok(const_eval::Const::Int(v)) => return format!("((int32_t){}u)", v),
@@ -1421,7 +1466,7 @@ impl<'a> Emitter<'a> {
             ExprKind::Bool(b) => if *b { "1".into() } else { "0".into() },
             ExprKind::Nil => "NULL".into(),
             ExprKind::Str(text) => {
-                // A one-character string where a CHAR is expected: report §10.1
+                // A one-character string in a CHAR context: report 10.1
                 // writes `ch <= "9"` and `ORD("0")`.
                 if let Some(w) = want {
                     if self.types.is_char(w) {
@@ -1431,6 +1476,14 @@ impl<'a> Emitter<'a> {
                 format!("\"{}\"", escape_c(text))
             }
             ExprKind::Designator(d) => {
+                if d.sels.is_empty() {
+                    if let Some(const_eval::Const::Str(text)) = self.sema.const_at(e.span) {
+                        if want.is_some_and(|t| self.types.is_char(t)) {
+                            return format!("\"{}\"[0]", escape_c(&text));
+                        }
+                        return format!("\"{}\"", escape_c(&text));
+                    }
+                }
                 if matches!(d.sels.last(), Some(Selector::Call(_))) {
                     return self.call_value(d, self.current_level());
                 }
@@ -1458,10 +1511,8 @@ impl<'a> Emitter<'a> {
                 };
                 let target = self.descriptor_name(t);
                 let test = format!("rt_is({}, {target})", self.dyn_of(&v, ty));
-                // `NIL IS T` is false, and the descriptor of a NIL pointer is at
-                // address zero — so the test has to come second (a C-path gap
-                // W9.2b found by comparing the two back ends; the guard spelling
-                // has always ordered it this way).
+                // `NIL IS T` is false. Since NIL's descriptor address is zero,
+                // test for NIL first (W9.2b, found when comparing the back ends).
                 if self.types.is_pointer(ty) {
                     format!("(({v}) != NULL && {test})")
                 } else {
@@ -1489,8 +1540,8 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The descriptor symbol of a type: a pointer type has none of its own, so
-    /// it names its base record's (DESIGN §9.3).
+    /// The descriptor symbol for a type. Pointer types have no descriptor of
+    /// their own, so use the base record's symbol (DESIGN 9.3).
     fn descriptor_name(&self, t: TypeId) -> String {
         let rec = if self.types.is_pointer(t) {
             self.types.deref(t).unwrap_or(t)
@@ -1506,11 +1557,10 @@ impl<'a> Emitter<'a> {
     fn binary(&mut self, op: BinOp, l: &Expr, r: &Expr) -> String {
         let lt = self.sema.type_at(l.span, self.types).unwrap_or(TypeId(0));
         let rt = self.sema.type_at(r.span, self.types).unwrap_or(TypeId(0));
-        // `x = x` is true and `x < x` is false for every scalar but REAL (where
-        // NaN makes it false), yet C compilers warn about the comparison itself
-        // and the documented build line treats warnings as errors (R20). Only
-        // plainly side-effect-free operands are folded: a call may differ per
-        // call, and in Oberon it may have side effects.
+        // Identical side-effect-free scalar operands compare equal (or ordered)
+        // except for REAL, where NaN affects the result. Folding also avoids C
+        // warnings for tautological comparisons (R20). Calls aren't folded
+        // because they can have side effects or return different values.
         if self.types.same_type(lt, rt)
             && !matches!(self.types.get(lt), Type::Basic(Basic::Real))
             && matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
@@ -1527,9 +1577,8 @@ impl<'a> Emitter<'a> {
         } else {
             None
         };
-        // `&&` and `||` are sequenced by C already — and sequencing them by
-        // hand would evaluate the right operand eagerly, which is the one thing
-        // short-circuiting exists to prevent.
+        // C sequences `&&` and `||`. Sequencing them by hand would eagerly
+        // evaluate the right operand, defeating short-circuiting.
         let sequenced = !matches!(op, BinOp::And | BinOp::Or)
             && (self.has_call(l) || self.has_call(r));
         let array_of_operands = {
@@ -1557,10 +1606,9 @@ impl<'a> Emitter<'a> {
         if sequenced && !self.is_address(r) && !array_of_operands && !self.is_aggregate(rt) {
             b = self.materialise(want.unwrap_or(rt), &b);
         }
-        // Two single characters compare as ordinals: a C `char` may be signed,
-        // in which case `255X > 1X` would come out backwards (report §8.2.4).
-        // A *string* of more than one character is a character array, and goes
-        // to the bounded comparison below instead.
+        // Single-character strings compare as ordinals. C `char` may be signed,
+        // which would reverse `255X > 1X` (report 8.2.4). Longer strings are
+        // arrays and use the bounded comparison below.
         let char_cmp = self.types.is_char_like(lt) && self.types.is_char_like(rt);
         if char_cmp {
             a = format!("(unsigned char)({a})");
@@ -1572,15 +1620,15 @@ impl<'a> Emitter<'a> {
         if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
             && array_cmp
         {
-            // Bounded comparison: an ARRAY n OF CHAR need not be terminated
-            // (DESIGN §9.5, risk R14).
+            // Bounded comparison supports CHAR arrays without a terminator
+            // (DESIGN 9.5, risk R14).
             let (na, nb) = (self.char_len(lt), self.char_len(rt));
             if sequenced {
                 a = self.materialise_addr("const char", &format!("(const char *)&({a})"));
                 b = self.materialise_addr("const char", &format!("(const char *)&({b})"));
             }
-            // With the addresses already fixed, the temporaries *are* the
-            // arguments; without them the addresses are taken in place.
+            // With fixed addresses, the temporaries are the arguments. Otherwise
+            // the addresses are taken in place.
             let cmp = if sequenced {
                 format!("rt_charcmp({a}, {na}, {b}, {nb})")
             } else {
@@ -1595,9 +1643,8 @@ impl<'a> Emitter<'a> {
                 _ => format!("({cmp} >= 0)"),
             };
         }
-        // report §8.2.3: with a SET operand, `+ - * /` are union, difference,
-        // intersection and symmetric difference, and `-` on its own is the
-        // complement (handled with the unary operators).
+        // Report 8.2.3 defines the SET operators `+ - * /` as union, difference,
+        // intersection, and symmetric difference. Unary `-` means complement.
         if self.types.is_set(lt) && self.types.is_set(rt) {
             return match op {
                 BinOp::Add => format!("({a} | {b})"),
@@ -1610,9 +1657,8 @@ impl<'a> Emitter<'a> {
         self.binary_plain(op, &a, &b, lt, rt, l.span.lo)
     }
 
-    /// Whether evaluating this expression can call something — an Oberon call is
-    /// the only side effect an expression can have. Exhaustive, so a new
-    /// expression form has to be classified rather than defaulting to "harmless".
+    /// Whether this expression can call something. Calls are the only expression
+    /// side effect. Classify every form so new expressions aren't assumed safe.
     fn has_call(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Designator(d) => d.sels.iter().any(|s| match s {
@@ -1653,21 +1699,19 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Whether two operands are the same literal or the same selector-free
-    /// designator. `Expr`'s derived `PartialEq` includes source *spans*, so two
-    /// occurrences of `x` in `x = x` never compare equal as parsed — which is why
-    /// this compares the structure that matters and nothing else.
-    /// Two trees that are the same expression and cannot differ between two
-    /// evaluations, so `x > x` folds to a constant. Excluded: a call (it may
-    /// differ per call and may have side effects) and a selector (a dereference,
-    /// an index and a type guard can *trap*, and folding would drop the trap).
+    /// Whether two operands have the same literal or selector-free designator.
+    /// Derived `PartialEq` includes source spans, so separate occurrences of
+    /// `x` in `x = x` do not compare equal. Compare only the relevant structure.
+    /// Identical expressions without calls or selectors cannot differ between
+    /// evaluations, so `x > x` folds to a constant. A call may return a
+    /// different value or have side effects. A selector can trap on a
+    /// dereference, index, or type guard, so folding it would omit the trap.
     fn same_plain(&self, l: &Expr, r: &Expr) -> bool {
         !self.has_call(l) && self.trap_free(l) && self.same_tree(l, r)
     }
 
-    /// Structural equality that ignores spans: `l.kind == r.kind` would compare
-    /// the spans the parser recorded, which differ between two occurrences of
-    /// the same designator.
+    /// Structural equality that ignores spans: parsed occurrences of the same
+    /// designator have different spans.
     fn same_tree(&self, l: &Expr, r: &Expr) -> bool {
         match (&l.kind, &r.kind) {
             (ExprKind::Int(a), ExprKind::Int(b)) => a == b,
@@ -1750,10 +1794,8 @@ impl<'a> Emitter<'a> {
             BinOp::Add => format!("({a} + {b})"),
             BinOp::Sub => format!("({a} - {b})"),
             BinOp::Mul => format!("({a} * {b})"),
-            // report §8.2.2: `/` on integers is the quotient the folder computes
-            // as DIV (the report defines only DIV/MOD precisely), so it uses the
-            // same helper. REAL division and SET symmetric difference are not
-            // affected.
+            // For integers, `/` uses the same quotient as DIV (report 8.2.2).
+            // REAL division and SET symmetric difference are not affected.
             BinOp::Div if self.types.is_integer_like(lt) && self.types.is_integer_like(rt) => {
                 format!("rt_div_at({a}, {b}, {at})")
             }
@@ -1782,12 +1824,10 @@ impl<'a> Emitter<'a> {
         self.frames.last().map(|f| f.level).unwrap_or(1)
     }
 
-    /// How a symbol is written where it is used: a plain name, a frame field
-    /// reached through the static links, and for a `VAR` parameter a deref of
-    /// whichever of those holds the pointer.
-    /// The hidden length that accompanies an open-array formal, named the way
-    /// `access` names the array itself (through the static links when the
-    /// parameter belongs to an enclosing procedure).
+    /// How to write a symbol at its use: a plain name or a frame field reached
+    /// through static links. A `VAR` parameter instead needs a dereference.
+    /// The hidden length for an open-array formal follows the same access path,
+    /// including static links for an enclosing procedure's parameter.
     fn access_len(&self, s: &Sym, level: usize) -> String {
         let place = if s.level == 0 || s.level >= level {
             s.cname.clone()
@@ -1808,8 +1848,8 @@ impl<'a> Emitter<'a> {
         } else {
             // Walk the static links (oberon/csmoke's `nested-link-*` scheme).
             // Every frame keeps its own link in its first word.
-            // `sl` points at the *parent's* frame, so a symbol one level up
-            // needs no hop, one two levels up needs one, and so on.
+            // `sl` points at the parent's frame. A symbol one level up needs
+            // zero hops; one two levels up needs one, and so on.
             let mut link = String::from("sl");
             for _ in 0..(level - s.level - 1) {
                 link = format!("(*(void **)({link}))");
@@ -1817,11 +1857,10 @@ impl<'a> Emitter<'a> {
             let frame = self.frame_at(s.level);
             format!("(({frame} *){link})->{}", s.cname.trim_start_matches("f."))
         };
-        // A `VAR` parameter is a pointer to the actual, so the access dereferences
-        // it — except an *open array*, whose parameter is already the pointer to
-        // the first element (§9.2), in both modes. Dereferencing that one produced
-        // `(*v)[i]`, which does not compile: found by the trap matrix's open-array
-        // case (PLAN.md W7.4).
+        // A `VAR` parameter points to the actual, so access dereferences it.
+        // Open arrays are the exception: their parameter already points to the
+        // first element (section 9.2). Dereferencing would produce `(*v)[i]`,
+        // which does not compile (PLAN.md W7.4).
         if s.by_var && !matches!(self.types.get(s.ty), Type::OpenArray { .. }) {
             format!("(*{place})")
         } else {
@@ -1837,8 +1876,8 @@ impl<'a> Emitter<'a> {
             .unwrap_or_default()
     }
 
-    /// Where a field lives: the derived record embeds its base as its first
-    /// member (DESIGN §9.3), so an inherited field is `.base.base.field`.
+    /// Where a field is stored: derived records embed their base as the first
+    /// member (DESIGN 9.3), so inherited fields use `.base.base.field`.
     fn field_path(&self, rec: TypeId, f: &str) -> Option<String> {
         let mut cur = rec;
         let mut prefix = String::new();
@@ -1876,11 +1915,10 @@ impl<'a> Emitter<'a> {
     }
 
     /// The pointer map of a record type: where the pointers are inside a region
-    /// of that type (DESIGN §15.2). It is the same walk `desc_init` uses to give
-    /// every nested record its descriptor, written as `offsetof` expressions so
-    /// the map follows the C layout the back end does not compute for itself.
-    /// A base's fields are a derived record's too — `base` is its first member —
-    /// so each level of the chain adds one more `offsetof` term.
+    /// `offsetof` terms from the C layout, which the back end does not compute.
+    /// The map uses the same walk as `desc_init` to describe nested records.
+    /// Since a base's fields are also derived-record fields, each level adds an
+    /// `offsetof` term.
     fn record_fields(&mut self, t: TypeId) -> Vec<String> {
         let mut out = Vec::new();
         self.collect_record_fields(t, "", &mut out);
@@ -1903,13 +1941,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The map entries for a region of type `t` whose first byte is at `off`
-    /// (DESIGN §15.2). A pointer field is one slot; an array of pointers is a run
-    /// of slots; an array of records is a run of descriptor-fronted records,
-    /// which their own map then walks; and a record field is the run of one.
-    /// Anything else — an `INTEGER`, a procedure variable, which holds a code
-    /// address and never an object — reaches no pointer, and a record that
-    /// reaches none gets no map at all, so marking it costs one NULL test.
+    /// Map entries for a region of type `t` beginning at `off` (DESIGN 15.2).
+    /// A pointer field is one slot; arrays of pointers are runs of slots, and
+    /// arrays of records are runs of descriptor-fronted records. A record field
+    /// is one run. Integers and procedure variables contain no object pointers.
+    /// A record without pointers has no map, so marking it costs one NULL test.
     fn region_fields(&mut self, t: TypeId, off: &str) -> Vec<String> {
         match self.types.get(t).clone() {
             Type::Pointer { .. } => vec![format!("{off}, 0, 1, NULL")],
@@ -1938,14 +1974,12 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// An array type flattened to its innermost element and its element count:
-    /// the dimensions are contiguous in the C struct — each is a single-member
-    /// struct of the next — so one run at the element's size covers the whole
-    /// array, however many dimensions the source wrote.
+    /// Flatten an array type to its innermost element and element count.
+    /// Dimensions are contiguous in the C struct, so one run uses the element
+    /// size across all source dimensions.
     fn array_run(&self, t: TypeId) -> (usize, TypeId) {
-        // The product saturates: a type with that many elements has no storage
-        // any machine could hold, so its map is never walked — and a wrapped
-        // count would be a wrong run rather than an unreachable one.
+        // Saturate the product. An array with that many elements cannot fit in
+        // machine storage. A wrapped count would describe the wrong run.
         let mut n: usize = 1;
         let mut elem = t;
         while let Type::Array { len, elem: e } = self.types.get(elem).clone() {
@@ -1955,10 +1989,8 @@ impl<'a> Emitter<'a> {
         (n, elem)
     }
 
-    /// Does a region of this type reach a pointer at all? Memoized, because a
-    /// type graph is a DAG and answering this per field without a memo is
-    /// exponential in its depth; a record cannot contain itself by value, so the
-    /// recursion terminates (a pointer back to it ends the walk at the pointer).
+    /// exponential in its depth; records cannot contain themselves by value, so
+    /// the walk ends at a pointer back to the record.
     fn reaches_pointer(&mut self, t: TypeId) -> bool {
         if let Some(&known) = self.reaches.get(&t) {
             return known;
@@ -1994,9 +2026,9 @@ impl<'a> Emitter<'a> {
     }
 
     /// Give a record storage its static descriptor and every record *inside* it
-    /// its own (DESIGN §9.3). The descriptor word belongs to the outermost
-    /// record, so only this function sets it; the base's fields are visited for
-    /// their descriptors, never its own descriptor word.
+    /// its own descriptor (DESIGN 9.3). The outermost record owns the descriptor
+    /// word, so only this function sets it. It visits base fields for their
+    /// descriptors, not the base descriptor word.
     fn desc_init(&self, t: TypeId, expr: &str, out: &mut String, indent: &str) {
         match self.types.get(t).clone() {
             Type::Record { base, fields, .. } => {
@@ -2079,9 +2111,8 @@ impl<'a> Emitter<'a> {
         // sound while `p` has no side effect. An *index* expression may contain a
         // call, so the flag is tracked selector by selector.
         let mut volatile = false;
-        // An open-array formal's length is a hidden companion parameter (§9.2),
-        // and the *index* check needs it — only the base of a designator can be an
-        // open array, so it is captured once here.
+        // Open-array formals have a hidden length (9.2), which the index check
+        // needs. Only a designator's base can be open, so capture it once here.
         let mut open_len: Option<String> = base_sym
             .as_ref()
             .filter(|s| matches!(self.types.get(s.ty), Type::OpenArray { .. }))
@@ -2116,11 +2147,9 @@ impl<'a> Emitter<'a> {
                     for e in ix {
                         let i = self.expr(e, Some(self.types.integer()));
                         if open {
-                            // An open-array parameter is a pointer (report §10.1)
-                            // and its length is that companion parameter, so the
-                            // bounds check has something to check against. Indexing
-                            // an open array used to be emitted with no check at all
-                            // — the trap matrix found it (PLAN.md W7.4).
+                            // Open-array parameters are pointers with a hidden
+                            // length (report 10.1). Use it for bounds checks;
+                            // the trap matrix found this omission (PLAN.md W7.4).
                             match open_len.take() {
                                 Some(len) if self.checks.index => {
                                     let _ = write!(text, "[rt_index({i}, {len}, {})]", d.span.lo);
@@ -2139,7 +2168,7 @@ impl<'a> Emitter<'a> {
                                 }
                             }
                         }
-                        // One level per index expression (report §8.1).
+                        // Advance one array level for each index (report 8.1).
                         ty = self.types.elem(ty).unwrap_or(TypeId(0));
                         // An element may be a pointer, and a further dimension
                         // may be an open array.
@@ -2157,11 +2186,10 @@ impl<'a> Emitter<'a> {
                     is_pointer = self.types.is_pointer(ty);
                 }
                 Selector::Guard(q) => {
-                    // report §8.1: `v(T0)` asserts that v is of type T0 and
-                    // *aborts* if it is not. The test is emitted as part of the
-                    // expression (a comma expression, not a hoisted statement),
-                    // so it keeps its place inside a short-circuit operand, and
-                    // a NIL pointer is rejected before its descriptor is read.
+                    // A guard `v(T0)` asserts that `v` has type T0 and aborts if
+                    // not (report 8.1). Keep the check in the expression so it
+                    // stays inside short-circuit operands and rejects NIL before
+                    // reading its descriptor.
                     let t = match self.qident_type(q) {
                         Some(t) => t,
                         None => {
@@ -2178,12 +2206,11 @@ impl<'a> Emitter<'a> {
                         let view = format!("(({}){text})", self.c_type(t));
                         let test = format!("rt_guard_is({dyn_test}, \"type guard failed at byte {}\")", d.span.lo);
                         text = if lvalue {
-                            // An assignment's target has to be an *lvalue*, and a
-                            // comma expression is not one, so the check becomes a
-                            // statement before whatever writes through it — which
-                            // every lvalue caller flushes. The cast stays unless
-                            // the guard is the whole designator, because a field's
-                            // offset belongs to the narrowed record (DESIGN R29).
+                            // A target must be an lvalue, but a comma expression
+                            // isn't one. Emit the check as a statement before
+                            // writes through the target. Lvalue callers flush it.
+                            // Keep the cast for field access. Its offset uses
+                            // the narrowed record (DESIGN R29).
                             if self.checks.guard {
                                 let _ = writeln!(self.prelude, "    {test};");
                             }
@@ -2241,7 +2268,7 @@ impl<'a> Emitter<'a> {
         text
     }
 
-    // ---------------------------------------------------------------- calls
+    // Calls
 
     /// A call used as a statement.
     fn call(&mut self, d: &ast::Designator, level: usize, out: &mut String) {
@@ -2268,8 +2295,8 @@ impl<'a> Emitter<'a> {
             Some(Selector::Call(a)) => a.clone(),
             _ => Vec::new(),
         };
-        // `MIN(T)`/`MAX(T)` (W8.2): a constant the checker recorded. A user's own
-        // `MIN` records nothing, so shadowing needs no check here.
+        // `MIN(T)`/`MAX(T)` (W8.2) use a constant recorded by the checker.
+        // A user's own `MIN` records nothing, so it doesn't need a check here.
         if let Some(v) = self.sema.extreme_at(d.span) {
             return format!("((int32_t){}u)", v as u32);
         }
@@ -2287,20 +2314,19 @@ impl<'a> Emitter<'a> {
         format!("{callee}({actuals})")
     }
 
-    /// The callee and its argument list, with the two adjustments the report's
-    /// parameter modes require: a static link for a nested procedure, and
-    /// (pointer, length) for an open array (DESIGN §9.7).
+    /// The callee and arguments, adjusted for parameter modes: nested procedures
+    /// take a static link, and open arrays take a pointer and length (DESIGN 9.7).
     fn call_parts(&mut self, d: &ast::Designator, level: usize, out: &mut String) -> (String, String) {
         let name = d.base[0].clone();
         let args = match d.sels.last() {
             Some(Selector::Call(a)) => a.clone(),
             _ => Vec::new(),
         };
-        // The callee is the designator *without* its argument list: a plain
-        // name, a module-qualified name, or a procedure-valued field or
-        // element (`r.f(1)`, `a[i](1)`), which the report allows (report §10.1).
-        // Either a bare name (`Greet`, a parameterless call) or a name with
-        // just its argument list; anything else selects a procedure *value*.
+        // The callee omits the argument list. It may be a bare name, a
+        // module-qualified name, or a procedure-valued field or element
+        // (`r.f(1)`, `a[i](1)`) allowed by the report (10.1).
+        // A bare name may represent a parameterless call. Other selectors yield
+        // a procedure value.
         let plain = d.sels.is_empty() || matches!(d.sels.as_slice(), [Selector::Call(_)]);
         let (callee, callee_ty, level_of_callee, is_declared_proc) = if let Some(c) = self
             .qualified_cname_for(&d.base)
@@ -2318,7 +2344,7 @@ impl<'a> Emitter<'a> {
                 None => (mangle(&name), TypeId(0), level, false),
             }
         } else {
-            // A selected procedure value: emit it as a designator.
+            // Emit a selected procedure value as a designator.
             let head = ast::Designator {
                 base: d.base.clone(),
                 sels: d.sels[..d.sels.len() - 1].to_vec(),
@@ -2350,11 +2376,10 @@ impl<'a> Emitter<'a> {
             };
             actuals.push(link);
         }
-        // C leaves the order of a call's *arguments* unspecified too, and a
-        // callee can write a variable another argument reads (the generator
-        // found it: `F0(ABS(F0(100, acc)), LSL(ASR(m0, 0), 1))`). A value
-        // actual is fixed in a temporary, in source order, when any actual can
-        // have a side effect; an address actual has to stay an address.
+        // C leaves call argument order unspecified. A callee may write a variable
+        // that another argument reads, as in `F0(ABS(F0(100, acc)),
+        // LSL(ASR(m0, 0), 1))`. If any argument has side effects, fix value
+        // arguments in source order. Address arguments must remain addresses.
         let seq = args.iter().any(|a| self.has_call(a));
         for (i, a) in args.iter().enumerate() {
             let formal = params
@@ -2369,9 +2394,8 @@ impl<'a> Emitter<'a> {
             }
             if formal.by_var {
                 let v = self.designator_of(a, level);
-                // report §10.1: a record formal may be a base type of the
-                // actual's type, which in C means an explicit up-cast to the
-                // embedded base (DESIGN §9.3).
+                // A record formal may be a base of the actual type (report 10.1).
+                // Convert to its embedded base in C (DESIGN 9.3).
                 let got = self.sema.type_at(a.span, self.types).unwrap_or(TypeId(0));
                 if self.types.is_record(formal.ty)
                     && self.types.is_record(got)
@@ -2384,16 +2408,14 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             if self.types.is_record(formal.ty) {
-                // A record value parameter is passed as a pointer to a copy the
-                // caller makes (report §10.1, DESIGN §9.7), and the copy keeps
-                // the *formal's* descriptor, not the actual's.
+                // The caller passes a copy by pointer (report 10.1, DESIGN 9.7).
+                // The copy keeps the formal's descriptor rather than the actual's.
                 //
-                // Inside a `&&`/`||` operand the copy must happen *there*: the
-                // operand is not evaluated when the other one decides the result,
-                // so only the declaration is hoisted and the copy becomes a comma
+                // Inside a `&&`/`||` operand, make the copy only when that operand
+                // is evaluated. Hoist the declaration, then form a comma
                 // expression whose value is the copy's address (R16, PLAN.md
-                // W2.3). This is also what keeps a call in the actual's own
-                // selector from running when it should not.
+                // W2.3). This also preserves short-circuiting in a selector of
+                // the actual argument.
                 self.anon += 1;
                 let tmp = format!("tmp__{}", self.anon);
                 let decl = self.binding(formal.ty, &tmp);
@@ -2415,8 +2437,8 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             let got = self.sema.type_at(a.span, self.types);
-            // `want` is the formal's type where the two differ (a one-character
-            // string into a CHAR, report §9.1.2), the actual's otherwise.
+            // Use the formal type for a one-character string passed to CHAR
+            // (report 9.1.2); otherwise use the actual type.
             let want = if self.types.is_char(formal.ty) {
                 Some(formal.ty)
             } else {
@@ -2450,16 +2472,15 @@ impl<'a> Emitter<'a> {
     }
 
     /// A parameter the callee receives as a pointer: a `VAR` parameter, and a
-    /// *record* value parameter (the caller hands over a copy it made, so the
-    /// read-only rule is the checker's, not C's). An array value parameter needs
-    /// no such trick — C passes the array struct by value, which is already a
-    /// copy.
+    /// Record value parameters use a caller-made copy because C lacks Oberon's
+    /// read-only value-parameter rule. Array value parameters already copy their
+    /// struct by value.
     fn param_is_pointer(&self, pm: &Param) -> bool {
         pm.by_var || self.types.is_record(pm.ty)
     }
 
-    /// The designator form of an expression where it has to be assignable: the
-    /// builtins that take a `VAR` argument (`NEW`, `INC`, `PACK`, …).
+    /// Return an assignable designator for builtins that take a `VAR` argument,
+    /// such as `NEW`, `INC`, or `PACK`.
     fn designator_of_mut(&mut self, e: &Expr, level: usize) -> String {
         match &e.kind {
             ExprKind::Designator(d) => self.designator(d, level, true),
@@ -2482,21 +2503,20 @@ impl<'a> Emitter<'a> {
                 let _ = elem;
                 let v = self.designator_of(a, level);
                 match self.types.get(t) {
-                    // A fixed array passes its element storage, which keeps the
-                    // array's extent visible to the C compiler.
+                    // A fixed array passes its element storage, preserving its
+                    // extent for the C compiler.
                     Type::Array { len, .. } => (format!("({v}).e"), len.to_string()),
-                    // An open array is already an element pointer, and its
-                    // length is the hidden parameter: forwarding one must not
-                    // take the address of the parameter.
+                    // An open array is already an element pointer. Forward its
+                    // hidden length without taking the parameter's address.
                     Type::OpenArray { .. } => (v.clone(), format!("{v}__len")),
-                    Type::StringLit(n) => (format!("\"{v}\""), n.to_string()),
+                    Type::StringLit(n) => (format!("((char *)({v}))"), n.to_string()),
                     _ => (v, "0".into()),
                 }
             }
         }
     }
 
-    // ---------------------------------------------------- predefined calls
+    // Predefined calls
 
     fn predef_proper(&mut self, name: &str, d: &ast::Designator, level: usize, out: &mut String) {
         let args = match d.sels.last() {
@@ -2544,12 +2564,10 @@ impl<'a> Emitter<'a> {
                 let base = self.types.deref(ty).unwrap_or(TypeId(0));
                 let bt = self.c_type(base);
                 let desc = self.descriptor_name(base);
-                // The allocation goes through the runtime so that the object's
-                // own descriptor is stored at its head, as the guard and the
-                // type CASE read it, and so that the failure the report
-                // specifies (§6.4: the pointer becomes NIL) is the runtime's
-                // single answer — including the heap-exhaustion hook the trap
-                // matrix uses, which no other route to `malloc` would see.
+                // Allocate through the runtime to store the object's descriptor
+                // at its head, where guards and type CASE read it. The runtime
+                // also returns NIL on failure (section 6.4) and calls the
+                // heap-exhaustion hook used by the trap matrix.
                 let _ = writeln!(out, "    {p} = rt_new(sizeof({bt}), {desc});");
                 let _ = writeln!(out, "    if ({p} != NULL) {{");
                 // Records *inside* the new object get their descriptors too.
@@ -2557,7 +2575,7 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(out, "    }}");
             }
             "PACK" => {
-                // report §10.2: PACK scales x by 2^n, so n is a value.
+                // PACK scales x by 2^n, so n is a value (report 10.2).
                 let x = self.designator_of_mut(&args[0], level);
                 let n = self.expr(&args[1], None);
                 let pre = self.take_prelude();
@@ -2589,10 +2607,10 @@ impl<'a> Emitter<'a> {
                     .first()
                     .and_then(|a| self.sema.type_at(a.span, self.types))
                     .unwrap_or(TypeId(0));
-                // Through a helper: written inline, the operand appears three
-                // times and a call in it would run twice, possibly with two
-                // different results. `ABS` is defined for REAL too and keeps the
-                // operand's type (report §10.2), so the helper is chosen by type.
+                // Use a helper because inline expansion would evaluate the
+                // operand more than once. Calls may return different results.
+                // `ABS` also accepts REAL and preserves its operand type (report
+                // 10.2), so choose the helper by type.
                 let helper = if matches!(self.types.get(t), Type::Basic(Basic::Real)) {
                     "rt_absf"
                 } else {
@@ -2614,8 +2632,8 @@ impl<'a> Emitter<'a> {
                     .first()
                     .and_then(|a| self.sema.type_at(a.span, self.types))
                     .unwrap_or(TypeId(0));
-                // report §10.1's own `ORD("0")`: a one-character string is a
-                // CHAR, and a CHAR must be read unsigned.
+                // `ORD("0")` is allowed by the report (10.1). A one-character
+                // string is a CHAR, which must be read unsigned.
                 if let Some(Expr {
                     kind: ExprKind::Str(text),
                     ..
@@ -2653,12 +2671,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    // ------------------------------------------------- report §11.1: SYSTEM
+    // SYSTEM builtins (report 11.1)
 
-    /// The `SYSTEM.<entry>` a designator names, if it names one. The import
-    /// *alias* is what makes it an entry, so `IMPORT S := SYSTEM` works too, and
-    /// the alias cannot be anything else: `IMPORT SYSTEM` is resolved before any
-    /// interface is looked for (DESIGN §9.10).
+    /// The `SYSTEM.<entry>` a designator names, if any. The import alias makes
+    /// it an entry, so `IMPORT S := SYSTEM` works. No other alias qualifies
+    /// because SYSTEM is resolved before interfaces (DESIGN 9.10).
     fn system_entry<'b>(&self, base: &'b [String]) -> Option<&'b str> {
         if base.len() != 2 {
             return None;
@@ -2669,10 +2686,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The mask a word is narrowed to when the type is *narrower* than a word: a
-    /// `CHAR` is one byte in this back end's model (§9.2), and every other basic
-    /// type `GET`/`PUT` accept fills the whole word, which is what report §11.1's
-    /// `mem[a]` holds.
+    /// The mask for narrowing a word to a smaller type. `CHAR` is one byte
+    /// (report 9.2); other basic types accepted by `GET`/`PUT` use the full word
+    /// stored by report 11.1's `mem[a]`.
     fn word_mask(&self, t: TypeId) -> Option<&'static str> {
         if self.types.is_char(t) {
             Some("0xFFu")
@@ -2681,9 +2697,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `SYSTEM.GET(a, v)`: one word read through the byte address `a`, narrowed to
-    /// `v`'s own type. A `REAL` is one word too, so the read *is* its bit pattern —
-    /// an integer read converted to `float` would be `FLT`'s rule, not this one.
+    /// `SYSTEM.GET(a, v)` reads one word through byte address `a`, narrowed to
+    /// `v`'s type. A `REAL` read returns its bit pattern; converting an integer
+    /// to `float` follows `FLT` semantics.
     fn sys_load(&self, addr: &str, t: TypeId) -> String {
         if matches!(self.types.get(t), Type::Basic(Basic::Real)) {
             return format!("(*(const float *)(uintptr_t)({addr}))");
@@ -2700,10 +2716,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `SYSTEM.PUT(a, x)`: the word `x` occupies, stored through the byte address.
-    /// The width is *x's*, since PUT has no variable of its own to take one from —
-    /// a `CHAR` contributes its low byte and leaves the rest of the word zeroed, a
-    /// `REAL` is one word whose bit pattern *is* the word, and an integer fills it.
+    /// `SYSTEM.PUT(a, x)` stores the word occupied by `x` through byte address
+    /// `a`. `CHAR` uses its low byte, `REAL` its bit pattern, and integers the
+    /// full word.
     fn sys_store(&self, addr: &str, t: TypeId, value: &str) -> String {
         if matches!(self.types.get(t), Type::Basic(Basic::Real)) {
             return format!("(*(float *)(uintptr_t)({addr}) = ({value}))");
@@ -2716,10 +2731,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Whether `e` is a `SYSTEM.ADR` call. Its C value is the host's address width
-    /// (R31) — the one expression whose C type is not its Oberon type — and it has
-    /// no side effect, so it is neither narrowed into a temporary of its Oberon
-    /// type (`INTEGER`) nor in need of sequencing.
+    /// Whether `e` is a `SYSTEM.ADR` call. Its C value has host address width
+    /// (R31), unlike its Oberon type. It has no side effect and needs neither
+    /// narrowing to its Oberon `INTEGER` type nor sequencing.
     fn is_address(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Designator(d) => matches!(self.system_entry(&d.base), Some("ADR")),
@@ -2727,11 +2741,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// One operand of a SYSTEM entry, fixed in a temporary when any operand of the
-    /// call can have a side effect: Oberon evaluates them left to right while C
-    /// leaves their order unspecified, which is the same reason a call's actuals
-    /// are sequenced (R23). `seq` is the caller's answer for the whole call, so
-    /// the temporaries are initialised in source order.
+    /// Fix an operand in a temporary when any call argument has side effects.
+    /// Oberon evaluates operands left to right, but C leaves their order
+    /// unspecified, so sequence them as call arguments are sequenced (R23).
+    /// `seq` describes the whole call, so temporaries follow source order.
     fn sys_operand(&mut self, e: &Expr, seq: bool, want: Option<TypeId>) -> String {
         let text = self.expr(e, want);
         match (seq, self.sema.type_at(e.span, self.types)) {
@@ -2740,10 +2753,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `SYSTEM.GET`, `SYSTEM.PUT` and `SYSTEM.COPY`: proper procedures, lowered
-    /// here and in place (DESIGN §9.10). None of them consults `self.checks`:
-    /// `-Ochecks=n` must not add *or remove* anything for SYSTEM, which is the
-    /// escape hatch the checks exist to be escaped by.
+    /// `SYSTEM.GET`, `SYSTEM.PUT`, and `SYSTEM.COPY` are proper procedures
+    /// lowered here (DESIGN 9.10). They ignore `self.checks`; `-Ochecks=n` does
+    /// not add or remove checks for SYSTEM.
     fn sys_proper(&mut self, entry: &str, d: &ast::Designator, level: usize, out: &mut String) {
         let args = match d.sels.last() {
             Some(Selector::Call(a)) => a.clone(),
@@ -2754,10 +2766,9 @@ impl<'a> Emitter<'a> {
         let text = match entry {
             "GET" | "PUT" => {
                 let addr = self.sys_operand(&args[0], seq, Some(self.types.integer()));
-                // The width is the typed operand's, and which one that is follows
-                // from the report's own signatures: `GET(a, v)` names the variable
-                // it writes, `PUT(a, x)` names only the value it stores, so there
-                // is no other type in sight (DESIGN §9.10).
+                // The typed operand sets the width, based on the report's
+                // signatures. `GET(a, v)` names the variable it writes, while
+                // `PUT(a, x)` names the value it stores (DESIGN 9.10).
                 let t = self.sema.type_at(args[1].span, self.types).unwrap_or(TypeId(0));
                 if entry == "GET" {
                     let place = self.designator_of_mut(&args[1], level);
@@ -2768,10 +2779,9 @@ impl<'a> Emitter<'a> {
                 }
             }
             "COPY" => {
-                // report §11.1's `mem` is an array of *words*, so `n` counts
-                // words and the byte count is `n * 4` (DESIGN §9.10). No bounds
-                // check, and no overlap promise: `memcpy` is what "copy n
-                // consecutive words" means here.
+                // The report defines `mem` as an array of words, so `n` counts
+                // words and the byte count is `n * 4` (DESIGN 9.10). There is no
+                // bounds check or overlap guarantee. `memcpy` copies the words.
                 let src = self.sys_operand(&args[0], seq, None);
                 let dst = self.sys_operand(&args[1], seq, None);
                 let n = self.sys_operand(&args[2], seq, None);
@@ -2791,25 +2801,23 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(out, "    {text}");
     }
 
-    /// `SYSTEM.ADR`, `SYSTEM.SIZE` and `SYSTEM.BIT`: function procedures, lowered
-    /// here and in place — the `ob_sys_` name space stays reserved for the runtime
-    /// (DESIGN §9.10).
+    /// `SYSTEM.ADR`, `SYSTEM.SIZE`, and `SYSTEM.BIT` are function procedures
+    /// lowered here (DESIGN 9.10). The `ob_sys_` namespace remains reserved for
+    /// the runtime.
     fn sys_function(&mut self, entry: &str, args: &[Expr], level: usize) -> String {
         match entry {
-            // The address of the variable itself, in §9.10's byte address model.
-            // `intptr_t` and not the report's `INTEGER`: an `int32_t` cannot carry
-            // a stack or `mmap`ed address on a 64-bit host, and putting one
-            // through the round trip `(uint32_t *)(uintptr_t)a` would dereference
-            // a sign-extended truncation of it (R31; the expression is as wide as
-            // the host's addresses, and an *INTEGER* the program stores it in
-            // narrows it, which is the report's own 32-bit model).
+            // Return the variable's address in SYSTEM's byte-address model.
+            // Use `intptr_t`, not the report's `INTEGER`: `int32_t` cannot hold
+            // a stack or `mmap` address on a 64-bit host. Converting a truncated
+            // value back through `(uint32_t *)(uintptr_t)a` would dereference the
+            // wrong address. The expression has host address width, while a
+            // stored `INTEGER` follows the report's 32-bit model (R31).
             "ADR" => {
                 let place = self.designator_of_mut(&args[0], level);
                 format!("((intptr_t)(uintptr_t)&({place}))")
             }
-            // `SIZE(T)` is the byte size the *layout* gives, which is the extent
-            // `NEW` hands `rt_new` and the one the record descriptor is built
-            // from: `sizeof`, folded by the C compiler (DESIGN §9.10).
+            // `SIZE(T)` is the byte size in the layout, used by `NEW` and record
+            // descriptors. The C compiler folds `sizeof` (DESIGN 9.10).
             "SIZE" => match self.sema.type_at(args[0].span, self.types) {
                 Some(t) => format!("((int32_t)sizeof({}))", self.c_type(t)),
                 None => {
@@ -2818,9 +2826,9 @@ impl<'a> Emitter<'a> {
                     "0".into()
                 }
             },
-            // Bit `n` of the word at `a`. The count is masked into 0..31 the way
-            // the runtime's shifts are (R22): outside that range the report says
-            // nothing, and an unmasked shift would be undefined C.
+            // Bit `n` of the word at `a`. Mask the count to 0..31, as for runtime
+            // shifts (R22). The report leaves other counts undefined; an
+            // unmasked shift would be undefined C.
             "BIT" => {
                 let seq = args.iter().any(|a| self.has_call(a));
                 let a = self.sys_operand(&args[0], seq, Some(self.types.integer()));
@@ -2837,11 +2845,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    // ------------------------------------------------------------ constants
+    // Constants
 
-    /// A constant as C, from the checker's folded value (DESIGN §9.2). This is
-    /// the only place a constant becomes C, and it cannot disagree with the
-    /// folder because it *is* the folder's answer.
+    /// Render a constant as C from the checker's folded value (DESIGN 9.2).
+    /// This is the only conversion to C, so it uses the folder's result.
     fn const_cvalue(&self, v: &sema::const_eval::Const) -> String {
         use sema::const_eval::Const as K;
         match v {
@@ -2854,8 +2861,8 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// A constant as an interface file spells it: Oberon's own notation, since
-    /// the reader parses these with the grammar (DESIGN §7).
+    /// Render a constant in Oberon notation for an interface file; the reader
+    /// parses it with the grammar (DESIGN 7).
     fn const_render(v: &sema::const_eval::Const) -> String {
         use sema::const_eval::Const as K;
         match v {
@@ -2863,7 +2870,7 @@ impl<'a> Emitter<'a> {
             K::Real(r) => format!("{r:?}"),
             K::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
             K::Char(c) => format!("{c:02X}X"),
-            K::Str(s) => format!("\"{}\"", s),
+            K::Str(s) => format!("\"{s}\""),
             K::Set(bits) => {
                 // Maximal runs, so a set stays short and the reader (which
                 // accepts a list of ranges) reads it back.
@@ -2918,15 +2925,14 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    // ------------------------------------------------------- interface text
+    // Interface text
 
-    /// Render a type the way an interface file spells it (DESIGN §7): the
-    /// inverse of `RenderedTypeParser`, so what the writer produces the reader
-    /// parses back with the module grammar.
+    /// Render a type in the form used by interface files (DESIGN 7). The
+    /// `RenderedTypeParser` reads the output with the module grammar.
     pub fn render_type(&self, t: TypeId) -> String {
-        // A named type is referred to by name: record identity is the
-        // declaration, the reader builds a whole interface at once, and
-        // inlining a self-referential record would not terminate.
+        // Use a declared type's name to preserve record identity. The reader
+        // builds the whole interface at once, and inlining a recursive record
+        // would not end.
         if let Some(n) = self.oberon_names.get(&t) {
             return n.clone();
         }
@@ -2949,21 +2955,20 @@ impl<'a> Emitter<'a> {
             Type::OpenArray { elem } => format!("ARRAY OF {}", self.render_type(*elem)),
             Type::Pointer { base } => format!("POINTER TO {}", self.render_type(*base)),
             Type::Record { base, fields, .. } => {
-                // An anonymous record has to be written out for a client to lay
-                // it out; its fields are `;`-separated and carry the public mark
-                // (report §6.3), which the reader accepts.
+                // Write out anonymous records so clients can lay them out. Their
+                // fields use semicolons and include the public mark (report 6.3).
                 let mut text = match base {
                     Some(b) => format!("RECORD ({})", self.render_type(*b)),
                     None => "RECORD".to_string(),
                 };
                 for f in fields {
-                    // The mark is the field's own (report §6.3): a client may
-                    // name an exported field and nothing else.
+                    // Only the field's own export mark lets a client name it
+                    // (report 6.3).
                     let mark = if f.export { "*" } else { "" };
                     let _ = write!(text, " {}{mark}: {};", mangle(&f.name), self.render_type(f.ty));
                 }
-                // Drop the separator after the last field: the reader's
-                // `FieldListSequence` is `;`-separated (report §6.3).
+                // Drop the separator after the last field. `FieldListSequence`
+                // is semicolon-separated (report 6.3).
                 if !fields.is_empty() {
                     text.pop();
                 }
@@ -2989,9 +2994,9 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// The interface of a checked module: what a client may refer to (DESIGN §7).
-/// Only exported objects are written, and an exported variable is read-only by
-/// the time a client sees it (report §11).
+/// A checked module's interface lists what clients may refer to (DESIGN 7).
+/// It includes only exported objects; exported variables are read-only to
+/// clients (report 11).
 pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> sema::sym::Interface {
     let mut e = Emitter::new(module.name.clone(), types, sema);
     let mut wanted = Vec::new();
@@ -3060,12 +3065,11 @@ pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> sema::sy
     iface
 }
 
-/// The span a `TypeExpr` was parsed at, which is the key the semantic pass
-/// recorded its type under (DESIGN §6).
+/// The span where a `TypeExpr` was parsed. The semantic pass uses it as the
+/// key for the expression's type (DESIGN 6).
 ///
-/// Shared with the Cranelift back end, which resolves a declaration's type the
-/// same way: one AST fact, one function, so a new `TypeExpr` cannot be added to
-/// one back end and forgotten in the other.
+/// Shared with the Cranelift back end, which resolves declaration types the same
+/// way. Keeping one function means both back ends handle every `TypeExpr`.
 pub fn span_of_type(t: &TypeExpr) -> Span {
     match t {
         TypeExpr::Named(_, s)
@@ -3076,19 +3080,18 @@ pub fn span_of_type(t: &TypeExpr) -> Span {
     }
 }
 
-/// An Oberon identifier cannot contain `__`, so every generated name (module
-/// prefixes, frames, temporaries) is out of reach of user code.
+/// An Oberon identifier cannot contain `__`, so user code cannot use generated
+/// names such as module prefixes, frames, or temporaries.
 ///
-/// Shared with the Cranelift back end: it emits the same `<Module>__<Name>`
-/// symbols, and a program that mixes the two back ends links them against each
-/// other's declarations (DESIGN §16.2), so one mangling has to serve both.
+/// Shared with the Cranelift back end, which emits the same `<Module>__<Name>`
+/// symbols. Programs mixing both back ends link those symbols together
+/// (DESIGN 16.2), so both need the same mangling.
 pub fn mangle(name: &str) -> String {
     let name = name.replace('.', "__");
-    // An Oberon identifier is case-sensitive, so `int`, `while`, `char`, … are
-    // legal Oberon names and must not reach C unchanged. Nothing else needs
-    // escaping: every generated C name is either `Module__Name` (and `__`
-    // cannot occur in an Oberon identifier), a `TD_`/`rt_`/`ob_` runtime name,
-    // or already mangled here.
+    // Oberon identifiers are case-sensitive, so names such as `int`, `while`,
+    // and `char` are legal in Oberon but reserved in C. Prefix keywords with
+    // `o_`. Generated names already use `Module__Name` (which Oberon identifiers
+    // cannot contain) or reserved runtime prefixes such as `TD_`, `rt_`, and `ob_`.
     if C_KEYWORDS.contains(&name.as_str()) {
         format!("o_{name}")
     } else {

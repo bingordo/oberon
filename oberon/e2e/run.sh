@@ -26,7 +26,27 @@ check() { # name expected actual
 OUT=$(mktemp -d)
 DRV=$(mktemp -d)
 trap 'rm -rf "$OUT" "$DRV"' EXIT
+OBC=${OBC:-../target/debug/obc}
 
+
+# Line directives are opt-in, source-located, and wired through the CLI.
+cat > "$OUT/LineMap.mod" <<'EOF'
+MODULE LineMap;
+VAR value: INTEGER;
+BEGIN
+  value := 1
+END LineMap.
+EOF
+"$OBC" emit "$OUT/LineMap.mod" --out "$OUT" --line-directives >/dev/null
+if grep -q '^#line 4 "' "$OUT/LineMap.c" &&
+    $CC $CFLAGS -I "$OUT" -c "$OUT/LineMap.c" -o "$OUT/LineMap.o" 2>"$OUT/linemap.cc.log"; then
+    echo "PASS c-line-directive-cli-and-compiles"
+    pass=$((pass + 1))
+else
+    echo "FAIL c-line-directive-cli-and-compiles"
+    cat "$OUT/linemap.cc.log" 2>/dev/null || true
+    fail=$((fail + 1))
+fi
 
 # 1. Interface files are part of the build: the compiler writes them and reads
 #    them back for the importing module.
@@ -51,7 +71,7 @@ else
     fail=$((fail + 1))
 fi
 
-# 3. It runs, and it prints what the report's semantics say it should.
+# 3. It runs and prints the output specified by the report.
 "$OUT/torture" > "$OUT/got.txt"
 check "torture-program-output" "$(cat expected.txt)" "$(cat "$OUT/got.txt")"
 
@@ -83,8 +103,8 @@ fi
 "$OUT/hello" > "$OUT/hello.got"
 check "hello-world-runs" "$(cat hello.expected.txt)" "$(cat "$OUT/hello.got")"
 
-# 6. The driver: source in, runnable program out, with the import graph
-#    resolved and the C compiler invoked for us.
+# 6. The driver reads source, resolves imports, invokes the C compiler, and
+#    produces a runnable program.
 OBC=${OBC:-../target/debug/obc}
 # BACKEND=clif runs every check through the Cranelift back end instead of the C one
 # (PLAN.md W9.1/W9.2). The driver takes `--backend` after the subcommand and the
@@ -101,7 +121,7 @@ WRAPPER
 fi
 BACKEND_MODE=${BACKEND:-c}
 # The C back end's driver, whatever BACKEND says. A row that reads the emitted *C*
-# -- `Checks.c`, `Named.c`, `SysChk.c`, a `.h` -- is about that back end and must not
+# `Checks.c`, `Named.c`, `SysChk.c`, or a `.h` file concerns the C back end.
 # inherit the switch, or the suite stops at the first such row instead of reaching
 # the rows a different back end exists to be judged by.
 C_OBC=${C_OBC:-../target/debug/obc}
@@ -158,7 +178,7 @@ check "clean-module-shows-its-warning" "1" \
 check "a-warning-does-not-fail-the-build" "0" "$warn_status"
 
 # A file with sixty broken statements prints twenty errors and says how many it
-# suppressed; `--ferror-limit 0` means no limit (PLAN.md W5.2).
+# suppressed. Setting the error limit to zero means no limit (PLAN.md W5.2).
 {
     printf 'MODULE Flood;\n  VAR x: INTEGER;\nBEGIN\n'
     for _ in $(seq 60); do printf '  x := ;\n'; done
@@ -174,8 +194,8 @@ check "zero-means-no-limit" "60" \
     "$(grep -c 'error:' "$DRV/flood0.out")"
 
 # A NIL pointer dereference traps with the designator's offset, in both
-# spellings (report §6.4 makes using NIL an error; the design traps rather than
-# faulting: R21, computed as a fault before this check existed).
+# spellings (report section 6.4 treats NIL as an error; the design traps rather
+# than faulting: R21, computed as a fault before this check existed).
 for form in field caret; do
     if [ "$form" = field ]; then
         stmt='p.x := 1'
@@ -194,8 +214,8 @@ for form in field caret; do
         "$(grep -c 'NIL pointer dereference (at byte' "$DRV/nil$form.err")"
 done
 
-# An interface that cannot be read is explained only when the build needs it: an
-# unrelated file on the search path must not be reported (PLAN.md W3.2).
+# An unreadable interface is explained only if the build needs it. An unrelated
+# file on the search path must not be reported (PLAN.md W3.2).
 mkdir -p "$DRV/badiface"
 printf 'MODULE Unrelated\nTYPE T = INTEGER\n' > "$DRV/badiface/Unrelated.sym"
 printf 'MODULE Quiet;\nBEGIN\nEND Quiet.\n' > "$DRV/Quiet.mod"
@@ -250,10 +270,11 @@ BEGIN
 END T3.
 ' 'oberon: trap: index out of range (at byte 95 of the source)'
 # A failed guard traps. The *record* spelling is covered here through a record
-# copy from the guarded view — reading a derived *field* through the view is the
-# static-analysis problem R15 records, where gcc sees the read is out of the
-# allocation's bounds and -Werror rejects the program although the guard's trap
-# fires first. The *pointer* spelling is the pre-existing `failed-guard-traps` row.
+# Copying the guarded view tests a record guard. Reading a derived *field*
+# through the view is the static-analysis problem R15 records: gcc sees a
+# read beyond the allocation and -Werror rejects the program, although the
+# guard traps first. The *pointer* spelling is covered by the existing
+# `failed-guard-traps` row.
 trap_case guard-record-spelling 'MODULE T4;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R;
   VAR p: P; s: S;
@@ -262,10 +283,11 @@ BEGIN
   s := p(S)
 END T4.
 ' 'oberon: trap: type guard failed at byte 124'
-# The *record* spelling of a failing guard, as an assignment target: the write
-# must compile under the documented line and trap with the guard's offset. It used
-# to be rejected, because gcc folds an inlined `malloc(sizeof(R))` and could then
-# prove the write lay outside the allocation (DESIGN R15, PLAN.md W2.2).
+# The *record* spelling of a failing guard is tested as an assignment target.
+# The write must compile under the documented line and trap with the guard's
+# offset. gcc used to reject it because it folded an inlined
+# `malloc(sizeof(R))` and proved the write lay outside the allocation
+# (DESIGN R15, PLAN.md W2.2).
 guard_record=$(cat <<'GuardREOF'
 MODULE GuardR;
   TYPE R = RECORD f: INTEGER END; S = RECORD (R) g: INTEGER END;
@@ -278,7 +300,7 @@ END GuardR.
 GuardREOF
 )
 trap_case guard-record-spelling-as-target "$guard_record" 'oberon: trap: type guard failed at byte 186'
-# ... and the same program under clang, which the same design row promises.
+# The same program is also tested under clang, as promised by the design row.
 if command -v clang >/dev/null 2>&1; then
     printf '%s' "$guard_record" > "$DRV/GuardR.mod"
     if "$OBC" build "$DRV/GuardR.mod" --cc clang --out "$DRV" -o "$DRV/guardr" 2>"$DRV/guardr.log"; then
@@ -317,7 +339,7 @@ if "$C_OBC" build "$DRV/Checks.mod" --out "$DRV" -o "$DRV/checks-on" >/dev/null 
     check "checks-off-runs" "0" "$status"
     check "checks-off-emits-no-check" "0" \
         "$(grep -c 'rt_index\|rt_nil\|rt_guard_is' "$DRV/Checks.c")"
-    # Every check has a name, and a named set emits exactly those (W8.3).
+# Every check has a name, and selecting a check emits only that check (W8.3).
     printf 'MODULE Named;\n  TYPE R = RECORD x: INTEGER END; P = POINTER TO R;\n  VAR a: ARRAY 100 OF INTEGER; p: P; n: INTEGER;\nBEGIN\n  n := a[150]; p.x := 1\nEND Named.\n' > "$DRV/Named.mod"
     "$C_OBC" emit "$DRV/Named.mod" -Ochecks=nil --out "$DRV" >/dev/null 2>&1
     check "named-checks-emit-only-that-check" "1" \
@@ -339,8 +361,8 @@ else
     fail=$((fail + 1))
 fi
 
-# A scalar CASE with no default arm warns and, if a value matches no label, traps
-# with the subject's offset (W2.5) — the type CASE has behaved that way all along.
+# A scalar CASE with no default arm warns and traps with the subject's offset
+# if no label matches (W2.5). Type CASE has always worked that way.
 trap_case case-no-matching-label 'MODULE Cnl;
   VAR i: INTEGER; ok: ARRAY 1 OF INTEGER;
 BEGIN
@@ -381,8 +403,8 @@ BEGIN
 END T9.
 ' 'oberon: trap: assertion failed (at byte 19 of the source)'
 
-# `NEW` failing is *specified* to yield NIL (report §6.4), so the hook makes it
-# observable: the program traps itself if the allocation did not fail.
+# `NEW` is specified to yield NIL on failure (report section 6.4). The hook makes
+# this observable: the program traps itself if the allocation did not fail.
 printf 'MODULE T10;
   TYPE R = RECORD x: INTEGER END;
   VAR p: POINTER TO R; fail: ARRAY 1 OF INTEGER;
@@ -401,10 +423,10 @@ check "a-failing-new-yields-nil" "0" "$status"
 # nothing reclaiming, `NEW` would give out after 85 of the 20000 allocations
 # (a 4096-byte heap, a 48-byte block), the NIL dereference would trap, and the
 # program would die; with the collector it completes, and the sum it checks says
-# no node of a live chain was reclaimed. Three modes, one answer: collection
-# forced on every allocation, collection triggered by the limit, and collection
-# idle (`OB_GC_STRESS` and `OB_GC_LIMIT` unset) -- which is also the evidence
-# that a program that never needs the collector pays nothing for it.
+# No node of a live chain was reclaimed. Test collection on every allocation,
+# collection triggered by the limit, and idle collection (`OB_GC_STRESS` and
+# `OB_GC_LIMIT` unset). The idle run shows that programs that do not need the
+# collector pay nothing for it.
 cat > "$DRV/Gc.mod" <<'MODEOF'
 MODULE Gc;
   TYPE P = POINTER TO Node;
@@ -426,10 +448,10 @@ BEGIN
 END Gc.
 MODEOF
 if "$OBC" build "$DRV/Gc.mod" --out "$DRV" -o "$DRV/gc" >/dev/null 2>&1; then
-    # 1000 rounds of 20 nodes: 20000 allocations, each round's chain dead before
-    # the next one starts, so the live set is one 20-node chain -- 960 bytes, a
-    # 24-byte header in front of each 24-byte node -- and the whole run would
-    # need 960000. 210000 is the sum of the values 1..20, a thousand times over.
+    # 1000 rounds of 20 nodes make 20000 allocations. Each round's chain is dead
+# the next one starts. The live set is one 20-node chain (960 bytes: a
+# 24-byte header and a 24-byte node per allocation). The whole run would need
+# 960000 bytes. 210000 is the sum of values 1..20, repeated a thousand times.
     for mode in stress limit idle; do
         status=0
         case $mode in
@@ -444,9 +466,9 @@ else
     fail=$((fail + 1))
 fi
 
-# A live set larger than the limit: `NEW` yields NIL (report §6.4) and the
-# attempt ends there -- a collection that frees nothing must not loop -- while
-# every node that did fit is still there, which is what the count says.
+# A live set larger than the limit: `NEW` yields NIL (report section 6.4), and
+# allocation stops. Collection that frees nothing must not loop. Every node
+# that fit remains, as the count confirms.
 cat > "$DRV/GcNil.mod" <<'MODEOF'
 MODULE GcNil;
   TYPE P = POINTER TO Node;
@@ -523,10 +545,10 @@ else
     fail=$((fail + 1))
 fi
 
-# A pointer field the *base* of the object's type declares: the object's own
-# descriptor is the extension's, so the map has to reach the field one level in,
-# through `offsetof(S, base) + offsetof(R, q)`. `head.q` is the only reference to
-# the leaf object, so a map that missed the inherited field loses it.
+# A pointer field declared in the object's base type: the object's own
+# descriptor is the extension's, so the map must reach the field one level in
+# through `offsetof(S, base) + offsetof(R, q)`. `head.q` is the only reference
+# to the leaf object, so a map that misses the inherited field loses it.
 cat > "$DRV/GcExt.mod" <<'MODEOF'
 MODULE GcExt;
   TYPE Q = POINTER TO Leaf;
@@ -558,13 +580,13 @@ else
     fail=$((fail + 1))
 fi
 
-# Two syntax errors in one body are both reported.
+# Both syntax errors in one body are reported.
 printf 'MODULE Two;\n  VAR x, y: INTEGER;\nBEGIN\n  x := ;\n  y := ;\n  x := 1\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" -I . >"$DRV/two.out" 2>&1 || true
 check "driver-reports-several-syntax-errors" "2" \
     "$(grep -c 'error: unexpected `;`' "$DRV/two.out")"
 
-# A missing END is reported where the module gives out, with what was expected.
+# A missing END is reported at the end of the module, with the expected token.
 printf 'MODULE NoEnd;\n  VAR x: INTEGER;\nBEGIN\n  x := 1;\nIF x = 1 THEN x := 2\nEND NoEnd.\n' > "$DRV/NoEnd.mod"
 "$OBC" check "$DRV/NoEnd.mod" -I . >"$DRV/noend.out" 2>&1 || true
 check "driver-locates-a-module-level-error" "1" \
@@ -597,9 +619,9 @@ fi
 
 # 7. Regression module: one line of output per defect the review found, each
 #    line's expectation computed from the report rather than from a run.
-# The run reports rather than aborting: a back end that cannot lower this module
-# yet says so as a FAIL, and the rows after it still run (which is what the
-# Cranelift back end's distance is measured with).
+# A back end that cannot lower this module yet reports a FAIL instead of
+# aborting. The later rows still run, which measures the Cranelift back end's
+# progress.
 if "$OBC" run Regress.mod -I . --command Regress.Run >"$DRV/regress.got" 2>"$DRV/regress.log"; then
     check "regressions-all-hold" "$(cat regress.expected.txt)" "$(cat "$DRV/regress.got")"
 else
@@ -639,7 +661,7 @@ fi
 # 9. A failed type guard must trap (and say where), not read a stranger's memory.
 # A failing guard must trap. The *pointer* spelling is used here because a
 # record-spelled failed guard reads past the object by construction, which the C
-# compiler can see statically and refuses under -Werror (DESIGN §13 R15).
+# compiler can see statically and refuses under -Werror (DESIGN section 13 R15).
 cat > "$DRV/Guard.mod" <<'MODEOF'
 MODULE Guard;
   TYPE R = RECORD a: INTEGER END; S = RECORD (R) b: INTEGER END;
@@ -665,10 +687,10 @@ fi
 sh -c '"$0" >/dev/null 2>"$1"' "$DRV/guard" "$DRV/guard.err" || true
 check "failed-guard-traps" "1" "$(grep -c 'type guard failed at byte' "$DRV/guard.err")"
 
-# A designator narrowed by a type-CASE arm or by a guard stays *assignable*. The
-# cast that gives a derived field its layout is not itself an lvalue, so the plain
-# spelling is used wherever a store is needed, and only where the narrowed name is
-# the whole designator (DESIGN R29, PLAN.md W7.6).
+# A designator narrowed by a type-CASE arm or guard stays *assignable*. The cast
+# that gives a derived field its layout is not itself an lvalue. Use the plain
+# spelling when storing through a narrowed name that is the whole designator
+# (DESIGN R29, PLAN.md W7.6).
 runs_case() { # name source
     printf '%s' "$2" > "$DRV/$1.mod"
     "$OBC" build "$DRV/$1.mod" --out "$DRV" -o "$DRV/$1" >/dev/null 2>&1 || {
@@ -680,6 +702,25 @@ runs_case() { # name source
     "$DRV/$1" || status=$?
     check "$1" "0" "$status"
 }
+cat > "$DRV/ConstDefs.mod" <<'EOF'
+MODULE ConstDefs;
+CONST Code* = 0AX; Text* = "abc";
+END ConstDefs.
+EOF
+runs_case imported-char-string-constants 'MODULE ConstUse;
+  IMPORT ConstDefs;
+  VAR code: CHAR; text: ARRAY 4 OF CHAR;
+  PROCEDURE CheckText(a: ARRAY OF CHAR);
+  BEGIN ASSERT(LEN(a) = 3) END CheckText;
+BEGIN
+  code := ConstDefs.Code;
+  text := ConstDefs.Text;
+  ASSERT(code = 0AX);
+  ASSERT(text = "abc");
+  CheckText(ConstDefs.Text);
+  ASSERT(ConstDefs.Text = "abc")
+END ConstUse.
+'
 runs_case narrow-assign-to-narrowed 'MODULE N1;
   TYPE R = RECORD END; S = RECORD (R) f: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P; ps: PS; ok: ARRAY 1 OF INTEGER;
@@ -728,10 +769,10 @@ BEGIN
 END R16.
 '
 
-# 10. report §11.1's SYSTEM (PLAN.md W4.1): the six entries of the table in one
-#     program whose every step is an assertion (Sys.mod), the import that resolves
-#     to a builtin, the entries the report lists as implementation-specific
-#     refused *by name*, and the promise that `-Ochecks` has nothing to do here.
+# 10. report section 11.1's SYSTEM: one program asserts all six entries in
+# the table (Sys.mod), tests the import that resolves to a builtin, checks the
+# implementation-specific entries are refused by name, and confirms that
+# `-Ochecks` does not apply here.
 if "$OBC" build Sys.mod -I . --out "$DRV" -o "$DRV/sys" 2>"$DRV/sys.log"; then
     echo "PASS system-entries-compile"
     pass=$((pass + 1))
@@ -744,17 +785,17 @@ status=0
 "$DRV/sys" || status=$?
 check "system-entries-run[ADR, SIZE, BIT, GET, PUT, COPY]" "0" "$status"
 # The import is in the interface, so a client can see that this module is not
-# portable (PLAN.md W4.1 step 4) -- and SYSTEM has no `.h` to include.
+# portable (PLAN.md W4.1 step 4). SYSTEM has no `.h` to include.
 check "system-import-is-recorded-in-the-interface" "IMPORT SYSTEM" "$(sed -n 3p "$DRV/Sys.sym")"
 mkdir -p "$DRV/sysc"
 "$C_OBC" emit Sys.mod -I . --out "$DRV/sysc" >/dev/null 2>&1 || true
 check "system-has-no-header-to-include" "0" \
     "$(grep -c 'SYSTEM\.h' "$DRV/sysc/Sys.h" || true)"
 
-# The module is *the compiler's*: a `SYSTEM.mod`/`SYSTEM.sym` on the search path
-# is never read, compiled or linked, so a broken pair there cannot reach a build
-# (a user supply would be a different language, and a program that names SYSTEM
-# in its import list must get the report's entries).
+# The compiler owns the SYSTEM module. It never reads, compiles, or links a
+# `SYSTEM.mod`/`SYSTEM.sym` on the search path, so a broken pair cannot affect a
+# build. A user-supplied module would be a different language, and programs that
+# import SYSTEM must get the report's entries.
 mkdir -p "$DRV/shadow"
 printf 'MODULE SYSTEM; VAR this: INTEGER; BEGIN this := ;\n' > "$DRV/shadow/SYSTEM.mod"
 printf 'MODULE SYSTEM\nTYPE Garbage = RECORD x: INTEGER\n' > "$DRV/shadow/SYSTEM.sym"
@@ -803,8 +844,8 @@ else
     fail=$((fail + 1))
 fi
 
-# Every refusal is located, and the extras are refused by the name the program
-# used (`SYSTEM.ADC is not implemented`, not a silent no-op).
+# Check that each refusal is located and that the extras name the rejected
+# operation (`SYSTEM.ADC is not implemented`, not a silent no-op).
 cat > "$DRV/SysBad.mod" <<'MODEOF'
 MODULE SysBad;
   IMPORT SYSTEM;
@@ -847,9 +888,9 @@ printf 'MODULE SysNoImp;\n  VAR i: INTEGER;\nBEGIN\n  i := SYSTEM.ADR(i)\nEND Sy
 check "system-must-be-imported" "1" \
     "$(grep -c '`SYSTEM` is not declared' "$DRV/sysnoimp.out")"
 
-# `MIN(T)`/`MAX(T)` (W8.2) and `CASE … ELSE` (W8.1): the extremes are constants,
-# wherever they appear, and `ELSE` is report §9.5's default arm under a keyword
-# LALR(1) can parse.
+# `MIN(T)`/`MAX(T)` (W8.2) and `CASE ... ELSE` (W8.1): the extremes are
+# constants wherever they appear, and ELSE is report section 9.5's default
+# arm under a keyword LALR(1) can parse.
 runs_case min-max-and-case-else 'MODULE Ext;
   CONST Low = MIN(INTEGER); High = MAX(INTEGER);
   VAR i: INTEGER; ok: ARRAY 1 OF INTEGER;
@@ -866,7 +907,7 @@ BEGIN
   IF i # 9 THEN ok[1] := 0 END
 END Ext.
 '
-# Two defaults are one answer too many, and the message says so.
+# The compiler reports an error for a second default arm.
 printf 'MODULE Two;\n  VAR i: INTEGER;\nBEGIN\n  CASE i OF 1: i := 1 | ELSE i := 2 END\nEND Two.\n' > "$DRV/Two.mod"
 "$OBC" check "$DRV/Two.mod" >"$DRV/two.out" 2>&1 || true
 check "two-case-defaults-are-refused" "1" "$(grep -c 'two default arms' "$DRV/two.out")"
@@ -952,15 +993,15 @@ else
     fail=$((fail + 1))
 fi
 
-# 21. The layout the second back end computes is the C ABI's (DESIGN §16): the C
-#     back end emits structs and lets `cc` place the members, so `cc` is the
-#     authority and `layout.rs` is the claim. `obc emit --layout` prints the
-#     computed table and stops, so this runs even though that back end does not
-#     lower records yet (PLAN.md W9.2a) — and every fact is a `check` of its own,
-#     so a mismatch names the type and the field it is about.
+# 21. The second back end computes the C ABI layout (DESIGN section 16). The C
+# back end emits structs and lets `cc` place the members, so `cc` is the
+# authority and `layout.rs` makes the claim. `obc emit --layout` prints the
+# computed table and stops. This test runs even though that back end does not
+# lower records yet (PLAN.md W9.2a). Each fact has its own `check`, so a
+# mismatch names the type and field.
 #
-#     The C half names the driver directly: under `BACKEND=clif` `$OBC` is the
-#     wrapper that appends `--backend=clif`, and the later flag would win.
+# The C half names the driver directly. Under `BACKEND=clif`, `$OBC` is the
+# wrapper that appends `--backend=clif`, and the later flag would win.
 LAY=$(mktemp -d)
 cat > "$DRV/Lay.mod" <<'MODEOF'
 MODULE Lay;
@@ -1025,10 +1066,9 @@ else
 fi
 
 # 22. Fixed scalar arrays on that layout, multi-dimensional ones included, on
-#     whichever back end `$OBC` is: a module array lives in a data object and a
-#     local one in a zeroed frame slot, every subscript is checked against its
-#     own dimension, and the element is read and written through the stride the
-#     layout gives.
+# whichever back end `$OBC` is: module arrays are stored in a data object and
+# local arrays in a zeroed frame slot. Each subscript is checked against its
+# dimension, and the element is read and written using the layout stride.
 cat > "$DRV/Grid.mod" <<'MODEOF'
 MODULE Grid;
   VAR g: ARRAY 3, 4 OF INTEGER; t: ARRAY 2 OF INTEGER; ok: ARRAY 1 OF INTEGER;
@@ -1059,8 +1099,8 @@ fi
 
 # A NIL pointer where a type is asked for: `NIL IS T` is false and a NIL type-CASE
 # subject matches no label, so the default arm (or the located trap) answers. The C
-# path used to read the descriptor through NIL and fault with no message — a gap
-# W9.2b found by comparing the two back ends (W2.6).
+# path read the descriptor through NIL and fault with no message. W9.2b found
+# this gap while comparing the two back ends (W2.6).
 runs_case nil-has-no-type 'MODULE NilT;
   TYPE R = RECORD END; S = RECORD (R) x: INTEGER END; P = POINTER TO R; PS = POINTER TO S;
   VAR p: P; i: INTEGER; ok: ARRAY 1 OF INTEGER;
@@ -1073,20 +1113,20 @@ BEGIN
 END NilT.
 '
 
-# 23. The ABI across back ends (DESIGN §16). One program, four modules, two back
-#     ends: `MixLib` and `MixC2` are the C back end's objects, `MixRoot` and
-#     `MixLeaf` the Cranelift back end's. The host `cc` links them, so the symbol
-#     names, the argument and result conventions and the runtime's calls have to
-#     agree -- and the modules' own ASSERTs (an argument into a C module, a value
-#     out of a clif one, and a value each way) have to hold.
+# 23. The ABI across back ends (DESIGN section 16). One program uses four
+# modules, two back ends: `MixLib` and `MixC2` are C back-end objects, while
+# `MixRoot` and `MixLeaf` are Cranelift objects. The host `cc` links them, so
+# symbol names, argument/result conventions, and runtime calls must agree.
+# The modules' ASSERTs check arguments into a C module, values out of a clif
+# module, and values in both directions.
 #
-#     `$C_OBC` here is the driver itself, not the wrapper: under BACKEND=clif the
-#     wrapper appends `--backend=clif` after the module, which would override the
-#     explicit flag each half needs.
+# `$C_OBC` is the driver itself, not the wrapper. Under BACKEND=clif the wrapper
+# appends `--backend=clif` after the module, overriding the explicit flag each
+# half needs.
 #
-#     Each half is emitted into its own directory, because `emit` writes the whole
-#     import graph: asking for `MixRoot` under clif also writes a Cranelift
-#     `MixLib.o`, and the C back end's is the one to link.
+# Emit each half into its own directory because `emit` writes the whole import
+# graph. Asking for `MixRoot` under clif also writes a Cranelift `MixLib.o`,
+# while the C back end's object is the one to link.
 MIX="$DRV/mixed"
 mkdir -p "$MIX/c" "$MIX/k" "$MIX/k2" "$MIX/c2"
 if "$C_OBC" emit MixLib.mod  -I . --out "$MIX/c" >"$MIX/emit.log" 2>&1 &&
@@ -1103,10 +1143,10 @@ else
     fail=$((fail + 1))
 fi
 
-# The two back ends' objects for one module must export the same names. Only the
-# *defined* symbols are compared: what each calls is its own business (they reach
-# different runtime helpers), but a name that differs or is missing would be an
-# ABI disagreement, and an undefined one would fail the link below.
+# Objects from both back ends must export the same names for a module. Only the
+# *defined* symbols are compared: each module can call its own runtime helpers.
+# A differing or missing name would be an ABI disagreement, while an undefined
+# name would fail the link below.
 nm "$MIX/c/MixLib.o" | awk '$2 ~ /^[TDBR]$/ {print ($2 == "R" ? "D" : $2), $3}' | sort > "$MIX/sym.c"
 nm "$MIX/k/MixLib.o" | awk '$2 ~ /^[TDBR]$/ {print ($2 == "R" ? "D" : $2), $3}' | sort > "$MIX/sym.k"
 check "mixed-backend-same-symbols[init, load, Take, Twice, its variable]" "same" \
@@ -1151,18 +1191,17 @@ done
 check "opt-level-refuses-an-unknown-name[by name, not silently]" "1" \
     "$(grep -c 'names no optimisation level' "$DRV/opt-bad.log")"
 
-# 25. Inlining must not change what a program means, and the way it did was that a
-#     spliced body's *data* named the caller's object: `cranelift-codegen` copies a
-#     callee's `GlobalValueData` verbatim, and its `User` name is an index into the
-#     *function's* name table, so two functions have to declare the same data in the
-#     same order (PLAN.md W9.4). These two modules are that shape kept: `InlStr` is
-#     the string literal that first printed the wrong text, `InlDesc` guards on a
-#     record descriptor the caller never names, and `InlVar` is the same hazard for
-#     the *order* rather than the set: both functions declare both variables, but a
-#     map does not iterate the same way twice, so the sequence has to be imposed. Both check themselves with ASSERTs,
-#     so the exit status is the verdict. `--backend=clif` is explicit because the
-#     inlining is the second back end's, so the row reads the same under either
-#     BACKEND setting.
+# 25. Inlining must not change program behavior. The bug was that a spliced
+# body's *data* named the caller's object: `cranelift-codegen` copies a callee's
+# `GlobalValueData` verbatim, and its `User` name is an index into the
+# *function's* name table. The two functions must declare the same data in the
+# same order (PLAN.md W9.4). These modules preserve that shape:
+# `InlStr` is the string literal that first printed the wrong text, `InlDesc`
+# checks a record descriptor the caller never names, and `InlVar` tests the
+# ordering hazard. Both functions declare both variables, but a map may iterate
+# them in a different order, so impose the sequence. ASSERTs check each case,
+# and the exit status is the verdict. `--backend=clif` selects the second
+# back end's inlining, regardless of the BACKEND setting.
 for inl_mod in InlStr InlDesc InlVar; do
     if "$C_OBC" build "$inl_mod.mod" -I . --out "$DRV/inl-$inl_mod" -o "$DRV/inl-$inl_mod.bin" \
             --backend=clif 2>"$DRV/inl-$inl_mod.log"; then
@@ -1181,10 +1220,10 @@ done
 #     `Powers.mod` are from https://github.com/lboasso/oberonc (MIT), and the only
 #     thing the port changes is how they reach the host's arguments: that compiler
 #     provides `ARGNUM`/`ARGS` as built-ins, which neither the report nor another
-#     implementation has, and here the same information comes from the `Args`
-#     module (DESIGN 11). `lib/` carries the `Out` those programs expect — the
-#     suite's own `Out` is a different module of the same name, so the search path
-#     is what chooses, and `lib` goes first.
+#     implementation has. Here that information comes from the `Args` module
+#     (DESIGN 11). `lib/` includes the `Out` module those programs expect. The
+#     suite's `Out` is a different module with the same name, so search `lib`
+#     first.
 #
 #     `Util.mod` is theirs unmodified. Both programs are checked by their output,
 #     and the value checked is one only a correct run produces: the last power of

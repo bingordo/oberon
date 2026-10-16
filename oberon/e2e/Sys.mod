@@ -1,4 +1,4 @@
-(* report §11.1's SYSTEM, every entry of its table, checked against a
+(* report section 11.1's SYSTEM, every entry of its table, checked against a
    hand-computed expectation: an ADR/PUT/GET round trip, BIT on a word written
    that way, SIZE against the layout, and COPY between two arrays. Each ASSERT
    names the rule it tests, so a failure says which one broke -- and one

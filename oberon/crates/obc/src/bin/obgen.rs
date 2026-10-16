@@ -1,39 +1,33 @@
-//! obgen — a random Oberon-07 program generator, used as a self-checking oracle.
+//! obgen, a random Oberon-07 program generator used as a self-checking oracle.
 //!
-//! This is the classical way to test a compiler: generate programs that are
-//! *known* to be well formed and *known* to compute a particular value, so any
+//! *know* to be well formed and *know* to compute a value, so any
 //! disagreement is a bug rather than a judgement call.
 //!
-//! How this file gets both:
-//!
-//! * It generates a small structured IR (`Expr` / `Stmt`), renders that as
-//!   Oberon-07, and *interprets the same IR* with its own arithmetic. Every
-//!   module variable's expected value therefore comes from this file, not from
-//!   the compiler, so the oracle is not circular.
+//! It generates a small structured IR (`Expr` / `Stmt`), renders that as
+//! Oberon-07, and *interprets the same IR* with its own arithmetic. Each
+//! module variable's expected value comes from this file, not from the
+//! compiler, so the oracle is not circular.
 //! * The emitted program ends with one check per module variable:
 //!
 //!   ```oberon
 //!   IF m0 # 42 THEN fail[1] := 0 END;  (* check m0 expected 42 *)
 //!   ```
 //!
-//!   `fail` is an `ARRAY 1 OF INTEGER`, so the failing branch is an
-//!   out-of-range index: it traps with the source offset of the designator
-//!   (DESIGN §9.4), and the runner maps that offset back to this line. The
-//!   generated program needs no output at all, and the checks cannot be
-//!   optimised away because they have an observable effect.
+//!   `fail` is an `ARRAY 1 OF INTEGER`, so the failing branch traps with the
+//!   source offset of the designator (DESIGN 9.4). The runner maps that offset
+//!   back to this line. The generated program writes nothing. The checks
+//!   cannot be optimised away because they have an observable effect.
 //!
-//! The fragment is chosen so that a failure is never "undefined behaviour":
-//! `INTEGER` variables, constants, `+ - * DIV MOD`, `ABS`, `MIN`/`MAX`,
-//! the four shifts, relations as conditions, assignment, `IF`, `WHILE`,
-//! `REPEAT`, `FOR`, `CASE`, calls to generated procedures with value
-//! parameters, and one recursive function (the report allows a single `RETURN`,
-//! at the end of the body, so the accumulator shape it uses is the idiomatic
-//! escaped form of an early return).
+//! The fragment avoids undefined behaviour: `INTEGER` variables, constants,
+//! `+ - * DIV MOD`, `ABS`, `MIN`/`MAX`, shifts, relations as conditions,
+//! assignment, `IF`, `WHILE`, `REPEAT`, `FOR`, `CASE`, calls to generated
+//! procedures with value parameters, and recursion (the report allows `RETURN`
+//! only at the end of the body, so the accumulator form acts as an early return).
 //!
 //! Excluded on purpose, because the report does not define them and a
 //! disagreement would not be a bug: `DIV`/`MOD` by zero, `MIN(INTEGER) DIV -1`,
 //! and shifts by a negative count. Overflow *is* included: the design fixes
-//! `-fwrapv` (DESIGN §9.1, R4), so wrapping is the specified behaviour.
+//! `-fwrapv` (DESIGN 9.1, R4), so wrapping is the specified behaviour.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -41,7 +35,7 @@ use std::process::Command;
 
 use obc::line_col;
 
-// ---------------------------------------------------------------- random ---
+// random generator
 
 /// xorshift64*, so a seed reproduces a program exactly, on any machine.
 struct Rng(u64);
@@ -73,7 +67,7 @@ impl Rng {
     }
 }
 
-// ----------------------------------------------------------- expressions ---
+// expression model
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
@@ -118,7 +112,7 @@ fn div_floor(l: i32, r: i32) -> i32 {
     }
 }
 
-/// The shifts of report §10.2 (there is no `ROL`). `LSL` and `ASR` are defined
+/// The shifts of report 10.2 (there is no `ROL`). `LSL` and `ASR` are defined
 /// as multiplication and division by `2^n`, and `ROR` as a rotation. Counts of
 /// 32 and above are generated on purpose: multiplying by `2^32` wraps to zero
 /// and `x DIV 2^32` is 0 or -1, so the report's answer is defined even where
@@ -151,11 +145,11 @@ fn shift(name: &str, x: i32, n: u32) -> i32 {
 #[derive(Clone, Debug)]
 enum Expr {
     /// An `INTEGER` literal. `MIN(INTEGER)` is spelled out: `-2147483648` is not
-    /// a legal literal (see the lexical near misses in DESIGN §4).
+    /// a legal literal (see the lexical near misses in DESIGN 4).
     Int(i32),
     MinInt,
     MaxInt,
-    /// A named constant of the generated `CONST` block.
+    /// A constant in the generated `CONST` block.
     Konst(usize),
     /// A module variable (`m<k>`).
     MVar(usize),
@@ -193,8 +187,8 @@ impl Expr {
     }
 
     /// The mirror. `m` is the module frame, `l` this call's parameters and
-    /// locals, and `depth` bounds recursion (the generator only emits recursion
-    /// that terminates).
+    /// locals, and `depth` bounds recursion (the generator emits only
+    /// recursion with a base case).
     fn eval(&self, g: &Gen, m: &mut [i32], l: &[i32], depth: u32) -> i32 {
         match self {
             Expr::Int(k) => *k,
@@ -258,13 +252,13 @@ enum Stmt {
     If(Cond, Vec<Stmt>, Vec<Stmt>),
     While(Cond, Vec<Stmt>),
     Repeat(Vec<Stmt>, Cond),
-    /// `FOR v := lo TO hi DO body END`; `v` is read-only inside the body.
+    /// `FOR v := lo TO hi DO body END`. `v` is read-only inside the body.
     For(usize, i32, i32, Vec<Stmt>),
-    /// `CASE e OF label: body | … END`. Oberon-07 has no `ELSE`, and the report's
-    /// *default* arm — an empty label list followed by a statement sequence —
-    /// cannot be written in LALR(1) at all (PLAN.md W6.4). The generator sidesteps
-    /// both: the subject is a constant and one label always matches it, so no
-    /// default arm is needed and every generated program is defined.
+    /// `CASE e OF label: body | ... END`. Oberon-07 has no `ELSE`, and the
+    /// *default* arm (an empty label list followed by a statement sequence)
+    /// cannot be written in LALR(1) at all (PLAN.md W6.4). The generator avoids
+    /// that case: the subject is a constant and one label always matches it,
+    /// so every generated program is defined.
     Case(Expr, Vec<(i32, Vec<Stmt>)>),
     Call(usize, Vec<Expr>),
 }
@@ -331,9 +325,9 @@ impl Stmt {
                     }
                     i += 1;
                 }
-                // Report §9.8 defines the loop as `v := beg; WHILE v <= end DO S;
-                // v := v + inc END`, so the control variable ends at `end + inc` —
-                // which is exactly what the emitted C's `for` header leaves. The
+                // Report 9.8 defines the loop as `v := beg; WHILE v <= end DO S;
+                // v := v + inc END`, so the control variable ends at `end + inc`.
+                // This matches what the emitted C `for` header leaves. The
                 // mirror used to stop at the last body value and disagree with
                 // every program that read the variable afterwards.
                 m[*v] = i;
@@ -397,7 +391,7 @@ impl Stmt {
                 for s in body {
                     s.render(g, loc, level + 1, out);
                 }
-                // `REPEAT … UNTIL expr` has no `END`: the report's production
+                // `REPEAT ... UNTIL expr` has no `END`: the report's production
                 // is `RepeatStatement = REPEAT StatementSequence UNTIL
                 // expression`, unlike Oberon-2's.
                 let _ = writeln!(out, "{pad}UNTIL {};", c.render(g, loc));
@@ -428,7 +422,7 @@ impl Stmt {
     }
 }
 
-// ------------------------------------------------------------ generator ---
+// generator state
 
 /// A generated procedure. `locals[0]` is the accumulator of a function, and the
 /// index space used by `Expr::LVar` is `params ++ locals`.
@@ -464,14 +458,14 @@ struct Gen {
     locals_in_scope: usize,
     /// Module variables no statement may assign, for the whole program: the
     /// counter of a generated loop (whose increment is written by hand) and a
-    /// `FOR` control variable (read-only inside its loop, report §9.8). A
+    /// `FOR` control variable (read-only inside its loop, report 9.8). A
     /// procedure called from inside a loop must not be able to clobber it.
     frozen: Vec<bool>,
 }
 
 impl Gen {
-    /// A fresh module variable, with its frozen flag: the two vectors must stay
-    /// in step, and the only way to be sure is to push both here.
+    /// The module-variable and frozen-flag vectors must stay in step. Push to
+    /// both here.
     fn new_var(&mut self, name: &str, frozen: bool) -> usize {
         let index = self.mvars.len();
         self.mvars.push(format!("{name}{index}"));
@@ -499,7 +493,7 @@ impl Gen {
     }
 }
 
-// --------------------------------------------------------------- program ---
+// generated program
 
 struct Program {
     g: Gen,
@@ -516,11 +510,9 @@ struct Program {
     /// spelling because they are names rather than keywords.
     lower_keywords: bool,
     /// Adversarial mode (PLAN.md W7.5): after the value checks, one statement
-    /// that *must* trap, together with the trap line it must produce. The
-    /// violation is not part of `body`, so the mirror and every value check stay
-    /// valid, and the trap is the only thing left to observe -- which is the
-    /// only way those checks (bounds, NIL, guard, divisor, assertion) are
-    /// exercised rather than reasoned about.
+    /// that *must* trap and the trap line it must produce. The violation is not
+    /// part of `body`, so the mirror and every value check stay valid. The trap
+    /// makes the checks (bounds, NIL, guard, divisor, assertion) observable.
     adversarial: bool,
     seed: u64,
 }
@@ -563,7 +555,7 @@ impl Program {
             }
             2 => {
                 // `pa` points at an `ARec` while the guard asks for a pointer to
-                // the extension `AExt`: the tag test fails and reports itself.
+                // the extension `AExt`: the tag test fails and reports the
                 let block =
                     "  NEW(pa);\n  IF pa(AExtPtr) # NIL THEN arr[0] := 1 END\n".to_string();
                 let rel = block.find("pa(AExtPtr)").unwrap();
@@ -621,18 +613,15 @@ impl Program {
             .to_string()
     }
 
-    /// The heap probe's body: one chain per root kind the collector has to find
-    /// -- in a local (which the conservative stack walk finds), in a module-level
-    /// pointer variable, and inside a module-level record, both as one field and
-    /// as a run of them -- and then a churn that leaves garbage behind, so that
-    /// `OB_GC_STRESS=1` collects on every allocation in between. Each chain is
-    /// checked afterwards: a collector that freed a live node would have let the
-    /// churn reuse it and change a `val`, and the check traps.
+    /// The heap probe tests a local, found by the conservative stack walk, and
+    /// roots in module-level variables and records. It then churns, leaving
+    /// garbage behind, while `OB_GC_STRESS=1` collects on every allocation. A
+    /// collector that frees a live node lets the churn reuse it and change a
+    /// `val`, so the check traps.
     ///
-    /// The value of a chain of `n` nodes is `1 + .. + n`, and one copied from
-    /// its head goes on with `n - 1` of them, from `2` -- `GCLink` pushes the
-    /// newest node, whose value is the loop's last, at the head, so the head's
-    /// own value is 1.
+    /// A chain of `n` nodes has value `1 + .. + n`. Copying from its head leaves
+    /// `n - 1` nodes, from `2` onward. `GCLink` pushes the newest node, whose
+    /// value is the loop's last, at the head, so the head's own value is 1.
     fn gc_probe(&self) -> String {
         let n: i32 = 3 + (self.seed % 6) as i32;
         let sum = n * (n + 1) / 2;
@@ -661,7 +650,7 @@ impl Program {
         self.render_with_expectation().0
     }
 
-    /// The module, and -- in adversarial mode -- the trap line the program must
+    /// The module and, in adversarial mode, the trap line the program must
     /// produce. Both come from one render, so the bytes cannot drift apart.
     fn render_with_expectation(&self) -> (String, Option<String>) {
         let g = &self.g;
@@ -711,11 +700,11 @@ impl Program {
         for name in &g.mvars {
             let _ = writeln!(out, "    {name}: INTEGER;");
         }
-        // The trap trigger: out of range for its own length, on purpose.
+        // The trap trigger is out of range for its own length, on purpose.
         let _ = writeln!(out, "    fail: ARRAY 1 OF INTEGER;");
         {
-            // The heap probe's roots: a pointer variable, a record variable
-            // holding pointers, and the temporaries the record copies need.
+            // A pointer variable, a record variable holding pointers, and the
+            // temporaries needed to copy the record are heap probe roots.
             let _ = writeln!(
                 out,
                 "    gcHead, gcTmp: GCPtr; gcHold: GCHold; gcN: INTEGER;"
@@ -732,9 +721,9 @@ impl Program {
 
         let _ = writeln!(out, "BEGIN");
         let trace = self.per_statement.map(|v| self.explain(v));
-        // A check may only be emitted once the variable it reads has been
-        // defined: the first statement that assigns it is that point (every
-        // variable gets one — see `generate`).
+        // A check can only be emitted once the variable it reads has been
+        // defined: the first statement that assigns it is that point. Every
+        // variable gets one. See `generate`.
         let first_def = self
             .per_statement
             .and_then(|v| {
@@ -776,7 +765,7 @@ impl Program {
             let (block, rel, msg) = Self::violation(self.seed, &g.mvars[0]);
             let at = out.len() + rel;
             expectation = Some(if msg == "type guard failed" {
-                // This message carries its own byte rather than a suffix.
+                // This message includes its own byte rather than a suffix.
                 format!("type guard failed at byte {at}")
             } else {
                 format!("oberon: trap: {msg} (at byte {at} of the source)")
@@ -864,16 +853,16 @@ fn render_func(g: &Gen, f: &Func, out: &mut String) {
 /// accumulator).
 fn loc_of(f: &Func) -> Vec<String> {
     // The declared names, exactly as `render_func` writes them: parameters and
-    // locals live in the procedure's own scope, so no prefixing is needed (and
-    // none of them collides with a module variable, which is `m<k>`).
+    // locals live in the procedure's own scope, so no prefixing is needed. None
+    // collides with a module variable, which is `m<k>`.
     let mut v = f.params.clone();
     v.extend(f.locals.iter().cloned());
     v
 }
 
-/// `MIN(INTEGER)` and `MAX(INTEGER)` are not Oberon-07 (report §10.2), and
-/// `-2147483648` is not a legal literal (the integer token must fit an
-/// `INTEGER`, DESIGN §4), so the extreme values are written out.
+/// `MIN(INTEGER)` and `MAX(INTEGER)` are not Oberon-07 (report 10.2).
+/// The integer token must fit an `INTEGER` (DESIGN 4), so the extreme values
+/// are written out instead of using the -2147483648 literal.
 const MIN_EXPR: &str = "(0 - 2147483647 - 1)";
 const MAX_EXPR: &str = "2147483647";
 
@@ -888,7 +877,7 @@ fn literal(k: i32) -> String {
     }
 }
 
-// -------------------------------------------------------- generation ------
+// program generation
 
 fn generate(seed: u64) -> Program {
     let mut rng = Rng::new(seed);
@@ -944,10 +933,10 @@ fn generate(seed: u64) -> Program {
         frozen: vec![false; nmvars],
     };
 
-    // The module body: define every variable, then a handful of statements. Each
-    // initial value is a *literal*: the report leaves a variable undefined until
-    // it is assigned, so an initialiser that read another variable would make the
-    // mirror depend on the C back end's static zero-initialisation.
+    // Define every variable in the module body, then add several statements.
+    // Each initial value is a *literal*: the report leaves a variable
+    // undefined until assigned, so reading another variable in an initializer
+    // would make the mirror depend on the C back end's static zero-initialisation.
     let mut body: Vec<Stmt> = Vec::new();
     for k in 0..g.mvars.len() {
         let v = *g.rng.pick(&[0, 1, 2, -1, 7, 1000]);
@@ -983,7 +972,7 @@ fn generate(seed: u64) -> Program {
         g.callable = (0..f).filter(|k| g.funcs[*k].is_function).collect();
         g.locals_in_scope = nparams + nlocals;
 
-        // Every parameter is bound by the caller; every local starts defined.
+        // Every parameter is bound by the caller. Every local starts defined.
         let mut prepare: Vec<Stmt> = Vec::new();
         for k in nparams..nparams + nlocals {
             prepare.push(Stmt::SetL(k, Expr::Int(*g.rng.pick(&[0, 1, 2, -1, 7]))));
@@ -991,8 +980,8 @@ fn generate(seed: u64) -> Program {
 
         let mut fbody: Vec<Stmt> = Vec::new();
         if is_r {
-            // `acc := <expr over n> + R(n - 1)`, guarded by `n > 0`: the only
-            // recursion the generator emits, and it terminates.
+            // `acc := <expr over n> + R(n - 1)`, guarded by `n > 0`. The
+            // generator emits only this recursive pattern, with a base case.
             let e = gen_expr(&mut g, 2);
             fbody.push(Stmt::If(
                 Cond::Rel(">", Expr::LVar(0), Expr::Int(0)),
@@ -1019,17 +1008,10 @@ fn generate(seed: u64) -> Program {
         g.funcs[f].body = fbody;
     }
 
-    // Loop counters and `FOR` controls are created while the body is generated,
-    // and an assignment inside a loop can be skipped (an untaken arm) — so after
-    // the fact, every variable the generator ended up with is defined up front,
-    // with a literal. That removes the last place where the mirror and the C back
-    // end agreed only because statics start at zero.
-    // Counters and `FOR` controls are created *while* the body is generated, and
-    // the assignment that defines one sits inside its loop — which an untaken arm
-    // can skip. So once the variable list is final, every variable the generator
-    // ended up with is defined up front (the ones with an initialiser already
-    // keep their value). That removes the last place where the mirror and the C
-    // back end agreed only because statics start at zero.
+    // Loop counters and `FOR` controls get created while generating the body.
+    // An assignment inside a loop can be skipped (an untaken arm), so define
+    // every variable up front with a literal. This avoids relying on static
+    // zero-initialisation when the mirror and C back end agree.
     let mut init: Vec<Stmt> = Vec::new();
     for k in nmvars..g.mvars.len() {
         init.push(Stmt::SetM(k, Expr::Int(0)));
@@ -1174,8 +1156,8 @@ fn gen_stmt(g: &mut Gen, depth: u32) -> Stmt {
             Stmt::If(c, then, els)
         }
         4 => {
-            // `counter := 0; WHILE counter < k DO … counter := counter + 1 END`:
-            // termination by construction, which the mirror relies on too.
+            // `counter := 0; WHILE counter < k DO ... counter := counter + 1 END`:
+            // the loop ends by construction, as the mirror also relies on.
             let counter = g.new_var("m", true);
             let k = g.rng.range(1, 4);
             let mut body: Vec<Stmt> = (0..1 + g.rng.below(2))
@@ -1258,7 +1240,7 @@ fn gen_stmt(g: &mut Gen, depth: u32) -> Stmt {
     }
 }
 
-// --------------------------------------------------------------- runner ---
+// command-line runner
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1271,10 +1253,10 @@ fn main() {
     let mut cflags: Vec<String> = Vec::new();
     let mut adversarial = false;
     let mut lower_keywords = false;
-    // Which back end the programs are built with, forwarded to `obc`. Both
-    // generate the same module: the shape is the corpus's, not the back end's
-    // (PLAN.md W9.2b widened the Cranelift one to the record and pointer
-    // machinery the heap probe needs).
+    // Which back end builds the programs, forwarded to `obc`. Both generate
+    // the same module shape (the corpus's, not the back end's). PLAN.md W9.2b
+    // widened the Cranelift one to include the record and pointer machinery
+    // the heap probe needs.
     let mut backend = "c".to_string();
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
@@ -1377,8 +1359,8 @@ fn main() {
         backend,
     };
     if let Some(path) = &seed_list {
-        // A named list is how the seeds that once found a bug stay in the gate:
-        // a seed reproduces a program exactly, so a list is a regression suite.
+        // A seed list keeps seeds that once found a bug in the gate. Each seed
+        // reproduces a program exactly, so the list is a regression suite.
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("obgen: cannot read {}: {e}", path.display());
             std::process::exit(2);
@@ -1394,8 +1376,8 @@ fn main() {
     std::process::exit(run(base, seeds, &obc, &work, &modes));
 }
 
-/// What the caller asked for: the modes that change what is generated, and the C
-/// flags that change how it is built. One argument, because the runners would
+/// The modes that change what the caller generates, and the C flags that
+/// change how the caller builds it. One argument, because the runners would
 /// otherwise take one per mode.
 #[derive(Clone, Default)]
 struct Modes {

@@ -1,10 +1,10 @@
 //! Hand written Oberon-07 lexer.
 //!
-//! Why not LALRPOP's built in (regex) lexer: Oberon comments nest, i.e.
-//! `(* a (* b *) c *)` is one comment.  That is not a regular language, so the
-//! built in lexer (whose `match { ... }` ignore patterns are regular
-//! expressions) cannot express it.  Everything else in Oberon's vocabulary is
-//! regular; the language is small enough that a by-hand scanner is cheap and
+//! LALRPOP's built-in lexer uses regular expressions and cannot handle nested Oberon comments:
+//! `(* a (* b *) c *)` is one comment, which is not a regular language.
+//! Its `match { ... }` ignore patterns use regular expressions, so they
+//! cannot express nested comments. Everything else in Oberon's vocabulary
+//! is regular; the language is small enough that a by-hand scanner is cheap
 //! gives exact control over the two lexical near-misses:
 //!
 //!   * `22X`  is the character with ordinal 0x22, not the number 22 followed by
@@ -254,15 +254,14 @@ pub struct Lexer<'input> {
     pos: usize,
     /// Accept reserved words spelled in lower case (PLAN.md W8.10). Off by
     /// default, because the report makes capital and lower-case letters distinct
-    /// (report §3), so a *report* program that uses `Begin` as an identifier would
-    /// tokenise differently — which is what makes this the one extension that
-    /// needs a switch rather than being additive.
+    /// (report section 3), so a *report* program that uses `Begin` as an identifier would
+    /// tokenize differently. This is the one extension that needs a switch
+    /// rather than being additive.
     fold_keywords: bool,
 }
 
 impl<'input> Lexer<'input> {
-    /// The report's lexer: reserved words are recognised in the spelling the
-    /// report fixes, and nothing else.
+    /// Recognize reserved words exactly as spelled in the report.
     pub fn new(input: &'input str) -> Self {
         Lexer {
             input,
@@ -336,7 +335,7 @@ impl<'input> Lexer<'input> {
     fn scan_number(&mut self) -> Spanned<Token<'input>, usize, LexicalError> {
         let start = self.pos;
         // Longest run of '0'..'9' and 'A'..'F' decides between integer and
-        // hexadecimal integer; a trailing 'X' makes it a character constant.
+        // hexadecimal integer. A trailing 'X' makes it a character constant.
         let mut p = self.pos;
         while Self::hex_val(self.at(p)).is_some() {
             p += 1;
@@ -387,7 +386,7 @@ impl<'input> Lexer<'input> {
                     self.pos = r;
                     return match text.parse::<f64>() {
                         // The emitted REAL is a C float: a value the target
-                        // cannot hold is a diagnostic, not a silent zero.
+                        // cannot hold and returns a diagnostic.
                         Ok(v) if v.is_finite() && v.abs() <= f32::MAX as f64 => {
                             Ok((start, Token::Real(v), self.pos))
                         }

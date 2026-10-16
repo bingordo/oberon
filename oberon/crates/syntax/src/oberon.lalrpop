@@ -196,7 +196,7 @@ pub VarDecl: VarDecl = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => Va
 ///
 /// Note the shape: the `*` must be applied to the *non-nullable*
 /// `ProcDeclSemi`.  Writing this as `{ => Vec::new(), <ProcDeclSemi*> => ... }`
-/// would give `ProcSection` two different ε derivations, which is a genuine
+/// would give `ProcSection` two different empty derivations, which is a genuine
 /// reduce/reduce conflict (a nullable symbol under `*` is always ambiguous).
 ///
 /// Error recovery is deliberately *not* attempted here. A `!` alternative that
@@ -204,7 +204,7 @@ pub VarDecl: VarDecl = <lo:@L> <names:IdentList> ":" <ty:TypeExpr> <hi:@R> => Va
 /// token (the nullable section can either end or swallow the error), and every
 /// shape that avoids it does so by removing the recovery. Statement sequences
 /// are the exception that works, because there the error token is shifted in a
-/// state with no competing reduction; see DESIGN §5 D7.
+/// state with no competing reduction; see DESIGN section 5, D7.
 ProcSection: Vec<Proc> = <ps:ProcDeclSemi*> => ps;
 ProcDeclSemi: Proc = <p:ProcDecl> ";" => p;
 
@@ -329,9 +329,9 @@ Statement: Option<Stmt> = {
     <s:ForStmt> => Some(s),
     <s:ExitStmt> => Some(s),
     <s:ReturnStmt> => Some(s),
-    // Recovery (DESIGN §5 D7): a statement the parser cannot accept becomes an
-    // empty one, and the parser skips input until it can continue — at the next
-    // `;`, in practice. The recovery is recorded, not swallowed, so one run can
+    // Recovery (DESIGN section 5, D7): a statement the parser cannot accept becomes
+    // empty. Parsing skips input until it can continue, usually at the next `;`.
+    // The parser records each recovery rather than swallowing it, so one run can
     // report every syntax error in the file.
     <e:!> => {
         errors.push(e);
@@ -364,9 +364,9 @@ WhileStmt: Stmt = <lo:@L> "WHILE" <cond:Expr> "DO" <body:StatementSequence> <arm
 };
 WhileElsif: (Expr, Vec<Stmt>) = "ELSIF" <cond:Expr> "DO" <body:StatementSequence> => (cond, body);
 
-/// `RETURN [Expr]` (PLAN.md W8.4). It was report §10's tail clause, reachable only
-/// at the end of a body; as a statement it can leave from inside a `CASE`, and the
-/// emitter still funnels every return through one site (DESIGN §5 D6).
+/// `RETURN [Expr]` (PLAN.md W8.4). Report section 10 allows it only at the end of
+/// a body. As a statement it can leave from inside a `CASE`; the emitter still
+/// routes every return through one site (DESIGN section 5, D6).
 ReturnStmt: Stmt = <lo:@L> "RETURN" <e:Expr?> <hi:@R> => Stmt::new(StmtKind::Return(e), sp(lo, hi));
 
 /// `EXIT` (PLAN.md W8.5): leave the innermost loop. It is a statement of its own
@@ -388,9 +388,9 @@ CaseStmt: Stmt = <lo:@L> "CASE" <subject:Expr> "OF" <first:CaseArm> <rest:CaseAr
     let mut arms = vec![first];
     arms.extend(rest);
     // `ELSE S` is the default arm, represented as an arm with an empty label
-    // list — which is what the checker and the emitter already treat as the
-    // default. It is how report §9.5's own default gets a spelling LALR(1) can
-    // parse (DESIGN §5 D8, PLAN.md W8.1).
+    // list. The checker and emitter already treat that arm as the default. It gives
+    // report section 9.5's default a spelling the LALR(1) parser can accept
+    // (DESIGN section 5, D8; PLAN.md W8.1).
     if let Some(body) = els {
         arms.push(CaseArm { labels: None, body, span: sp(lo, hi) });
     }
@@ -552,7 +552,7 @@ QualTail: Ident = "." <i:Ident> => i;
 
 Ident: Ident = <s:"ident"> => s.to_string();
 
-/// Interface files store *rendered* types (DESIGN §7). They are ordinary Oberon
+/// Interface files store *rendered* types (DESIGN section 7). They are ordinary Oberon
 /// type syntax, so the interface reader reuses this very production instead of
 /// growing a second parser for its own output.
 pub RenderedType: TypeExpr = <t:TypeExpr> => t;

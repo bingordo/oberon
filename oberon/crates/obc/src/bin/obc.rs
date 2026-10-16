@@ -1,37 +1,36 @@
-//! `obc` — the driver: source in, runnable program out.
+//! `obc` is the driver: it turns source into a runnable program.
 //!
-//! The library turns one module into C; this binary is what makes that a
-//! compiler. It walks the import graph, emits every module it has source for,
-//! accepts hand-written C for the rest, writes the shared runtime, generates the
-//! loader that `main` needs, invokes the C compiler with the flags DESIGN §9.1
-//! fixes, and can run the result.
+//! The library turns one module into C. This binary completes the compiler by
+//! resolving imports, writing C modules and the shared runtime, and generating
+//! the loader that `main` needs. It then invokes the C compiler with the flags
+//! in DESIGN 9.1 and can run the result.
 //!
 //! ```text
 //! obc check  Foo.mod [-I DIR]...                  diagnostics only
 //! obc emit   Foo.mod [--out DIR] [-I DIR]...      .c/.h/.sym per module
-//! obc build  Foo.mod [-o EXE] [--out DIR] [-I DIR]... [--cc CC] [--cflags …]
+//! obc build  Foo.mod [-o EXE] [--out DIR] [-I DIR]... [--cc CC] [--cflags ...]
 //! obc run    Foo.mod [-I DIR]... [--command M.P] [--keep]
 //! ```
 //!
-//! Resolution, per `IMPORT M`: `M.mod` on the search path is compiled
-//! (recursively, depth first, so its interface exists before the importer is
-//! checked); otherwise `M.c` is taken as a hand-written implementation in the
-//! emitted shape, as `oberon/e2e/Texts.c` is. `M.sym` must be findable either
-//! way, because that is what the importing module is checked against.
+//! For `IMPORT M`, the compiler recursively compiles `M.mod` from the search
+//! path, depth first, so its interface exists before it checks the importer.
+//! Otherwise it uses `M.c` as hand-written code in the emitted shape, as in
+//! `oberon/e2e/Texts.c`. In either case, `M.sym` must be findable
+//! because the importer is checked against it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use obc::{
-    check_module_recovering_dialect, emit_c_full, emit_interface_dialect, emit_object_full,
-    layout_table_full, limit_errors, parse_with_diagnostics_dialect, render_diagnostics,
-    Diagnostic, Dialect,
+    check_module_recovering_dialect, emit_c_full, emit_c_full_with_line_directives,
+    emit_interface_dialect, emit_object_full, layout_table_full, limit_errors,
+    parse_with_diagnostics_dialect, render_diagnostics, Diagnostic, Dialect,
 };
 use sema::sym;
 
-/// The flags DESIGN §9.1 fixes: wrapping arithmetic, the base-as-first-member
-/// punning, and warnings as errors so the emitted C has to be clean.
+/// DESIGN 9.1 sets the C flags for wrapping arithmetic, base-as-first-member
+/// punning, and warnings as errors. This keeps the emitted C clean.
 const CFLAGS: &str =
     "-std=c11 -O2 -fwrapv -fno-strict-aliasing -Wall -Wextra -Werror -Wno-overflow";
 
@@ -43,10 +42,10 @@ enum Mode {
     Run,
 }
 
-/// Which back end writes the code for the modules this build has source for
-/// (PLAN.md W9.1). `c` is the reference and the default; `clif` emits an object
-/// file per module instead of a translation unit and a header, and the driver
-/// links it the same way (DESIGN §16.2).
+/// Selects the back end for modules with source in this build (PLAN.md W9.1).
+/// `c` is the reference and default. `clif` emits an object file per module
+/// instead of a translation unit and header. The driver links it the same way
+/// (DESIGN 16.2).
 #[derive(PartialEq, Clone, Copy)]
 enum Backend {
     C,
@@ -76,31 +75,33 @@ struct Opts {
     cflag: Vec<String>,
     command: Option<(String, String)>,
     keep: bool,
+    /// Generate C preprocessor line directives for source statements.
+    line_directives: bool,
     /// Which back end emits this build's modules.
     backend: Backend,
-    /// Print the module's type layout and stop, without emitting anything: a
-    /// diagnostic (DESIGN §16's comparison), not a mode of the build.
+    /// Print the module's type layout and stop without emitting anything. The
+    /// result supports the comparison in DESIGN 16.
     layout: bool,
     /// How many errors to print before saying the rest were suppressed; `0` is
     /// no limit (PLAN.md W5.2).
     ferror_limit: usize,
-    /// Which runtime checks to write: all of them unless `-Ochecks=…` narrows the
-    /// set (DESIGN §9.4, PLAN.md W3.1 and W8.3).
+    /// Which runtime checks to write. All are enabled unless `-Ochecks=...`
+    /// narrows the set (DESIGN 9.4, PLAN.md W3.1 and W8.3).
     checks: cgen::cgen::Checks,
     /// Which dialect to accept: the report's Oberon-07 unless `-Odialect=lower`
-    /// (DESIGN §5, PLAN.md W8.10).
+    /// (DESIGN 5, PLAN.md W8.10).
     dialect: Dialect,
     /// What the second back end optimises for, in Cranelift's vocabulary: `speed`
-    /// unless `-Oopt=…` says otherwise (DESIGN §16, PLAN.md W9.7). The C back
-    /// end's level is `gcc`'s business and is chosen with `--cflag -O…`, so this
+    /// unless `-Oopt=...` says otherwise (DESIGN 16, PLAN.md W9.7). The C back
+    /// end's level is `gcc`'s business and is chosen with `--cflag -O...`, so this
     /// only ever reaches the Cranelift back end.
     opt: String,
 }
 
-/// One module in the link: code this build emitted, or C found on disk. What
-/// the code *is* depends on the back end that wrote it — a translation unit for
-/// the C back end, an object file for the Cranelift one — and both go to the C
-/// compiler's command line, which is why the two live in one field.
+/// A module in the link, either code emitted by this build or C found on disk.
+/// Its format depends on the back end: a translation unit for C or an object
+/// file for Cranelift. The C compiler takes either format on its command line,
+/// so both fit in one field.
 struct Unit {
     name: String,
     code: PathBuf,
@@ -120,6 +121,7 @@ fn usage() -> ExitCode {
          \x20 --cflag ARG       one extra C flag (repeatable, no splitting)\n\
          \x20 --command M.P     run this command after the modules load (run)\n\
          \x20 --keep            keep the temporary build directory\n\
+         \x20 --line-directives  map generated C statements to their Oberon source lines\n\
          \x20 --ferror-limit N  print at most N errors (default 20, 0 = no limit)
          \x20 -Ochecks[=LIST]   runtime checks: all (default), none, or a list of
          \x20                   index, nil, guard and case
@@ -153,10 +155,10 @@ fn main() -> ExitCode {
     if temporary {
         opts.out = std::env::temp_dir().join(format!("obc-{}", std::process::id()));
     }
-    // The build directory carries interfaces too: the runtime's `Args.sym` is
-    // written there with the runtime itself, so a program reaches the host
-    // through an ordinary module without the user adding a search path. Appended
-    // last, so a `-I` still shadows it (DESIGN 11).
+    // The build directory also holds interfaces. The runtime writes `Args.sym`
+    // there, letting a program reach the host through an ordinary module
+    // without an added search path. Since this directory is appended last,
+    // `-I` entries still shadow it (DESIGN 11).
     if !opts.search.contains(&opts.out) {
         opts.search.push(opts.out.clone());
     }
@@ -200,6 +202,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         checks: cgen::cgen::Checks::ALL,
         dialect: Dialect::Report,
         opt: "speed".to_string(),
+        line_directives: false,
     };
     let mut i = 2;
     while i < args.len() {
@@ -224,6 +227,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                 o.command = Some((m.to_string(), p.to_string()));
             }
             "--keep" => o.keep = true,
+            "--line-directives" => o.line_directives = true,
             "--layout" => o.layout = true,
             other if other.starts_with("--backend=") => {
                 let name = &other["--backend=".len()..];
@@ -289,6 +293,10 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         }
         i += 1;
     }
+    if o.line_directives && (o.mode == Mode::Check || o.backend != Backend::C) {
+        eprintln!("obc: --line-directives requires C output (emit, build, or run with --backend=c)");
+        return None;
+    }
     Some(o)
 }
 
@@ -296,7 +304,7 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     std::fs::create_dir_all(&o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
 
     // 1. Interfaces already on the search path (hand-written modules such as
-    //    Texts and Oberon ship one with their C).
+    //    Texts and Oberon include one with their C).
     // An interface that is *refused* is not the same as one that is missing, but
     // saying so has to wait until we know it is needed: an unrelated `.sym` on the
     // search path, or one superseded by a better copy in another directory, must
@@ -315,10 +323,9 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     let root_src = read(&o.root)?;
     let root = module_name(&root_src, o.dialect);
     if o.layout {
-        // The table is about the *types*, so a module whose records or pointers
-        // this back end does not lower yet can still be asked what layout it
-        // would get — which is exactly what the comparison against `cc` needs,
-        // and why this prints and stops rather than building anything.
+        // The table describes types, so it can report layouts for records or
+        // pointers this back end does not yet lower. This supports comparison
+        // against `cc` and stops before building anything.
         let pointer_bytes = clif::clif::pointer_bytes().map_err(|e| format!("--layout: {e}"))?;
         match layout_table_full(&root_src, &interfaces, o.dialect, pointer_bytes) {
             Ok(Ok(table)) => print!("{table}"),
@@ -379,7 +386,7 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
         cmd.arg("-I").arg(dir);
     }
     // A unit is a `.c` or a `.o`; the compiler driver takes either, which is
-    // what makes the back ends interchangeable here (DESIGN §16.2).
+    // what makes the back ends interchangeable here (DESIGN 16.2).
     for u in &units {
         cmd.arg(&u.code);
     }
@@ -454,10 +461,10 @@ fn emit_tree(
         if done.contains(&m) {
             continue;
         }
-        // Report §11.1's SYSTEM is built into the compiler (DESIGN §9.10): there
-        // is no module to compile, nothing to link, and no interface to find.
-        // Looking for `SYSTEM.mod` here would both shadow the report's module with
-        // whatever the search path holds and fail the build when it holds nothing.
+        // DESIGN 9.10 defines SYSTEM in report 11.1 as built into the compiler.
+        // There is no module to compile, link, or search for. Looking for
+        // `SYSTEM.mod` could shadow the report's module with one on the search
+        // path, or fail the build if the path has no such module.
         if m == "SYSTEM" {
             continue;
         }
@@ -469,8 +476,8 @@ fn emit_tree(
             }
             None => match find_file(o, &format!("{m}.c")) {
                 Some(c) if matches!(o.mode, Mode::Build | Mode::Run) => {
-                    // A hand-written module: its header has to be next to it in
-                    // the emitted shape, and its interface is already loaded.
+                    // A hand-written module needs its header beside it in the
+                    // emitted shape. Its interface is already loaded.
                     if !c.with_extension("h").exists() {
                         return Err(format!(
                             "`{}` has no `{m}.h` beside it: a hand-written module needs the \
@@ -501,15 +508,13 @@ fn emit_tree(
                 }
                 None => {
                     if !interfaces.iter().any(|i| i.module == m) {
-                        // An interface that was *refused* (a version this compiler
-                        // does not read) is not a missing one, and saying which it
-                        // is means no unrelated `.sym` on the search path gets the
-                        // blame (PLAN.md W3.2).
+                        // A refused interface has an unsupported version. It
+                        // is not missing, and identifying it avoids blaming an
+                        // unrelated `.sym` on the search path (PLAN.md W3.2).
                         //
-                        // A module whose C *is* found does not reach this arm, so
-                        // `emit_tree` reports the same refusal from the checker's
-                        // diagnostic instead. The two are exclusive, so neither
-                        // path can report it twice.
+                        // If the module's C exists, this arm is not reached;
+                        // `emit_tree` reports the refusal in the checker's
+                        // diagnostic instead. Only one path can report it.
                         if let Some(why) = refused.get(&m) {
                             return Err(why.to_string());
                         }
@@ -524,14 +529,14 @@ fn emit_tree(
         }
     }
 
-    // Now the imports' interfaces exist, so this module can be checked. The
-    // parser recovers at statement level, so one run reports syntax errors *and*
-    // type errors rather than stopping at the first of either.
+    // The imports' interfaces are ready, so this module can be checked. The
+    // parser recovers at statement level and reports syntax and type errors
+    // together rather than stopping at the first one.
     let (parsed, mut diags) = check_module_recovering_dialect(src, interfaces, o.dialect);
-    // An interface the checker reports as missing may have been *refused* rather
-    // than absent — a version this compiler does not read — and the reason is
-    // worth more than "no interface". This is the place that knows an interface is
-    // needed, whatever backs it: a `.sym`, a `.mod`, or C (PLAN.md W3.2).
+    // A missing-interface diagnostic may mean the interface was refused
+    // because this compiler does not read its version. This point knows an
+    // interface is needed, whether it comes from `.sym`, `.mod`, or C
+    // (PLAN.md W3.2).
     for d in &diags {
         if let Some(rest) = d.message.split("no interface for module `").nth(1) {
             if let Some(name) = rest.split('`').next() {
@@ -553,13 +558,24 @@ fn emit_tree(
         return Err(format!("`{name}` does not check"));
     }
     let _ = parsed;
-    // The two back ends diverge in what they write: a translation unit and a
-    // header the C compiler is handed, or an object file that is handed to the
-    // same command line. Both are linked with the same runtime and loader
-    // (DESIGN §16.2), so the rest of the driver does not care which it was.
+    // The back ends write different formats. C writes a translation unit and
+    // header. Cranelift writes an object file. Both use the same runtime and
+    // loader (DESIGN 16.2), so the rest of the driver is independent of the
+    // selected back end.
     let code = match o.backend {
         Backend::C => {
-            let (c, h) = emit_c_full(src, interfaces, o.checks, o.dialect)
+            let emitted = if o.line_directives {
+                emit_c_full_with_line_directives(
+                    src,
+                    interfaces,
+                    o.checks,
+                    o.dialect,
+                    &path.display().to_string(),
+                )
+            } else {
+                emit_c_full(src, interfaces, o.checks, o.dialect)
+            };
+            let (c, h) = emitted
                 .map_err(|e| format!("{}: {e}", path.display()))?
                 .map_err(|diags| {
                     print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));
@@ -610,23 +626,22 @@ void Args__Get(int32_t i, char *s, int32_t s__len);
 #endif
 ";
 
-/// The modules whose bodies the runtime carries, rather than a `.c` on the search
-/// path. To a program they are ordinary modules — an import, an interface, calls
-/// that go through the usual ABI — and the driver's only part is knowing that the
-/// implementation is already in the object every build links. One row per module
-/// the host provides, so the next one (a clock, the environment) costs a row and
-/// its C in the runtime rather than a change anywhere else (DESIGN 11).
+/// The runtime provides these module bodies instead of finding a `.c` on the
+/// search path. Programs use them like ordinary modules, through imports,
+/// interfaces, and calls that follow the usual ABI. The driver only needs to
+/// know that their code is already in the object linked by every build. Add a
+/// row for each host-provided module, and put its C in the runtime (DESIGN 11).
 const RUNTIME_MODULES: &[&str] = &["Args"];
 
 fn is_runtime_module(name: &str) -> bool {
     RUNTIME_MODULES.contains(&name)
 }
 
-/// The `Args` module's interface, in the shape the emitter writes `.sym` files,
-/// and the one interface this driver writes itself: the module's body is in the
-/// runtime, so there is no declaration to emit it from. `Count` is the number of
-/// arguments the program was given — after its own name — and `Get` copies the
-/// `i`-th into a string, empty if there is none (DESIGN 11).
+/// The `Args` interface uses the `.sym` shape written by the emitter. This
+/// driver writes it because the module body is in the runtime, with no separate
+/// declaration to emit. `Count` returns the argument count excluding the
+/// program name. `Get` copies argument `i` into a string, or an empty string
+/// when none exists (DESIGN 11).
 const ARGS_INTERFACE: &str = "\
 MODULE Args
 VERSION 1
@@ -636,9 +651,9 @@ PROC Get(i: INTEGER; VAR s: ARRAY OF CHAR)
 
 fn write_runtime(o: &Opts) -> Result<(), String> {
     write(&o.out.join("oberon.h"), cgen::cgen::RUNTIME_HEADER)?;
-    // `Args` is an ordinary module whose body lives in the runtime, so its
-    // interface is written here beside it. A program that wants the arguments
-    // imports it, and nothing in the compiler knows the name (DESIGN 11).
+    // `Args` is an ordinary module with its body in the runtime. Write its
+    // interface beside the body. Programs import it to read arguments; the
+    // compiler does not know its name (DESIGN 11).
     write(&o.out.join("Args.sym"), ARGS_INTERFACE)?;
     write(&o.out.join("Args.h"), ARGS_HEADER)?;
     write(&o.out.join("oberon_runtime.c"), cgen::cgen::RUNTIME_SOURCE)
@@ -697,16 +712,14 @@ fn find_file(o: &Opts, name: &str) -> Option<PathBuf> {
     o.search.iter().map(|d| d.join(name)).find(|p| p.exists())
 }
 
-/// The loader `main`: load the modules in dependency order. Each `<M>__load`
-/// runs that module's body and registers its commands, which is exactly what
-/// report §11 says happens when a module is loaded.
+/// The loader `main` loads modules in dependency order. Each `<M>__load` runs
+/// that module's body and registers its commands, as report 11 describes.
 ///
-/// The two back ends need the same `main` with different prologues. The C back
-/// end's modules declare themselves in a header, so the loader includes it; a
-/// module the Cranelift back end lowered has no header at all — its interface is
-/// the object and the `.sym` — so the loader declares the one entry point it
-/// calls. Either way the command dispatch is the same, because it goes through
-/// the runtime's registry and not through a module's names (DESIGN §16.2).
+/// Both back ends use the same `main` with different prologues. C modules
+/// have declarations in a header, which the loader includes. Cranelift modules
+/// have no header; their object and `.sym` hold the interface, so the loader
+/// declares the entry point it calls. In either case, command dispatch uses
+/// the runtime's registry, not module names (DESIGN 16.2).
 fn loader_source(
     units: &[Unit],
     command: Option<&(String, String)>,
@@ -738,7 +751,7 @@ fn loader_source(
         out.push_str(&format!("    {}__load();\n", u.name));
     }
     match command {
-        // report §11: a parameterless exported procedure can be activated by
+        // report 11: a parameterless exported procedure can be activated by
         // name once its module is loaded, which is what `--command` does.
         Some((module, proc)) => {
             out.push_str(&format!(

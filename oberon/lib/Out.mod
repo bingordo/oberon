@@ -1,8 +1,8 @@
 MODULE Out;
   (* The module Oberon-07 programs written elsewhere expect: `Int`, `Char`,
-     `String` and `Ln` over the report's `Texts`. It is not part of the report —
+     `String` and `Ln` over the report's `Texts`. It is not part of the report.
      `Out` is a convention of the Oberon implementations, and a program that
-     prints reaches for it — so it lives here rather than being something the
+     prints reaches for it. It lives here rather than being something the
      compiler knows about, exactly as the host's arguments do through `Args`
      (DESIGN 11). This file and the `Args` interface the driver writes are the two
      halves: the compiler ships no library, and a program that wants one puts this

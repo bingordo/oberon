@@ -63,7 +63,7 @@ fn main() -> ExitCode {
     // the runtime pair.
     if let Some(i) = args.iter().position(|a| a == "--emit-c") {
         let dir = args.get(i + 1).cloned().unwrap_or_else(|| ".".to_string());
-        // Interface files of the modules this one imports: DESIGN §7 has the
+        // Interface files of imported modules: see DESIGN section 7. The
         // compiler write them, and the reader looks for them next to the source
         // and in each `-I DIR`.
         let mut ifaces = Vec::new();
@@ -98,12 +98,18 @@ fn main() -> ExitCode {
                 }
             }
         }
-        return match obc::emit_c_full(
-            &src,
-            &ifaces,
-            cgen::cgen::Checks::ALL,
-            dialect,
-        ) {
+        let emitted = if args.iter().any(|a| a == "--line-directives") {
+            obc::emit_c_full_with_line_directives(
+                &src,
+                &ifaces,
+                cgen::cgen::Checks::ALL,
+                dialect,
+                path,
+            )
+        } else {
+            obc::emit_c_full(&src, &ifaces, cgen::cgen::Checks::ALL, dialect)
+        };
+        return match emitted {
             Ok(Ok((c, h))) => {
                 let name = obc::parse_module_dialect(&src, dialect)
                     .map(|m| m.name)
@@ -162,7 +168,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            // The same shape as any other diagnostic (DESIGN §10).
+            // The same shape as any other diagnostic (DESIGN section 10).
             let d = obc::diagnostic_for_parse_error(&e);
             eprint!("{}", obc::render_diagnostics(path, &src, &[d]));
             ExitCode::FAILURE

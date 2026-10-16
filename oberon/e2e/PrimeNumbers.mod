@@ -6,7 +6,7 @@ MODULE PrimeNumbers;  (* Tabulate prime numbers *)
      as built-ins, which are neither the report's nor portable. Here the host's
      arguments come from the `Args` module instead (DESIGN 11), so the only
      changes are the import, `Args.Count` for `ARGNUM()`, `Args.Get` for `ARGS`,
-     and a module body that calls `Main` — that compiler calls it for you. *)
+    and a module body that calls `Main`. That compiler calls it for you. *)
   IMPORT Args, Out, Util;
 
   PROCEDURE Primes(n: INTEGER);

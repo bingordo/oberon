@@ -1,5 +1,5 @@
-/* A hand-written Texts implementation in the emitted shape, so that the
- * report's own Out module can be compiled and run against it unchanged. */
+/* A hand-written Texts fixture in the emitted shape lets the report's own Out
+ * module compile and run against it unchanged. */
 #include "Texts.h"
 #include <stdio.h>
 

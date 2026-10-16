@@ -1,11 +1,10 @@
 //! Oberon-07 concrete syntax: the hand-written lexer, the LALRPOP grammar and
-//! the syntax AST (DESIGN §2, §3, §4, §5, §6).
+//! the syntax AST (DESIGN 2, 3, 4, 5, 6).
 //!
-//! This is the only crate that knows LALRPOP exists: the grammar, its `build.rs`
-//! and the generated parsers stay here, and every phase above consumes a plain
-//! syntax AST. The crate also carries the dialect switch (`Report` vs `Lower`)
-//! and the diagnostics a parse can raise, because a lexical or syntax error is
-//! the lowest phase's own.
+//! This is the only crate that knows LALRPOP exists. Its grammar, `build.rs`
+//! and generated parsers stay here. Every phase above consumes a plain syntax
+//! AST. The crate also contains the dialect switch (`Report` vs `Lower`) and
+//! diagnostics for lexical and syntax errors.
 
 pub mod ast;
 pub mod diag;
@@ -24,12 +23,11 @@ pub use lalrpop_util::ParseError;
 
 pub type ParseErr<'input> = ParseError<usize, Token<'input>, LexicalError>;
 
-/// Which dialect the front end accepts (DESIGN §5: a dialect is a *gated* grammar,
-/// not a second grammar). `Report` is the report's Oberon-07. `Lower` additionally
-/// accepts reserved words spelled in lower case (PLAN.md W8.10) — the one extension
-/// that cannot be additive, because the report makes capital and lower-case letters
-/// distinct (report §3), so a report program that used `Begin` as a name would
-/// tokenise differently.
+/// The front end uses one of two dialects (DESIGN 5). Each is a *gated* grammar,
+/// not a separate grammar. `Report` is report Oberon-07. `Lower` accepts reserved
+/// words in lower case too (PLAN.md W8.10). This extension changes parsing because
+/// the report distinguishes capital and lower-case letters (report section 3).
+/// A report program using `Begin` as a name would tokenize differently.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Dialect {
     #[default]
@@ -61,10 +59,10 @@ impl Dialect {
         }
     }
 
-    /// A note for a token that is a reserved word *only* because this dialect folds
-    /// keyword case: without it a reader sees "unexpected `BEGIN`" where the program
-    /// wrote `begin`, and has no way to tell why. The spelling is checked, so an
-    /// honestly upper-case `BEGIN` — a reserved word in either dialect — gets no note.
+    /// Explain why a token is reserved only in this dialect, which folds keyword
+    /// case. Without the note, a reader sees "unexpected `BEGIN`" where the
+    /// program wrote `begin`. The spelling is checked, so upper-case `BEGIN`
+    /// (reserved in either dialect) doesn't need one.
     fn collision_note(self, tok: &Token<'_>, text: &str) -> Option<String> {
         if self != Dialect::Lower {
             return None;
@@ -99,10 +97,10 @@ pub fn parse_module_dialect<'input>(
     }
 }
 
-/// Parse a module, recovering at statement level (DESIGN §5 D7): the module
-/// comes back with the statements that parsed, together with every syntax error
-/// the parser recovered from. Nothing is discarded - a recovered statement
-/// becomes an empty one, and each error carries the input it dropped.
+/// Parse a module, recovering at statement level (DESIGN 5 D7). The module
+/// includes the statements that parsed and all syntax errors the parser recovered
+/// from. A recovered statement becomes empty, and each error records the input
+/// that was dropped.
 pub fn parse_module_recovering<'input>(
     input: &'input str,
 ) -> (

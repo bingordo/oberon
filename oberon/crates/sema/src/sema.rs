@@ -1,16 +1,15 @@
-//! The semantic pass: scopes, declarations, type resolution and the checks of
-//! DESIGN.md §8.5, driven over the syntax AST produced by `oberon.lalrpop`.
+//! Semantic pass: scopes, declarations, type resolution and the checks of
+//! DESIGN.md section 8.5, driven over the syntax AST produced by `oberon.lalrpop`.
 //!
 //! One walk, the way the reference Oberon compiler works: a scope chain, types
 //! built on the fly, diagnostics carrying spans into the only tree there is.
-//! The two predicates it leans on are separate and already tested — `types.rs`
-//! for the type algebra and `const_eval.rs` for constants — so what remains here
-//! is declaration bookkeeping and the checks themselves.
+//! The type algebra and constants are handled by separate, already tested
+//! modules, `types.rs` and `const_eval.rs`, so what remains here is declaration
+//! bookkeeping and the checks themselves.
 //!
 //! Each check names the catalogue row and the report section it comes from.
 //! `SELF_HOSTING` (bottom of the file) checks this pass on the report's own
 //! modules, and `tests` covers the negative cases row by row.
-
 use std::collections::{HashMap, HashSet};
 
 use syntax::ast::{
@@ -24,7 +23,7 @@ use crate::resolve::{reclassify, Names};
 use crate::sym::{Interface, Item};
 use crate::types::{Field, Basic, Param, Type, TypeId, Types};
 
-/// A procedure's signature as the checker flattened it (DESIGN §9.7): the
+/// A procedure's signature as the checker flattened it (DESIGN section 9.7): the
 /// procedure's type, one entry per parameter with its mode, and the result.
 #[derive(Debug, Clone)]
 pub struct Signature {
@@ -33,8 +32,8 @@ pub struct Signature {
     pub result: Option<TypeId>,
 }
 
-/// What an identifier denotes (report §4: an object is a constant, a type, a
-/// variable, or a procedure).
+/// An identifier denotes a constant, a type, a variable, or a procedure
+/// (report section 4).
 #[derive(Debug, Clone)]
 enum Sym {
     Const(Const, TypeId),
@@ -50,7 +49,7 @@ enum Sym {
     },
     Proc {
         ty: TypeId,
-        /// A procedure declared inside another procedure; report §6.5 forbids
+        /// A procedure declared inside another procedure. Report section 6.5 forbids
         /// assigning one to a procedure variable (check 50).
         local: bool,
         /// Identity of a procedure *this compilation unit declares*, so a use
@@ -58,17 +57,17 @@ enum Sym {
         /// unused-procedure half). `None` for an imported or predefined one.
         id: Option<usize>,
     },
-    /// A predeclared procedure of report §10.2.
+    /// A predeclared procedure of report section 10.2.
     Predef(&'static str),
-    /// Report §11.1's module `SYSTEM`, imported as a *builtin*: no interface
+    /// Report section 11.1's module `SYSTEM`, imported as a *builtin*: no interface
     /// file is read for it (see `imports`).
     System,
     /// One entry of `SYSTEM`, dispatched by name in the checker. `ADR`, `GET`
     /// and `PUT` take a variable and `SIZE` takes a type, so the entries have
-    /// no signature to check against (§5 D2's shape: one production, decided by
-    /// the name it names).
+    /// no signature to check against (section 5, D2's shape: one production,
+    /// decided by the name it names).
     Sys(String),
-    /// An imported module; the index selects the interface.
+    /// An imported module. The index selects the interface.
     Module(usize),
 }
 
@@ -86,13 +85,13 @@ struct Typed {
     lvalue: bool,
     /// May this be passed to a `VAR` parameter? False for a constant and for a
     /// structured value parameter; true for a variable, *including* an imported
-    /// one - report §11 forbids assigning to an imported variable, not passing
+    /// one - report section 11 forbids assigning to an imported variable, not passing
     /// it, and the report's own `Out` passes `Oberon.Log` to
     /// `Texts.Append(VAR w: Writer; ...)`.
     var_ok: bool,
     read_only: Option<&'static str>,
     /// A `VAR` parameter of record type: this is what makes a guard or `IS`
-    /// applicable to a record-typed designator (report §8.1).
+    /// applicable to a record-typed designator (report section 8.1).
     var_record_param: bool,
     /// The assigned name, for the `FOR` control-variable lock.
     name: Option<String>,
@@ -122,7 +121,7 @@ pub struct Sema<'a> {
     scopes: Vec<Scope>,
     pub diags: Vec<Diagnostic>,
     interfaces: &'a [Interface],
-    /// Control variables of enclosing `FOR` loops (report §9.8).
+    /// Control variables of enclosing `FOR` loops (report section 9.8).
     locked: Vec<String>,
     /// How many loops enclose the statement being checked: `EXIT` outside one
     /// has no loop to leave (PLAN.md W8.5).
@@ -176,14 +175,14 @@ pub struct Sema<'a> {
     /// here.
     pub call_types: HashMap<u64, TypeId>,
     /// The type of every expression the pass typed, keyed by its span. This is
-    /// what the C emitter consults instead of re-deriving types (DESIGN §9):
-    /// it needs them for the handful of places where Oberon's types are not
-    /// C's — a record up-cast, a pointer up/down cast, a string into a `CHAR`
-    /// array, a guard, a type-`CASE` narrowing.
+    /// what the C emitter consults instead of re-deriving types (DESIGN section 9):
+    /// it needs them in several places where Oberon's types differ from
+    /// C, including a record up-cast, a pointer up/down cast, a string into a `CHAR`
+    /// array, a guard, and a type-`CASE` narrowing.
     pub types_at: HashMap<u64, TypeId>,
     /// `MIN(T)`/`MAX(T)` by the span of the call: their value is fixed by the
-    /// type, so the checker is where it is known and the emitter reads it here
-    /// (W8.2) — the same channel as `types_at`, for the same reason.
+    /// type, so the checker computes it and the emitter reads it here
+    /// (W8.2), using the same channel as `types_at`.
     extremes: HashMap<u64, i32>,
 }
 
@@ -225,7 +224,7 @@ impl<'a> Sema<'a> {
     }
 
     /// The same, but handing back the whole pass: the C emitter needs the type
-    /// side table as well (DESIGN §9).
+    /// side table as well (DESIGN section 9).
     pub fn check_owned(module: &mut Module, interfaces: &'a [Interface]) -> Sema<'a> {
         let mut names = Names::collect(module);
         let mut sema = Sema::new(interfaces);
@@ -233,9 +232,9 @@ impl<'a> Sema<'a> {
             sema.error(e.span, e.message);
         }
         // The report's outermost scope is the *universe* of predefined
-        // identifiers (§10.2), and a module declares its own scope inside it —
-        // which is what lets a module or procedure declare `ABS` and have it hide
-        // the predefined one (§4). Declaring both in one scope made that a
+        // identifiers (section 10.2), and a module declares its own scope inside it.
+        // This lets a module or procedure declare `ABS` and hide the predefined
+        // one (section 4). Declaring both in one scope made that a
         // duplicate-declaration error instead.
         sema.push_scope();
         sema.predefine();
@@ -253,7 +252,7 @@ impl<'a> Sema<'a> {
     }
 
     /// The interface index of a module, and its type environment, for the code
-    /// generator (DESIGN §9.8: an imported type keeps the defining module's
+    /// generator (DESIGN section 9.8: an imported type keeps the defining module's
     /// identity).
     pub fn interface_index(&self, module: &str) -> Option<usize> {
         self.interfaces.iter().position(|i| i.module == module)
@@ -273,7 +272,7 @@ impl<'a> Sema<'a> {
 
     /// The `Module.Name` a type came from, if it came from an interface. The
     /// interface writer needs this: a rendering may only name its own types
-    /// unqualified, everything else has to be qualified (DESIGN §7).
+    /// unqualified, everything else has to be qualified (DESIGN section 7).
     pub fn qualified_name(&self, t: TypeId) -> Option<String> {
         for (idx, env) in &self.envs {
             for (name, ty) in env {
@@ -285,20 +284,20 @@ impl<'a> Sema<'a> {
         None
     }
 
-    // -------------------------------------------------------------- plumbing
+    // Plumbing
 
     fn note_extreme(&mut self, span: Span, v: i32) {
         self.extremes.insert(key_of(span), v);
     }
 
     /// The value `MIN`/`MAX` gave at this span, if the call was one of them: a
-    /// user's own `MIN` records nothing, so shadowing needs no extra check.
+    /// user's own `MIN` records nothing, so shadowing is covered by the symbol lookup.
     pub fn extreme_at(&self, span: Span) -> Option<i32> {
         self.extremes.get(&key_of(span)).copied()
     }
 
     /// The type an argument *names*, when it is a type name rather than an
-    /// expression: `SIZE(T)`, `MIN(T)` (report §11.1, W8.2).
+    /// expression: `SIZE(T)`, `MIN(T)` (report section 11.1, W8.2).
     fn type_arg(&mut self, e: &Expr) -> Option<TypeId> {
         match &e.kind {
             ExprKind::Designator(d) if d.sels.is_empty() => {
@@ -309,7 +308,7 @@ impl<'a> Sema<'a> {
     }
 
     /// The extreme of an ordinal type (W8.2): `INTEGER`, and `BYTE`/`CHAR`,
-    /// whose range report §6.1 fixes at 0..255. A type without one has no
+    /// whose range report section 6.1 fixes at 0..255. A type without one has no
     /// extreme to name, which is an error rather than a zero.
     fn extreme_of(&self, name: &str, ty: TypeId) -> Option<i32> {
         let min = name == "MIN";
@@ -360,8 +359,8 @@ impl<'a> Sema<'a> {
         self.scopes.pop();
     }
 
-    /// ✔ row 2: report §4, "No identifier may denote more than one object within
-    /// a given scope."
+    /// Check row 2: report section 4 states, "No identifier may denote more than
+    /// one object within a scope."
     fn declare(&mut self, name: &str, sym: Sym, span: Span) {
         let duplicate = self
             .scopes
@@ -416,7 +415,7 @@ impl<'a> Sema<'a> {
         env.get(&q[1]).copied()
     }
 
-    /// ✔ row 1: report §4, every identifier must be declared or predefined.
+    /// Check row 1: report section 4 requires every identifier to be declared or predefined.
     fn lookup_qual(&mut self, q: &QIdent, span: Span) -> Option<Sym> {
         if q.len() == 1 {
             self.used.push(q[0].clone());
@@ -427,7 +426,7 @@ impl<'a> Sema<'a> {
             if let Some(Sym::Proc { id: Some(id), .. }) = found {
                 // A use of a procedure this unit declares: check 54's
                 // unused-procedure half reads this. Qualified names cannot
-                // reach a local procedure, so they need no case.
+                // reach a local procedure, so that path is irrelevant.
                 self.used_procs.push(id);
             }
             return match found {
@@ -449,10 +448,8 @@ impl<'a> Sema<'a> {
             };
         }
         self.used.push(q[0].clone());
-        // An entry of report §11.1's builtin SYSTEM. It has no interface to look
-        // the name up in, so the entry is handed to the checker as *the name it
-        // names* and dispatched there: `ADR`, `GET` and `PUT` take a variable
-        // and `SIZE` takes a type, so there is no signature to build.
+        // The checker dispatches report section 11.1's builtin SYSTEM entries by
+        // name: `ADR`, `GET`, and `PUT` take a variable, while `SIZE` takes a type.
         if matches!(self.lookup(&q[0]), Some(Sym::System)) {
             return Some(Sym::Sys(q[1].clone()));
         }
@@ -469,7 +466,7 @@ impl<'a> Sema<'a> {
             Some(Sym::Module(i)) => Some(i),
             _ => None,
         }) {
-            // ✔ row 3: a qualifier must be a module from the import list.
+            // Check row 3: a qualifier must be a module from the import list.
             Some(i) => i,
             None => {
                 match self.lookup(&q[0]) {
@@ -490,14 +487,20 @@ impl<'a> Sema<'a> {
             }
         };
         let module = self.interfaces[idx].module.clone();
-        // ✔ row 4: the object must be exported by that module.
+        // Check row 4: the object must be exported by that module.
         let found = self.interfaces[idx]
             .items
             .iter()
             .find(|i| item_name(i) == q[1])
             .cloned();
         match found {
-            Some(it) => self.imported_sym(idx, &it, span),
+            Some(it) => {
+                let symbol = self.imported_sym(idx, &it, span);
+                if let Some(Sym::Const(value, _)) = &symbol {
+                    self.const_uses.insert(span_key(span), value.clone());
+                }
+                symbol
+            }
             None => {
                 self.error(
                     span,
@@ -531,12 +534,12 @@ impl<'a> Sema<'a> {
         }
     }
 
-    // --------------------------------------------------------------- imports
+    // Imports
 
     fn imports(&mut self, m: &Module) {
         for imp in &m.imports {
-            // ✔ row 5: no self-import, no duplicate alias (row 2 covers the
-            // duplicate through `declare`).
+            // Check row 5: self-import and duplicate aliases are reported here.
+            // Row 2 handles duplicate aliases through `declare`.
             if imp.alias == m.name {
                 self.error(
                     imp.span,
@@ -544,12 +547,11 @@ impl<'a> Sema<'a> {
                 );
                 continue;
             }
-            // Report §11.1's module is *built in* (R5): the compiler supplies
-            // its entries, so no `SYSTEM.sym` and no `SYSTEM.mod` is read or
-            // compiled for it, and one on the search path is therefore shadowed
-            // — a user supply would be a different language, while a module that
-            // names SYSTEM in its import list must get the report's entries
-            // (DESIGN §9.10).
+            // Report section 11.1's module is built in (R5), so the compiler
+            // supplies its entries without reading `SYSTEM.sym` or `SYSTEM.mod`.
+            // A module of either name on the search path is shadowed. This keeps
+            // the language consistent: imports named SYSTEM always use the
+            // report's entries (DESIGN section 9.10).
             if imp.module == "SYSTEM" {
                 self.imports.push((imp.alias.clone(), imp.span));
                 self.declare(&imp.alias, Sym::System, imp.span);
@@ -598,11 +600,11 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// ✔ row 54 (the other half): a procedure this unit declares and never uses
-    /// is worth a warning, since the report has no way to mark one as
-    /// deliberately unused. A procedure that only calls *itself* counts as used,
-    /// which is a known imprecision: the report has no way to say "not
-    /// reachable", and reachability is not what this checks.
+    /// Check row 54's other half: an unused procedure declared in this unit
+    /// warrants a warning because the report does not let users mark one as
+    /// deliberately unused. A procedure that only calls itself counts as used.
+    /// This is imprecise because users cannot mark a procedure unreachable, and
+    /// reachability is not what this check measures.
     fn unused_procedures(&mut self) {
         let declared = self.declared_procs.clone();
         for (id, name, span, exported) in declared {
@@ -614,7 +616,7 @@ impl<'a> Sema<'a> {
     }
 
     fn unused_imports(&mut self, m: &Module) {
-        // ✔ row 54 (warning half): an import that is never qualified.
+        // Check row 54's warning half: an import that is never qualified.
         let imports = self.imports.clone();
         for (alias, span) in imports {
             let used = self.used.iter().any(|n| n == &alias);
@@ -651,7 +653,7 @@ impl<'a> Sema<'a> {
             },
             Item::Var { ty, .. } => Some(Sym::Var {
                 ty: self.type_from_rendered(ty, &env, idx, span),
-                // report §11: "Variables are always exported in read-only mode."
+                // Report section 11: "Variables are always exported in read-only mode."
                 read_only: Some("is an imported variable, which is read-only (report 11)"),
             }),
             Item::Proc { params, result, .. } => {
@@ -681,11 +683,11 @@ impl<'a> Sema<'a> {
     }
 
     /// The type environment of an imported module, built from its interface
-    /// (DESIGN §7). Rendered types are parsed with the very production the
-    /// module parser uses, and their names resolve inside the interface's own
-    /// module — so `Texts.Writer = RECORD buf: Buffer END` gives the importer
-    /// the real record, and a cycle between two interfaces terminates because
-    /// the record placeholders exist before any body is built.
+    /// (DESIGN section 7). Rendered types use the same production as the module
+    /// parser, and their names resolve inside the interface's own module. For
+    /// example, `Texts.Writer = RECORD buf: Buffer END` gives the importer the
+    /// real record. Placeholder records let cycles between interfaces end because
+    /// all placeholders exist before any body is built.
     fn interface_env(&mut self, idx: usize, span: Span) -> HashMap<String, TypeId> {
         if let Some(e) = self.envs.get(&idx) {
             return e.clone();
@@ -736,7 +738,7 @@ impl<'a> Sema<'a> {
 
     /// Build a type written in an interface file. `module` is the module the
     /// interface belongs to, for its own qualified references. A formal type is
-    /// `{ARRAY OF} qualident` (report §10.1), so the open-array prefix is peeled
+    /// `{ARRAY OF} qualident` (report section 10.1), so the open-array prefix is peeled
     /// off here rather than being part of the type grammar.
     fn type_from_rendered(
         &mut self,
@@ -794,9 +796,9 @@ impl<'a> Sema<'a> {
     /// with the interface it came from, so a field access through one can be
     /// checked against the field's public mark.
     fn mark_imported(&mut self, t: TypeId, module_idx: usize) {
-        // A recursive type (`POINTER TO Node` inside `Node`) would otherwise spin
-        // here until a depth guard cut the walk off, leaving the records it had
-        // not reached yet unmarked — a small legal type, not a deep input.
+        // A recursive type (`POINTER TO Node` inside `Node`) would keep this walk
+        // cycling without a guard. A depth guard could stop it while leaving some
+        // records unmarked, even for a small legal type.
         let mut seen: HashSet<TypeId> = HashSet::new();
         let mut stack = vec![t];
         while let Some(t) = stack.pop() {
@@ -820,11 +822,11 @@ impl<'a> Sema<'a> {
         }
     }
 
-    // ---------------------------------------------------------- declarations
+    // Declarations
 
     fn decls(&mut self, d: &ast::Decls, is_module: bool) {
         for c in &d.consts {
-            // ✔ row 48: export marks only at module scope.
+            // Check row 48: export marks are allowed only at module scope.
             self.check_export_mark(c.export, is_module, c.span);
             self.const_decl(c);
         }
@@ -846,7 +848,7 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// ✔ row 40: report §5, the value must be a constant expression.
+    /// Check row 40: report section 5 requires a constant expression.
     fn const_decl(&mut self, c: &ast::ConstDecl) {
         if self.lookup_here(&c.name).is_some() {
             return; // the duplicate was already reported
@@ -864,10 +866,9 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// Fold a constant expression (report §5). `const_eval` works on syntax
-    /// alone, so first replace what only the symbol table can resolve — a named
-    /// constant, and `LEN(v)` of a declared array (report §10.2 makes `LEN` of
-    /// an array a constant) — with literals, then fold.
+    /// `const_eval` works on syntax alone. First substitute names resolved by
+    /// the symbol table: constants and `LEN(v)` for declared arrays (report
+    /// section 10.2 treats `LEN` of an array as a constant), then fold.
     fn const_expr(&mut self, e: &Expr) -> Result<Const, String> {
         let mut e = e.clone();
         self.substitute(&mut e);
@@ -959,13 +960,12 @@ impl<'a> Sema<'a> {
 
     /// Types in declaration order.
     ///
-    /// The report allows exactly one forward reference inside a scope — a
-    /// pointer's base type (§6.4) — so a declaration whose body *is* a record
-    /// gets a placeholder that is later defined **in place**, which is what
-    /// makes `Tree = POINTER TO Node; Node = RECORD … END` give `Tree` a pointer
-    /// to the filled-in record rather than to an empty shell. Every other name
-    /// is declared only after its body is built, so referencing it earlier is
-    /// reported (with the forward-reference rule as the note).
+    /// The report allows one forward reference inside a scope: a pointer's
+    /// base type (section 6.4). A record declaration gets a placeholder that is
+    /// later defined **in place**, so `Tree = POINTER TO Node; Node = RECORD ... END`
+    /// gives `Tree` a pointer to the filled-in record rather than an empty shell.
+    /// Other names are declared only after their bodies are built, so earlier
+    /// references are reported with the forward-reference rule as a note.
     fn type_section(&mut self, decls: &[ast::TypeDecl], is_module: bool) {
         for t in decls {
             self.check_export_mark(t.export, is_module, span_of_type(&t.ty));
@@ -1002,9 +1002,9 @@ impl<'a> Sema<'a> {
                 let ph = ts.placeholders[name];
                 let (b, fs) = self.record_body(base, fields, *span, &mut ts);
                 self.types.define_record(ph, b, fs);
-                // New decision (DESIGN §13): report §6.3 permits a field to hide
-                // an inherited field of the same name, and it stays legal — but
-                // `x.f` then means the derived field silently, so say so.
+                // New decision (DESIGN section 13): report section 6.3 permits a
+                // field to hide an inherited field of the same name. It remains
+                // legal, but `x.f` then silently means the derived field.
                 if let Some(bt) = b {
                     let mut inherited: Vec<String> = Vec::new();
                     let mut walk = Some(bt);
@@ -1057,7 +1057,7 @@ impl<'a> Sema<'a> {
     }
 
     /// `in_pointer`: a name that is still a placeholder may be used as a
-    /// pointer's base type (report §6.4) and nowhere else.
+    /// pointer's base type (report section 6.4) and nowhere else.
     fn type_expr(&mut self, t: &TypeExpr, ts: &mut TypeScope, in_pointer: bool) -> TypeId {
         let built = self.type_expr_inner(t, ts, in_pointer);
         self.note_type(span_of_type(t), built);
@@ -1106,7 +1106,7 @@ impl<'a> Sema<'a> {
                 }
             }
             TypeExpr::Array { dims, elem, .. } => {
-                // report §6.2: `ARRAY N0, N1, ... OF T` is right-nested.
+                // Report section 6.2: `ARRAY N0, N1, ... OF T` is right-nested.
                 let mut ety = self.type_expr(elem, ts, false);
                 for dim in dims.iter().rev() {
                     let len = self.array_length(dim);
@@ -1120,7 +1120,7 @@ impl<'a> Sema<'a> {
             }
             TypeExpr::Pointer(inner, span) => {
                 let base = self.type_expr(inner, ts, true);
-                // ✔ row 44.
+                // Check row 44.
                 if !self.types.is_record(base) && !self.types.is_error(base) {
                     self.error(*span, "the base type of a pointer must be a record (report 6.4)");
                 }
@@ -1129,7 +1129,7 @@ impl<'a> Sema<'a> {
             TypeExpr::Proc(fp, span) => {
                 let (params, result) = self.formals(fp, *span);
                 if let Some(r) = result {
-                    // ✔ row 45.
+                    // Check row 45.
                     if self.is_structured(r) {
                         self.error(
                             *span,
@@ -1154,7 +1154,7 @@ impl<'a> Sema<'a> {
         let b = match base {
             Some(q) => {
                 let bt = self.type_expr(&TypeExpr::Named(q.clone(), span), ts, false);
-                // ✔ row 42.
+                // Check row 42.
                 if !self.types.is_record(bt) && !self.types.is_error(bt) {
                     self.error(span, "the base type of a record must be a record (report 6.3)");
                 }
@@ -1167,12 +1167,12 @@ impl<'a> Sema<'a> {
         for fl in fields {
             let fty = self.type_expr(&fl.ty, ts, false);
             for (name, mark) in &fl.names {
-                // A field's `*` marks it *public* (report §6.3: "field
+                // A field's `*` marks it *public* (report section 6.3: "field
                 // identifiers that are to be visible outside the declaring
                 // module must be marked"). The mark travels with the field, so a
-                // later access through a type from an interface can tell whether
-                // it may name the field (rows 4 and 14).
-                // ✔ row 43.
+                // later access through an interface type can check whether the
+                // field is visible (rows 4 and 14).
+                // Check row 43.
                 if seen.contains(name) {
                     self.error(fl.span, format!("field `{name}` is declared twice (report 6.3)"));
                     continue;
@@ -1188,8 +1188,8 @@ impl<'a> Sema<'a> {
         (b, fs)
     }
 
-    /// ✔ row 41: report §6.2, an array length is a constant expression, and a
-    /// length of zero or less has no elements to index.
+    /// Check row 41: report section 6.2 requires a constant expression for an
+    /// array length, and a length of zero or less has no elements to index.
     fn array_length(&mut self, e: &Expr) -> u32 {
         match self.const_expr(e) {
             Ok(Const::Int(n)) if n > 0 => n as u32,
@@ -1224,7 +1224,7 @@ impl<'a> Sema<'a> {
     }
 
     /// The formal parameters of a procedure heading or a procedure type.
-    /// Returns one entry per *name*, because report §10.1 lets one `FPSection`
+    /// Returns one entry per *name*, because report section 10.1 lets one `FPSection`
     /// declare several parameters sharing a type.
     fn formals(&mut self, fp: &FormalParams, span: Span) -> (Vec<Param>, Option<TypeId>) {
         let mut params = Vec::new();
@@ -1239,7 +1239,7 @@ impl<'a> Sema<'a> {
             }
             self.note_type(span_of_type(&TypeExpr::Named(section.ty.base.clone(), span)), base);
             for (name, mark) in &section.names {
-                // ✔ row 48, formal-parameter half.
+                // Check row 48, formal-parameter half.
                 if *mark {
                     self.error(
                         span,
@@ -1266,7 +1266,7 @@ impl<'a> Sema<'a> {
     fn proc_decl(&mut self, p: &ast::Proc, is_module: bool) {
         self.check_export_mark(p.export, is_module, p.span);
         // The name is declared before the body is checked, which is what makes
-        // recursion work (report §10).
+        // recursion work (report section 10).
         let (declared, result) = self.named_formals(&p.params, p.result.as_ref(), p.span);
         let pty = self.types.proc(
             declared.iter().map(|(_, pm)| *pm).collect(),
@@ -1293,7 +1293,7 @@ impl<'a> Sema<'a> {
                 result,
             },
         );
-        // ✔ row 47.
+        // Check row 47.
         if p.end_name != p.name {
             self.error(
                 p.span,
@@ -1315,9 +1315,9 @@ impl<'a> Sema<'a> {
             );
         }
         self.decls(&p.decls, false);
-        // ✔ row 46, as W8.4 relaxes it: a function must *contain* a RETURN clause
-        // rather than end with one, now that `RETURN` is a statement — while every
-        // return still funnels through one site in the emitter (§5 D6).
+        // Check row 46, as W8.4 relaxes it: a function must *contain* a RETURN clause
+        // rather than end with one, now that `RETURN` is a statement. Every return
+        // still funnels through one site in the emitter (section 5, D6).
         let (outer_result, outer_saw) = (self.cur_result, self.saw_return);
         self.cur_result = result;
         self.saw_return = false;
@@ -1339,7 +1339,7 @@ impl<'a> Sema<'a> {
     }
 
     /// Flatten `FPSection`s into one `(name, Param)` per parameter, so the
-    /// scope holds one symbol per name (report §10.1).
+    /// scope holds one symbol per name (report section 10.1).
     fn named_formals(
         &mut self,
         sections: &[ast::Param],
@@ -1371,7 +1371,7 @@ impl<'a> Sema<'a> {
         )
     }
 
-    // ---------------------------------------------------------- expressions
+    // Expressions
 
     fn expr(&mut self, e: &Expr) -> Typed {
         let v = self.expr_inner(e);
@@ -1403,7 +1403,7 @@ impl<'a> Sema<'a> {
             ExprKind::Designator(d) => self.designator(d),
             ExprKind::Unary(op, x) => {
                 let v = self.expr(x);
-                // ✔ rows 18-21: the operand rules live in `types.rs`.
+                // Checks 18-21: the operand rules live in `types.rs`.
                 if let Err(msg) = self.types.unary_ok(*op, v.ty) {
                     self.error(e.span, msg);
                 }
@@ -1419,7 +1419,7 @@ impl<'a> Sema<'a> {
                 if let Err(msg) = self.types.operator_ok(*op, a.ty, b.ty) {
                     self.error(e.span, msg);
                 }
-                // report §8.2: relations yield BOOLEAN, the rest keep the
+                // Report section 8.2: relations yield BOOLEAN; the rest keep the
                 // operands' type.
                 let ty = match op {
                     ast::BinOp::Or
@@ -1448,8 +1448,8 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// ✔ row 52: the elements of a set are the integers 0..31 in this
-    /// implementation (report §6.1 leaves the limit to the implementation).
+    /// Check row 52: set elements are integers 0..31 in this language
+    /// (report section 6.1 leaves the limit open).
     fn check_set_element(&mut self, e: &Expr) {
         if let Ok(Const::Int(n)) = self.const_expr(e) {
             if !(0..32).contains(&n) {
@@ -1462,23 +1462,23 @@ impl<'a> Sema<'a> {
     }
 
     fn expect_integer(&mut self, span: Span, ty: TypeId, what: &str) {
-        // ✔ rows 11 and 23.
+        // Checks 11 and 23.
         if !self.types.is_integer_like(ty) && !self.types.is_error(ty) {
             self.error(span, format!("{what} must be an INTEGER (report 8.1)"));
         }
     }
 
-    /// ✔ rows 15-17, 37 and 38: the applicability of `v IS T`, of a guard
-    /// `v(T)` and of a type `CASE` label, and the type the guard yields.
+    /// Checks 15-17, 37 and 38 cover `v IS T`, guards `v(T)`, type `CASE` labels,
+    /// and the type a guard yields.
     ///
     /// The report states the rule as "T is an extension of the declared type T0
-    /// of v" (report §8.1, §8.2.4) but its own examples spell T two ways for a
-    /// pointer v: §8.1 writes `t(CenterNode)` (a *record* name, CenterNode being
-    /// an extension of the pointer's base type Node) while §9.5 writes
-    /// `CASE p OF P0` (a *pointer* name extending p's pointer type). Both are
-    /// accepted here; the guard's type is the type named, which is what makes
-    /// §8.1's `t(CenterNode).subnode (Tree)` come out as Tree and my
-    /// `c := t(CenterNode)` for `c: CenterNode` type-check.
+    /// of v" (sections 8.1 and 8.2.4), but its examples spell T two ways for a
+    /// pointer v. Section 8.1 writes `t(CenterNode)` (a *record* name, with
+    /// CenterNode extending the pointer's base type Node), while section 9.5
+    /// writes `CASE p OF P0` (a *pointer* name extending p's pointer type). Both
+    /// are accepted here. The guard's type is the type named by the guard, so
+    /// `t(CenterNode).subnode (Tree)` has type Tree and
+    /// `c := t(CenterNode)` type-checks for `c: CenterNode`.
     fn guard_type(&mut self, span: Span, v: &Typed, named: TypeId, what: &str) -> Option<TypeId> {
         if self.types.is_error(v.ty) || self.types.is_error(named) {
             return Some(self.types.error());
@@ -1537,8 +1537,8 @@ impl<'a> Sema<'a> {
         };
         let mut name = d.base.join(".");
         let mut var_record_param = false;
-        // Carried through selection: assigning to a field or an element of a
-        // read-only object is assigning to that object (report §9.1).
+        // Carried through selection: assigning to a field or element of a
+        // read-only object assigns to that object (report section 9.1).
         let read_only: Option<&'static str> = match &cur {
             Sym::Var { read_only, .. } => *read_only,
             Sym::Param { ty, by_var } => {
@@ -1555,7 +1555,7 @@ impl<'a> Sema<'a> {
         for (i, sel) in d.sels.iter().enumerate() {
             match sel {
                 Selector::Call(args) => {
-                    // ✔ row 29: `f(x)(y)` - a call's result is not a designator.
+                    // Check row 29: `f(x)(y)` is invalid because a call's result is not a designator.
                     if i + 1 != d.sels.len() {
                         self.error(
                             d.span,
@@ -1577,10 +1577,10 @@ impl<'a> Sema<'a> {
                             Typed::value(result.unwrap_or_else(|| self.types.error()))
                         }
                         Sym::Predef(n) => self.predef_call(d.span, n, args),
-                        // Report §11.1: one production, dispatched by name.
+                        // Report section 11.1: one production, dispatched by name.
                         Sym::Sys(n) => self.sys_call(d.span, &n, args),
                         _ => {
-                            // ✔ row 28.
+                            // Check row 28.
                             let ty = self.error_ty(
                                 d.span,
                                 format!("`{name}` is not a procedure, so it cannot be called (report 9.2)"),
@@ -1593,7 +1593,7 @@ impl<'a> Sema<'a> {
                     let t = self.sym_type(&cur);
                     match self.types.elem(t) {
                         Some(elem) => {
-                            // ✔ row 10: one index per dimension (report §8.1).
+                            // Check row 10: one index per dimension (report section 8.1).
                             let dims = self.array_dims(t);
                             if ix.len() != dims {
                                 self.error(
@@ -1609,9 +1609,8 @@ impl<'a> Sema<'a> {
                             // mistake the compiler can name, and warning about it
                             // does not weaken the run-time check (which stays, and
                             // still carries the offset). The report leaves the
-                            // index' range to the implementation (§8.1 bounds
-                            // checking is optional), so this is a warning, not an
-                            // error (PLAN.md W7.2).
+                            // index range checking optional), so this is a warning rather than an error
+                            // (PLAN.md W7.2).
                             let lens = self.array_lengths(t);
                             for (k, e) in ix.iter().enumerate() {
                                 let v = self.expr(e);
@@ -1630,8 +1629,8 @@ impl<'a> Sema<'a> {
                                 }
                             }
                             var_record_param = false;
-                            // `A[E1, E2]` means `A[E1][E2]` (report §8.1), so
-                            // descend one level per index expression.
+                            // `A[E1, E2]` means `A[E1][E2]` (report section 8.1), so descend
+                            // one level per index expression.
                             let mut stepped = elem;
                             for _ in 1..ix.len() {
                                 stepped = self.types.elem(stepped).unwrap_or_else(|| self.types.error());
@@ -1653,7 +1652,7 @@ impl<'a> Sema<'a> {
                 }
                 Selector::Field(f) => {
                     let t = self.sym_type(&cur);
-                    // report §8.1: `.` on a pointer implies dereferencing.
+                    // Report section 8.1: `.` on a pointer implies dereferencing.
                     let rec = if self.types.is_pointer(t) {
                         self.types.deref(t).expect("checked")
                     } else {
@@ -1661,12 +1660,10 @@ impl<'a> Sema<'a> {
                     };
                     match self.types.field(rec, f) {
                         Some(ft) => {
-                            // ✔ rows 4 and 14 (the private-field halves). A field
-                            // declared without the report's `*` is private to its
-                            // module, so naming it through a type that came from
-                            // an interface is an error — unless the type came
-                            // from this module, which is the same check because
-                            // only imported types are recorded (§6.3).
+                            // Checks 4 and 14 cover private fields. A field declared
+                            // without the report's `*` is private to its module, so
+                            // naming it through an imported type is an error. Only
+                            // imported types are recorded (section 6.3).
                             let decl = self.types.field_decl(rec, f).map(|(d, _)| d);
                             if let Some(idx) = decl
                                 .and_then(|d| self.imported_types.get(&d).copied())
@@ -1694,7 +1691,7 @@ impl<'a> Sema<'a> {
                             name = format!("{name}.{f}");
                         }
                         None => {
-                            // ✔ rows 13 and 14.
+                            // Checks 13 and 14.
                             let ty = if self.types.is_record(rec) {
                                 self.error_ty(
                                     d.span,
@@ -1722,7 +1719,7 @@ impl<'a> Sema<'a> {
                             name = format!("{name}^");
                         }
                         None => {
-                            // ✔ row 12.
+                            // Check row 12.
                             let ty = self.error_ty(
                                 d.span,
                                 format!("`{name}` is not a pointer (report 8.1)"),
@@ -1773,18 +1770,17 @@ impl<'a> Sema<'a> {
             Sym::Var { read_only: ro, .. } => Typed {
                 lvalue: true,
                 // An imported variable is read-only for assignment but may be
-                // handed to a VAR parameter (report §11, and the report's own
+                // handed to a VAR parameter (report section 11, and the report's own
                 // `Texts.Append(Oberon.Log, W.buf)`).
                 var_ok: true,
                 read_only: *ro,
                 ..Typed::value(ty)
             },
             Sym::Param { ty, by_var } => {
-                // report §10.1: a value parameter of a basic type "represents a
-                // local variable"; a structured one is read-only. A VAR
-                // parameter is a variable, and a VAR *record* parameter is what
-                // makes a guard, an `IS` test or a type CASE applicable to it
-                // (report §8.1, §9.5).
+                // Report section 10.1: a value parameter of a basic type "represents a
+                // local variable." A structured value parameter is read-only.
+                // VAR parameters are variables. Record-typed VAR parameters also
+                // allow guards, `IS` tests, and type CASE (report sections 8.1 and 9.5).
                 let is_rec = self.types.is_record(*ty);
                 if *by_var || !self.is_structured(*ty) {
                     Typed {
@@ -1802,7 +1798,7 @@ impl<'a> Sema<'a> {
                     }
                 }
             }
-            // ✔ row 6: report §9.1, a constant is not assignable.
+            // Check row 6: report section 9.1 says a constant is not assignable.
             Sym::Const(..) => Typed {
                 lvalue: false,
                 read_only: Some("is a constant, which is read-only (report 9.1)"),
@@ -1819,17 +1815,16 @@ impl<'a> Sema<'a> {
                 }
             }
             Sym::Predef(n) => {
-                // ✔ row 51: report §6.5/§10.1 - a standard procedure cannot be
-                // used as a value.
+                // Check row 51: reports 6.5 and 10.1 say a standard procedure cannot
+                // be used as a value.
                 let ty = self.error_ty(
                     d.span,
                     format!("`{n}` is a predeclared procedure: it cannot be used as a value (report 10.1)"),
                 );
                 Typed::error(ty)
             }
-            // ✔ row 51 holds for report §11.1's entries too; an entry the report
-            // lists as implementation-specific is refused by name instead (row
-            // 53), which is the more useful of the two messages.
+            // Check row 51 also covers report section 11.1's entries. Entries the
+            // report leaves to compiler choice are refused by name instead
             Sym::Sys(n) => {
                 let ty = if SYSTEM_FUNCTIONS.contains(&n.as_str())
                     || SYSTEM_PROPER.contains(&n.as_str())
@@ -1926,7 +1921,7 @@ impl<'a> Sema<'a> {
         let [Expr { kind: ExprKind::Designator(inner), .. }] = args.as_slice() else {
             return None;
         };
-        // A bare designator: no selectors, one name.
+        // The argument has one designator name and no selectors.
         if !inner.sels.is_empty() || inner.base.len() != 1 {
             return None;
         }
@@ -1937,8 +1932,8 @@ impl<'a> Sema<'a> {
         self.types.array_len(arg_ty)
     }
 
-    /// True when no `( … )` selector in this expression could be a call the
-    /// folder would misread as a predefined one.
+    /// True when this expression contains no `(...)` selector that could be a
+    /// call the folder would mistake for a predefined one.
     fn call_free(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Designator(d) => {
@@ -1982,7 +1977,7 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// ✔ rows 25, 26, 27.
+    /// Checks 25, 26, and 27.
     fn check_actuals(&mut self, span: Span, formals: &[Param], args: &[Expr]) {
         if formals.len() != args.len() {
             self.error(
@@ -2000,11 +1995,11 @@ impl<'a> Sema<'a> {
         }
         for (f, a) in formals.iter().zip(args) {
             let v = self.expr(a);
-            // ✔ row 50, the locality half: report §6.5/§10.1 — a formal of
-            // procedure type takes "a procedure declared globally, or a variable
-            // (or parameter) of that procedure type", never one declared inside
-            // another procedure. The formal's type is checked first so that a
-            // plain type mismatch is not reported twice.
+            // Check row 50's locality rule (reports 6.5 and 10.1). A procedure
+            // parameter accepts a global procedure or a variable (or parameter)
+            // of that type. A procedure declared inside another procedure does
+            // not qualify. Check the formal type first to avoid repeating a plain
+            // type mismatch.
             if let Some("local procedure") = v.proc {
                 if matches!(self.types.get(f.ty), Type::Proc { .. }) {
                     self.error(
@@ -2055,8 +2050,8 @@ impl<'a> Sema<'a> {
         if q.len() != 2 {
             return None;
         }
-        // Report §11.1's entries have no interface and no signature: the entry's
-        // name says whether a call to it yields a value (row 31).
+        // Report section 11.1's entries have no interface or signature. Their
+        // names determine whether a call yields a value (row 31).
         if matches!(self.lookup(&q[0]), Some(Sym::System)) {
             return Some(SYSTEM_FUNCTIONS.contains(&q[1].as_str()));
         }
@@ -2074,10 +2069,10 @@ impl<'a> Sema<'a> {
             })
     }
 
-    /// A mutating predefined procedure must be handed a writable variable: the
-    /// same rules as an assignment target apply (report §9.1, §9.8, §10.1).
-    /// `SYSTEM.GET` writes its second argument, so it is one of them, and it has
-    /// already typed that argument (row 58) — hence the split.
+    /// A mutating predefined procedure must be passed a writable variable.
+    /// Assignment-target rules apply (reports 9.1, 9.8, and 10.1).
+    /// `SYSTEM.GET` writes its second argument, which has already been typed
+    /// (row 58), so the checks split across these methods.
     fn note_mutation(&mut self, a: &Expr) {
         let v = self.expr(a);
         self.note_mutation_of(a, &v);
@@ -2106,7 +2101,7 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// A predeclared procedure of report §10.2, used as a call.
+    /// A predeclared procedure of report section 10.2, used as a call.
     /// `MIN(T)`/`MAX(T)` (W8.2). The argument is a type name, so this is the
     /// shape of a SYSTEM entry rather than of a predefined function; the value
     /// is a constant of type `INTEGER`.
@@ -2151,10 +2146,10 @@ impl<'a> Sema<'a> {
             tys.push(v.ty);
             typed.push(v);
         }
-        // report §9.1 and §9.8: whatever a *mutating* predefined procedure
-        // writes must be a writable variable - not a constant, not a read-only
-        // (imported or structured value) object, and not a FOR control variable.
-        // A function's arguments are values and need no such check.
+        // A mutating predefined procedure writes to a writable variable
+        // (reports 9.1 and 9.8). Constants, read-only objects (imported or
+        // structured values), and FOR control variables are not writable targets.
+        // A function's arguments are values, so this check does not apply.
         if matches!(name, "INC" | "DEC" | "INCL" | "EXCL" | "NEW" | "PACK" | "UNPK") {
             if let Some(first) = args.first() {
                 self.note_mutation(first);
@@ -2166,7 +2161,7 @@ impl<'a> Sema<'a> {
                 Err(msg) => Typed::error(self.error_ty(span, msg)),
             };
         }
-        // The proper procedures (report §10.2).
+        // The proper procedures (report section 10.2).
         match name {
             "INC" | "DEC" => {
                 if !matches!(args.len(), 1 | 2) {
@@ -2201,7 +2196,7 @@ impl<'a> Sema<'a> {
                     self.error(span, "PACK takes 2 arguments (report 10.2)");
                 } else {
                     // `PACK(x, n)` scales x by 2^n: x is written, n is not
-                    // (report §10.2), so only x has to be a variable here.
+                    // (report section 10.2), so only x must be a variable here.
                     if !matches!(self.types.get(tys[0]), Type::Basic(Basic::Real)) {
                         self.error(args[0].span, "argument 1 of PACK must be a REAL variable (report 10.2)");
                     }
@@ -2234,12 +2229,11 @@ impl<'a> Sema<'a> {
         Typed::value(self.types.error())
     }
 
-    // ------------------------------------------------- report §11.1: SYSTEM
+    // SYSTEM built-ins
 
-    /// An entry the report lists as implementation-specific — or one no compiler
-    /// knows. It is refused *by name*, because the program said which one it
-    /// wanted (row 53; `SYSTEM.ADC is not implemented` rather than a silent
-    /// no-op or a plausible invention).
+    /// Report-listed entries with compiler-specific support or no support are
+    /// refused by name (row 53). This reports `SYSTEM.ADC is not implemented`
+    /// instead of silently doing nothing or inventing behavior.
     fn sys_unimplemented(&mut self, span: Span, name: &str) -> TypeId {
         self.error_ty(
             span,
@@ -2247,10 +2241,10 @@ impl<'a> Sema<'a> {
         )
     }
 
-    /// An entry of report §11.1's `SYSTEM` written as a statement without its
-    /// argument list: a function's value must be used (row 31), a proper
-    /// procedure needs its actuals (row 30), and an entry the report lists as
-    /// implementation-specific is refused by name (row 53).
+    /// A report section 11.1 SYSTEM entry used as a statement without arguments.
+    /// Function entries require their value to be used (row 31). Proper
+    /// procedures require actuals (row 30). Unsupported entries are refused by
+    /// name (row 53).
     fn sys_bare(&mut self, span: Span, name: &str) {
         if SYSTEM_FUNCTIONS.contains(&name) {
             self.error(
@@ -2267,9 +2261,9 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// Report §11.1's `a` and `n` are INTEGER expressions: DESIGN §9.10's address
-    /// model puts a byte address in an INTEGER, and the word count of `COPY` is
-    /// one too.
+    /// Report section 11.1 defines `a` and `n` as INTEGER expressions. The
+    /// address model in DESIGN section 9.10 stores byte addresses in an INTEGER,
+    /// and the word count of `COPY` is one too.
     fn sys_integer(&mut self, a: &Expr, entry: &str, which: usize) {
         let v = self.expr(a);
         if !self.types.is_integer_like(v.ty) && !self.types.is_error(v.ty) {
@@ -2280,8 +2274,8 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// Report §11.1's `v: any basic type`: a record, an array or a pointer is
-    /// not one (row 57).
+    /// Report section 11.1's `v: any basic type` excludes records, arrays, and pointers
+    /// (row 57).
     fn sys_basic(&mut self, a: &Expr, entry: &str, which: usize) -> Typed {
         let v = self.expr(a);
         if !self.types.is_basic(v.ty) && !self.types.is_error(v.ty) {
@@ -2297,15 +2291,15 @@ impl<'a> Sema<'a> {
         v
     }
 
-    /// A call to report §11.1's `SYSTEM`, decided by the *name* of the entry: the
-    /// entries are not ordinary procedures (`ADR`, `GET` and `PUT` take a
-    /// variable and `SIZE` takes a type), so there is no formal parameter list to
-    /// check an actual against — which is exactly why the call production reaches
-    /// here and the name decides (§5 D2's shape).
+    /// The name of a report section 11.1 SYSTEM entry determines its behavior.
+    /// These entries are not ordinary procedures: `ADR`, `GET`, and `PUT` take a
+    /// variable, while `SIZE` takes a type. They have no formal parameter list,
+    /// so the call production sends them here and the name determines the check
+    /// (section 5, D2).
     ///
-    /// Every rule below says what an entry *takes*; none of them is a run-time
-    /// check, and none of them consults `-Ochecks` — SYSTEM is the escape hatch
-    /// (row 60, DESIGN §9.10).
+    /// Each rule describes an entry's argument requirements, and none runs at
+    /// runtime or consults `-Ochecks`. SYSTEM is the escape hatch (row 60, DESIGN
+    /// section 9.10).
     fn sys_call(&mut self, span: Span, name: &str, args: &[Expr]) -> Typed {
         let arity = match name {
             "ADR" | "SIZE" => 1,
@@ -2314,7 +2308,7 @@ impl<'a> Sema<'a> {
             _ => return Typed::error(self.sys_unimplemented(span, name)),
         };
         if args.len() != arity {
-            // ✔ row 59: there is no formal parameter list to report row 25.
+            // Check row 59: no formal parameter list exists for report row 25.
             self.error(
                 span,
                 format!(
@@ -2327,11 +2321,10 @@ impl<'a> Sema<'a> {
         match name {
             "ADR" => {
                 let v = self.expr(&args[0]);
-                // ✔ row 56: "x, a, and n stand for ... expressions" but `v` is a
-                // variable, and its *address* has to exist. A constant, a
-                // structured value parameter (which the report makes read-only
-                // *because* there is no variable behind it, report §10.1) and a
-                // procedure have none.
+                // Check row 56: the report says "x, a, and n stand for ... expressions,"
+                // but `v` must be a variable with an address. Constants, structured
+                // value parameters (read-only under report section 10.1), and
+                // procedures have no address.
                 if !(v.lvalue || v.var_ok) {
                     self.error(
                         args[0].span,
@@ -2342,11 +2335,10 @@ impl<'a> Sema<'a> {
                 Typed::value(self.types.integer())
             }
             "SIZE" => {
-                // ✔ row 55: report §11.1 writes `SIZE(T)`, and the table's
-                // "Argument types: any type" says the argument is a *type name*
-                // and not an expression. The lookup is the silent one: `expr` on
-                // a type name would add "is a type, not a value" to a diagnostic
-                // that already names the mistake.
+                // Check row 55: report section 11.1 writes `SIZE(T)`, and the table's
+                // "Argument types: any type" means the argument is a *type name*.
+                // Looking it up silently avoids adding a second diagnostic. Calling
+                // `expr` on a type name would repeat the message identifying the error.
                 let ty = match &args[0].kind {
                     ExprKind::Designator(d) if d.sels.is_empty() => {
                         if d.base.len() == 2 {
@@ -2382,19 +2374,17 @@ impl<'a> Sema<'a> {
             }
             "GET" => {
                 self.sys_integer(&args[0], "GET", 1);
-                // `GET(a, v)` writes `v`, so the rule for a mutating predefined
-                // procedure applies verbatim: it must be a writable variable
-                // (row 58, with row 6's reasons - a constant, an imported
-                // variable, a structured value parameter, a `FOR` control
-                // variable).
+                // `GET(a, v)` writes `v`, so its target must be a writable variable
+                // (row 58). Row 6 also rules out constants, imported variables,
+                // structured value parameters, and FOR control variables.
                 let v = self.sys_basic(&args[1], "GET", 2);
                 self.note_mutation_of(&args[1], &v);
                 Typed::value(self.types.error())
             }
             "PUT" => {
                 self.sys_integer(&args[0], "PUT", 1);
-                // ✔ row 57: "x: any basic type" - and a *value*, since PUT writes
-                // the memory the address points at, not x.
+                // Check row 57. PUT's second argument has any basic type, and is a
+                // value because PUT changes memory at the address, not the value.
                 self.sys_basic(&args[1], "PUT", 2);
                 Typed::value(self.types.error())
             }
@@ -2408,7 +2398,7 @@ impl<'a> Sema<'a> {
         }
     }
 
-    // ----------------------------------------------------------- statements
+    // Statements
 
     fn stmt(&mut self, s: &Stmt) {
         match &s.kind {
@@ -2416,11 +2406,11 @@ impl<'a> Sema<'a> {
                 let t = self.designator(target);
                 let v = self.expr(value);
                 if let Some(reason) = t.read_only {
-                    // ✔ row 6.
+                    // Check row 6.
                     self.error(s.span, format!("cannot assign to this: it {reason}"));
                 }
                 if let Some(name) = &t.name {
-                    // ✔ row 32: the FOR control variable is frozen in the body.
+                    // Check row 32: the FOR control variable cannot change in the body.
                     if self.locked.iter().any(|n| n == name) {
                         self.error(
                             s.span,
@@ -2434,7 +2424,7 @@ impl<'a> Sema<'a> {
                         "the left-hand side of an assignment must be a variable (report 9.1)",
                     );
                 }
-                // ✔ rows 7, 8, 9, 10: one predicate for all four exceptions.
+                // Checks 7, 8, 9, and 10 use one predicate.
                 if !self.types.is_assignable(t.ty, v.ty) {
                     let note = if self.types.is_numeric(t.ty) && self.types.is_numeric(v.ty) {
                         // The one conversion Oberon refuses to do silently.
@@ -2457,8 +2447,8 @@ impl<'a> Sema<'a> {
                         self.error_note(s.span, msg, note);
                     }
                 }
-                // ✔ rows 50, 51: report §6.5 - a local or predeclared procedure
-                // cannot be the value assigned to a procedure variable.
+                // Checks 50 and 51: reports 6.5 and 10.1 forbid assigning a local
+                // or predeclared procedure to a procedure variable.
                 if let Some(kind) = v.proc {
                     if kind == "local procedure" {
                         self.error(
@@ -2472,12 +2462,12 @@ impl<'a> Sema<'a> {
             StmtKind::Call(d) => {
                 let ends_in_call = matches!(d.sels.last(), Some(Selector::Call(_)));
                 if !ends_in_call {
-                    // A bare designator: the call of a parameterless procedure.
+                    // Without selectors, a designator calls a parameterless procedure.
                     match self.lookup_qual(&d.base, d.span) {
                         Some(Sym::Proc { ty, .. }) => {
                             let (params, _) = self.signature(ty);
                             if !params.is_empty() {
-                                // ✔ row 30 (and row 49).
+                                // Check rows 30 and 49.
                                 self.error(
                                     d.span,
                                     format!(
@@ -2502,17 +2492,16 @@ impl<'a> Sema<'a> {
                         // as a statement are caught below by the function check.
                         Some(Sym::Predef(n)) => {
                             if PREDEFINED_FUNCTIONS.contains(&n) || PREDEFINED_TYPED.contains(&n) {
-                                // ✔ row 31: a function's value must be used.
+                                // Check row 31: a function's value must be used.
                                 self.error(
                                     d.span,
                                     format!("`{n}` is a function procedure: its value must be used (report 9)"),
                                 );
                             }
                         }
-                        // ✔ rows 31 and 30 for report §11.1's entries: a
-                        // function's value must be used, a proper procedure needs
-                        // its argument list, and an entry the report lists as
-                        // implementation-specific is refused by name (row 53).
+                        // For report section 11.1, row 31 applies to function values
+                        // and row 30 to proper-procedure actuals. Row 53 refuses
+                        // unsupported entries by name.
                         Some(Sym::Sys(n)) => self.sys_bare(d.span, &n),
                         Some(_) => {
                             let name = d.base.join(".");
@@ -2522,10 +2511,9 @@ impl<'a> Sema<'a> {
                     }
                     return;
                 }
-                // ✔ row 31: calling a function for its value in statement
-                // position leaves the value unused. The question is answered by
-                // a *silent* lookup: `designator` is the one place that reports
-                // a bad callee, so it must not report it twice.
+                // Check row 31: a function called as a statement leaves its value
+                // unused. A silent lookup answers the question because `designator`
+                // is the only place that reports a bad callee.
                 let is_function = self.callee_is_function(&d.base).unwrap_or(false);
                 let t = self.designator(d);
                 let _ = t;
@@ -2540,7 +2528,7 @@ impl<'a> Sema<'a> {
             StmtKind::If { arms, els } => {
                 for (c, b) in arms {
                     let v = self.expr(c);
-                    // ✔ row 24.
+                    // Check row 24.
                     if !self.types.is_bool(v.ty) && !self.types.is_error(v.ty) {
                         self.error(c.span, "the guard of an IF must be a BOOLEAN (report 9.4)");
                     }
@@ -2578,7 +2566,7 @@ impl<'a> Sema<'a> {
                     self.error(until.span, "the UNTIL condition must be a BOOLEAN (report 9.7)");
                 }
             }
-            // ✔ W8.5: `EXIT` leaves the innermost loop, so it needs one.
+            // Check W8.5: `EXIT` leaves the innermost loop and needs an enclosing loop.
             StmtKind::Exit => {
                 if self.loop_depth == 0 {
                     self.error(s.span, "EXIT is only allowed inside a loop (W8.5)");
@@ -2618,8 +2606,8 @@ impl<'a> Sema<'a> {
                 let t = self.expr(to);
                 self.expect_integer(from.span, f.ty, "the initial value of a FOR");
                 self.expect_integer(to.span, t.ty, "the limit of a FOR");
-                // ✔ row 32: report §9.8 - the control variable is an INTEGER
-                // variable of the *current* scope.
+                // Check row 32: report section 9.8 requires the control variable to
+                // be an INTEGER variable in the *current* scope.
                 match self.lookup(var) {
                     Some(Sym::Var { ty, read_only: None }) if self.types.is_integer_like(ty) => {}
                     Some(Sym::Var { ty, .. }) if self.types.is_integer_like(ty) => self.error(
@@ -2639,7 +2627,7 @@ impl<'a> Sema<'a> {
                         format!("`{var}` is not declared, so it cannot be the control variable of a FOR (report 9.8)"),
                     ),
                 }
-                // ✔ row 34.
+                // Check row 34.
                 if let Some(b) = by {
                     match self.const_expr(b) {
                         Ok(Const::Int(0)) => self.error(
@@ -2666,9 +2654,9 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// ✔ rows 35, 36, 37, 38, 39: report §9.5.
-    /// Robustly record a CASE label interval, reporting an empty range or an
-    /// overlap with an earlier label (report §9.5: the labels must be distinct).
+    /// Checks 35-39 cover report section 9.5.
+    /// Record a CASE label interval, reporting an empty range or overlap with an
+    /// earlier label (report section 9.5 requires distinct labels).
     fn note_label(&mut self, span: Span, lo: i32, hi: i32, seen: &mut Vec<(i32, i32)>) {
         if hi < lo {
             self.error(span, format!("the CASE range {lo}..{hi} has no elements (report 9.5)"));
@@ -2688,30 +2676,27 @@ impl<'a> Sema<'a> {
         let sub = self.expr(subject);
         let is_type_case = self.types.is_pointer(sub.ty) || self.types.is_record(sub.ty);
         if is_type_case && !self.types.is_pointer(sub.ty) && !sub.var_record_param {
-            // ✔ row 38.
+            // Check row 38.
             self.error(
                 subject.span,
                 "a type CASE needs a pointer or a VAR record parameter (report 9.5)",
             );
         }
-        // A label must extend the case variable's type; for a pointer variable
-        // the report's own §9.5 example writes the label as a pointer type, and
-        // the §8.1 spelling (a record extending the pointer's base) is accepted
-        // too - see `guard_type`.
+        // The report's section 9.5 example uses a pointer type as the label.
+        // Section 8.1 also allows a record extending the pointer's base.
+        // See the `guard_type` check.
         let pointer_base = if self.types.is_pointer(sub.ty) {
             self.types.deref(sub.ty)
         } else {
             None
         };
-        // Ordinal labels are checked as *intervals*: a range covers its
-        // interior, so `1..3` and `2` overlap even though their endpoints
-        // differ, and a descending range has no elements at all.
+        // Check ordinal labels as *intervals*. Their interior counts, so `1..3`
+        // overlaps `2`. Descending ranges have no elements.
         let mut seen_ord: Vec<(i32, i32)> = Vec::new();
         let mut seen_type: Vec<TypeId> = Vec::new();
         let mut has_default = false;
-        // report §9.5: "in the statements S_i labelled by T_i, the case variable
-        // is considered as of type T_i". The name is rebound per arm, exactly as
-        // the emitter rebinds it.
+        // Report section 9.5 says the statements labelled by T_i treat the case
+        // variable as type T_i. Rebind the name per arm, as the emitter does.
         let case_name = match &subject.kind {
             ExprKind::Designator(d) if d.base.len() == 1 && d.sels.is_empty() => Some(d.base[0].clone()),
             _ => None,
@@ -2744,10 +2729,10 @@ impl<'a> Sema<'a> {
             }
             match &arm.labels {
                 None => {
-                    // Two defaults — `CASE x OF 1: … ELSE … | END`, or `ELSE` with
-                    // a label-less `|` arm — are two answers to one question
-                    // (W8.1; the report's grammar allows only one, and `ELSE` is
-                    // the spelling this dialect adds).
+                    // Two defaults, such as `CASE x OF 1: ... ELSE ... | END` or
+                    // `ELSE` with a label-less `|` arm, give two answers to one
+                    // question (W8.1). The report grammar allows one; this dialect
+                    // adds `ELSE`.
                     if has_default {
                         self.error(arm.span, "CASE has two default arms (report 9.5)");
                     }
@@ -2755,8 +2740,8 @@ impl<'a> Sema<'a> {
                 }
                 Some(labels) => {
                     for l in labels {
-                        // One label per entry: a range is `l.lo .. l.hi`, and the
-                        // upper end is *part of the interval*, not a second label.
+                        // A label entry can specify `l.lo .. l.hi`, whose upper end
+                        // belongs to the interval rather than starting a second label.
                         for lab in std::iter::once(&l.lo) {
                             match lab {
                                 ast::CaseLabel::Int(v) => {
@@ -2771,13 +2756,13 @@ impl<'a> Sema<'a> {
                                         continue;
                                     }
                                     if !self.types.is_integer_like(sub.ty) {
-                                        // ✔ row 35.
+                                        // Check row 35.
                                         self.error(
                                             arm.span,
                                             "an integer label needs an INTEGER case variable (report 9.5)",
                                         );
                                     }
-                                    // ✔ row 36, including the range interior.
+                                    // Check row 36, including the range interior.
                                     let hi = l.hi.as_ref().map(|h| self.case_label_ord(h));
                                     self.note_label(arm.span, *v as i32, hi.unwrap_or(*v as i32), &mut seen_ord);
                                 }
@@ -2801,7 +2786,7 @@ impl<'a> Sema<'a> {
                                         let n = text.as_bytes()[0] as i32;
                                         self.note_label(arm.span, n, n, &mut seen_ord);
                                     } else {
-                                        // ✔ row 35.
+                                        // Check row 35.
                                         self.error(
                                             arm.span,
                                             "a string label must be a single character for a CHAR case variable (report 9.5)",
@@ -2819,7 +2804,7 @@ impl<'a> Sema<'a> {
                                         continue;
                                     }
                                     if !is_type_case {
-                                        // ✔ row 35.
+                                        // Check row 35.
                                         self.error(
                                             arm.span,
                                             format!(
@@ -2831,7 +2816,7 @@ impl<'a> Sema<'a> {
                                     }
                                     match self.lookup_qual(q, arm.span) {
                                         Some(Sym::Type(t)) => {
-                                            // ✔ row 37.
+                                            // Check row 37.
                                             let ok = self.types.extends(t, sub.ty)
                                                 || pointer_base
                                                     .map(|b| self.types.extends(t, b))
@@ -2865,16 +2850,14 @@ impl<'a> Sema<'a> {
             for s in &arm.body {
                 self.stmt(s);
             }
-            // The arm's scope holds the narrowed case variable and *only* the
-            // arm: leaving it open would leak the narrowing into everything
-            // that follows.
+            // The arm's scope holds the narrowed case variable and only the arm.
+            // Closing it prevents the narrower type from leaking into later code.
             self.pop_scope();
         }
-        // ✔ row 39: without a default arm, a value matching no label traps, and the
-        // reader is told before it happens — for a *scalar* CASE as much as for a
-        // type one, which is the asymmetry W2.5 removed. The report leaves the case
-        // undefined (§9.5 defines which arm runs and says nothing about a value that
-        // matches no label), and this design's answer to undefined is a located trap.
+        // Check row 39: without a default arm, a value matching no label traps.
+        // This also applies to scalar CASE, the asymmetry W2.5 removed. The report
+        // leaves unmatched values undefined (section 9.5 specifies labels but says
+        // nothing about unmatched values). This design uses a located trap.
         if !has_default {
             self.warn(
                 s.span,
@@ -2913,11 +2896,10 @@ impl<'a> Sema<'a> {
     }
 }
 
-/// The type names of the section being resolved: `placeholders` are the
-/// record-bodied declarations whose identity is known before their fields
-/// (report §6.4's forward reference), `names` is every name the section
-/// declares, so a reference to a *later* non-record can be told apart from a
-/// reference to something that does not exist at all.
+/// The type names of the section being resolved. `placeholders` stores record
+/// declarations whose identities the checker knows before their fields (report
+/// section 6.4's forward reference). `names` stores all declared names, letting
+/// the checker distinguish later non-records from unknown names.
 #[derive(Default)]
 struct TypeScope {
     placeholders: HashMap<String, TypeId>,
@@ -2928,22 +2910,22 @@ struct TypeScope {
     result: HashMap<String, TypeId>,
 }
 
-/// Report §10.2, the function procedures and type conversions.
+/// Report section 10.2: function procedures and type conversions.
 const PREDEFINED_FUNCTIONS: &[&str] = &[
     "ABS", "ODD", "LEN", "LSL", "ASR", "ROR", "FLOOR", "FLT", "ORD", "CHR",
 ];
 /// `MIN(T)`/`MAX(T)` (W8.2): function procedures whose argument is a *type*, so
 /// they have no signature to build and are dispatched by name like a SYSTEM entry.
 const PREDEFINED_TYPED: &[&str] = &["MIN", "MAX"];
-/// Report §10.2, the proper procedures.
+/// Report section 10.2: proper procedures.
 const PREDEFINED_PROPER: &[&str] = &[
     "INC", "DEC", "INCL", "EXCL", "NEW", "ASSERT", "PACK", "UNPK",
 ];
 
-/// Report §11.1's function procedures. A call to one is a value, so using it as
-/// a statement is row 31's defect, and its result is what the emitter lowers.
+/// A call to a SYSTEM function returns a value. Calling it as a statement is
+/// row 31's defect. The emitter lowers the result.
 const SYSTEM_FUNCTIONS: &[&str] = &["ADR", "SIZE", "BIT"];
-/// Report §11.1's proper procedures, the ones that write memory.
+/// Report section 11.1: proper procedures that write memory.
 const SYSTEM_PROPER: &[&str] = &["GET", "PUT", "COPY"];
 
 /// The span a type is filed under. Spans are unique per node in practice; two
@@ -2988,7 +2970,7 @@ fn parse_const_text(text: &str) -> Option<Const> {
         return Some(Const::Int(if neg { v.wrapping_neg() } else { v }));
     }
     if let Some(hex) = t.strip_suffix('X') {
-        // A character constant, as `oberon` writes one (report §3).
+        // A character constant, as `oberon` writes one (report section 3).
         let v = u32::from_str_radix(hex, 16).ok()?;
         return Some(Const::Char((v & 0xFF) as u8));
     }

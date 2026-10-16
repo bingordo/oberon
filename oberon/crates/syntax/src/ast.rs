@@ -1,12 +1,12 @@
 //! Oberon-07 abstract syntax tree.
 //!
 //! Shape rationale: the tree is organised *per procedure*. A `Module` owns a
-//! `Decls`; `Decls::procs` holds fully-formed `Proc` nodes, and every `Proc`
-//! again owns its own `Decls` plus its body. Nested procedures therefore form
-//! a tree with no side tables, and every later phase (scope/type check,
-//! codegen) can be written as a fold over one `Proc` at a time.
+//! `Decls`; `Decls::procs` holds fully formed `Proc` nodes, and every `Proc`
+//! has its own `Decls` plus its body. Nested procedures form a tree with no
+//! side tables. Later phases (scope/type check, codegen) can fold over one
+//! `Proc` at a time.
 //!
-//! Syntax only: nothing here is resolved. In particular a `Selector::Args`
+//! Syntax only: nothing here is resolved. A `Selector::Args`
 //! is a parenthesised group parsed after a designator which is *either* a
 //! type guard `v(T0)` or the actual parameter list of a call (see
 //! `Selector::Args` doc). Resolution happens in the semantic phase.
@@ -128,7 +128,7 @@ pub struct Proc {
     pub decls: Decls,
     pub body: Vec<Stmt>,
     /// Oberon-07 allows exactly one `RETURN expr`, at the end of the body.
-    /// The identifier repeated after `END`; must equal `name`.
+    /// The identifier repeated after `END`. It must equal `name`.
     pub end_name: Ident,
     /// The span of the *name* (and its export mark), which is what a diagnostic
     /// about the declaration should point at: `span` covers the whole body.
@@ -147,7 +147,7 @@ pub struct Param {
     pub ty: FormalType,
 }
 
-/// `{ARRAY OF} qualident`; `open` counts the leading `ARRAY OF`s.
+/// `{ARRAY OF} qualident`. The `open` field counts leading `ARRAY OF`s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormalType {
     pub open: usize,
@@ -234,8 +234,8 @@ pub enum Selector {
     Deref,
     /// `( ... )` after a designator. The report makes this a *type guard*
     /// `v(T0)`, while a call's actual parameters have the same shape. Parsing
-    /// both as one production keeps the grammar LR(1)-clean; `resolve.rs`
-    /// rewrites it into `Guard` or `Call` (see DESIGN.md §5 D2).
+    /// both as one production keeps the grammar LR(1)-clean. `resolve.rs`
+    /// rewrites it into `Guard` or `Call` (see DESIGN.md 5 D2).
     Args(Option<Vec<Expr>>),
     /// Produced by resolution only: actual parameters of a call.
     Call(Vec<Expr>),

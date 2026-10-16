@@ -3,7 +3,7 @@
 //! The grammar (see `oberon.lalrpop`) deliberately parses two constructs that
 //! the Oberon-07 report describes differently but which have the same concrete
 //! shape; this pass decides between them from the symbol table, before the type
-//! checker ever runs (DESIGN.md §5, decisions D2 and D3):
+//! checker ever runs (DESIGN.md 5, decisions D2 and D3):
 //!
 //! 1. `Selector::Args` is either a call's actual parameter list or a type guard.
 //! 2. A designator's leading `.field` is either a record field select or a
@@ -13,25 +13,25 @@
 //!
 //! * A paren group is a guard iff (a) it is followed by at least one more
 //!   selector, or (b) it holds exactly one bare designator that denotes a type.
-//!   Types and variables share one namespace in Oberon (report §4), so an
-//!   identifier that denotes a type can never be the value argument of a call —
-//!   with one exception, `SYSTEM.SIZE(T)`, whose single argument *is* a type
-//!   name by definition (report §11.1), so rule (b) is suppressed for that call.
+//!   Types and variables share one namespace in Oberon (report 4), so an
+//!   identifier that denotes a type cannot be a call's value argument, except
+//!   for `SYSTEM.SIZE(T)`, whose single argument is a type by definition
+//!   (report 11.1). Rule (b) is suppressed for that call.
 //! * The leading selector is a module qualifier iff the base identifier is a
 //!   name bound by the module's import list.
 //!
 //! Both decisions need the names visible *at that designator*: whether an
 //! identifier denotes a type, and whether it is bound by the module's import
 //! list. Those live in a scope chain here, not in one module-wide set, because an
-//! inner declaration shadows an outer one — a local variable named `Texts` is not
-//! the import alias, and a local `T` is not the type `T` (report §4; R17).
+//! inner declaration shadows an outer one: a local variable named `Texts` is not
+//! the import alias, and a local `T` is not the type `T` (report 4). See R17.
 
 use syntax::ast::*;
 use std::collections::HashMap;
 
-/// One scope's bindings, by kind: only the two questions the pass asks are
-/// distinguished, but *every* declaration is recorded, because a variable or a
-/// constant of some name shadows a type or an import alias of the same name.
+/// One scope's bindings, by kind: the pass asks two questions, but records every
+/// declaration. A variable or constant shadows a type or import alias of the
+/// same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Type,
@@ -40,15 +40,15 @@ enum Kind {
 }
 
 /// The scopes visible at the point being classified, innermost last. The
-/// outermost scope holds the predefined types and the module's own imports and
-/// declarations; a procedure body pushes its parameters and its own declarations.
+/// outermost scope holds predefined types and the module's imports and
+/// declarations. A procedure body pushes its parameters and declarations.
 #[derive(Debug, Default)]
 pub struct Names {
     scopes: Vec<HashMap<String, Kind>>,
-    /// The import aliases bound to report §11.1's builtin module `SYSTEM`.
-    /// Every import is a `Kind::Module`, so the one paren group that must *not*
-    /// follow rule (b) — `SYSTEM.SIZE(T)` — needs this extra set, and it is
-    /// consulted through `lookup` so an inner declaration still shadows it (R17).
+    /// The import aliases bound to report 11.1's builtin module `SYSTEM`.
+    /// Every import is a `Kind::Module`, so `SYSTEM.SIZE(T)` needs this extra
+    /// set to avoid rule (b). `lookup` checks it so an inner declaration still
+    /// shadows it (R17).
     system: Vec<String>,
 }
 
@@ -59,8 +59,8 @@ impl Names {
     fn pop(&mut self) {
         self.scopes.pop();
     }
-    /// Bind a name in the scope currently open — a procedure's own name, which
-    /// its later siblings and the enclosing body can see.
+    /// Bind a name in the scope currently open. A procedure's own name is
+    /// visible to its later siblings and the enclosing body.
     fn declare_here(&mut self, name: &str) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.to_string(), Kind::Other);
@@ -76,7 +76,7 @@ impl Names {
 }
 
 impl Names {
-    /// The outermost scope: the predefined types of report §6.1, the module's
+    /// The outermost scope holds the predefined types of report 6.1, the module's
     /// imports, and everything the module declares. Inner scopes are pushed by
     /// the walk.
     pub fn collect(m: &Module) -> Names {
@@ -103,7 +103,7 @@ impl Names {
         self.lookup(name) == Some(Kind::Module)
     }
     /// Whether `name` is an alias the import list bound to `SYSTEM` (report
-    /// §11.1) *and* is still the module in the scope the designator sits in.
+    /// 11.1) and is still the module in the designator's scope.
     fn is_system(&self, name: &str) -> bool {
         self.is_module(name) && self.system.iter().any(|s| s == name)
     }
@@ -135,9 +135,9 @@ fn decl_bindings(d: &Decls, scope: &mut HashMap<String, Kind>) {
 /// folds a leading module qualifier into the designator's base.
 pub fn reclassify(m: &mut Module, names: &mut Names) -> Result<(), ReclassifyError> {
     // Declarations first, in order, each procedure's name entering the module's
-    // scope as its declaration is reached (report §4): a procedure is then
-    // visible to the ones declared after it and to the module body, and not to
-    // the ones before it.
+    // scope as its declaration is reached (report 4): a procedure is then
+    // visible to those declared after it and to the module body, but not to
+    // those declared before it.
     for p in &mut m.decls.procs {
         names.push(entry(&p.name));
         reclassify_proc(p, names)?;
@@ -161,8 +161,8 @@ fn entry(name: &str) -> HashMap<String, Kind> {
 }
 
 fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyError> {
-    // A procedure's own scope: its parameters first, then its declarations —
-    // either can shadow an outer type name or import alias.
+    // A procedure's own scope contains its parameters first, then its declarations.
+    // Either can shadow an outer type name or import alias.
     let mut scope: HashMap<String, Kind> = HashMap::new();
     for sec in &p.params {
         for (name, _) in &sec.names {
@@ -173,7 +173,7 @@ fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyErro
     names.push(scope);
     // Nested declarations first, and each nested procedure's name enters *this*
     // scope as its declaration is reached, so its siblings after it see it while
-    // the ones before it do not (report §4).
+    // the ones before it do not (report 4).
     for c in &mut p.decls.consts {
         reclassify_expr(&mut c.value, names)?;
     }
@@ -188,8 +188,8 @@ fn reclassify_proc(p: &mut Proc, names: &mut Names) -> Result<(), ReclassifyErro
         names.declare_here(&qname);
         reclassify_proc(q, names)?;
     }
-    // The body last: by now it can see every declaration of this scope, including
-    // the nested procedures.
+    // The procedure body is last, so it can see every declaration in this scope,
+    // including the nested procedures.
     for s in &mut p.body {
         reclassify_stmt(s, names)?;
     }
@@ -365,11 +365,10 @@ fn reclassify_designator(d: &mut Designator, names: &mut Names) -> Result<(), Re
         let taken = std::mem::replace(&mut d.sels[i], Selector::Deref);
         d.sels[i] = match taken {
             Selector::Args(args) => {
-                // Two calls take a *type* as their single argument —
-                // `SYSTEM.SIZE(T)` (report §11.1) and `MIN(T)`/`MAX(T)` (W8.2) —
-                // so rule (b) must not swallow them: the paren group stays a
-                // call. A guard, after all, needs a designator of a record or
-                // pointer type, which none of these names can be.
+                // Calls to `SYSTEM.SIZE(T)` (report 11.1) and `MIN(T)`/`MAX(T)`
+                // (W8.2) take a type as their single argument, so rule (b) must
+                // not swallow them. Their paren group stays a call. A guard
+                // needs a record or pointer type, which these names are not.
                 let takes_a_type = matches!(d.base.as_slice(), [alias, entry]
                     if entry == "SIZE" && names.is_system(alias))
                     || matches!(d.base.as_slice(), [n] if n == "MIN" || n == "MAX");

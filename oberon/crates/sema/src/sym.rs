@@ -1,4 +1,4 @@
-//! Prototype of the interface-file (`*.sym`) format of DESIGN.md §7.
+//! Prototype of the interface-file (`*.sym`) format of DESIGN.md 7.
 //!
 //! Only the *format* is prototyped here: rendering a module's exported surface
 //! and parsing it back. Resolution of the parsed declarations is the real
@@ -15,14 +15,13 @@
 //! IMPORT <module> {"," <module>}
 //! CONST <name> = <value>
 //! TYPE <name> = <rendered type>
-//! VAR <name>: <rendered type>        (* read-only for importers, report §11 *)
+//! VAR <name>: <rendered type>        (* read-only for importers, report 11 *)
 //! PROC <name>(<type>; VAR <type>; ARRAY OF <type>): <result>
 //! ```
 //!
-//! Everything after `=` / `:` / `(` is opaque text in this prototype: it is the
-//! *rendered* type, which the real resolver parses with the same type parser the
-//! grammar uses. The prototype checks the part that must not be ambiguous — the
-//! line structure and the declaration kinds — by round-tripping.
+//! Everything after `=` / `:` / `(` is opaque text in this prototype. The real
+//! resolver parses the rendered type with the same type parser used by the
+//! The prototype checks the lines' structure and declaration kinds by round-tripping.
 
 use std::fmt::Write as _;
 
@@ -30,7 +29,7 @@ use std::fmt::Write as _;
 pub enum Item {
     Const { name: String, value: String },
     Type { name: String, def: String },
-    /// Exported variables are read-only for importers (report §11).
+    /// Exported variables are read-only for importers (report 11).
     Var { name: String, ty: String },
     Proc {
         name: String,
@@ -46,7 +45,7 @@ pub struct Interface {
     /// The modules this interface's own type renderings refer to. An interface
     /// has to name them, otherwise `VAR Log: Texts.Writer` in module `Oberon`
     /// could not be resolved by a client that imports `Oberon` but not `Texts`
-    /// (DESIGN §7).
+    /// (DESIGN 7).
     pub imports: Vec<String>,
     pub items: Vec<Item>,
 }
@@ -56,10 +55,10 @@ pub fn render(i: &Interface) -> String {
 }
 
 /// The same, recording the dialect the module was compiled in (PLAN.md W8.10). An
-/// interface means the same thing to either dialect — its names are user
-/// identifiers, and those stay case-sensitive — so the line is there for the reader
-/// rather than enforced, and the default writes no line at all, which keeps a report
-/// interface byte-identical to what it was.
+/// interface means the same thing to either dialect. Its names are user
+/// identifiers and remain case-sensitive, so this line informs the reader
+/// rather than enforcing anything. By default, it doesn't write a line, which keeps a
+/// report interface byte-identical to its previous form.
 pub fn render_dialect(i: &Interface, dialect: syntax::Dialect) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "MODULE {}", i.module);
@@ -88,7 +87,7 @@ pub fn render_dialect(i: &Interface, dialect: syntax::Dialect) -> String {
             } => {
                 // A parameterless proper procedure is written without
                 // parentheses (`PROC WriteLn`), which is also how the report
-                // lets it be called (`WriteLn`, report §9.2).
+                // lets it be called (`WriteLn`, report 9.2).
                 if params.is_empty() && result.is_none() {
                     let _ = writeln!(s, "PROC {name}");
                 } else {
@@ -226,7 +225,7 @@ pub fn parse(text: &str) -> Result<Interface, String> {
                         params.split("; ").map(str::to_string).collect()
                     };
                     // A formal parameter's type is `{ARRAY OF} qualident`
-                    // (report §10.1), so a parameter spec can never contain
+                    // (report 10.1), so a parameter spec can never contain
                     // parentheses; rejecting them keeps the closing `)` of the
                     // parameter list unambiguous.
                     if params.iter().any(|p| p.contains('(') || p.contains(')')) {
@@ -270,7 +269,7 @@ pub fn parse(text: &str) -> Result<Interface, String> {
 mod tests {
     use super::*;
 
-    /// The exact example written out in DESIGN.md §7.
+    /// The exact example written out in DESIGN.md 7.
     const OUT_SYM: &str = "\
 MODULE Out
 VERSION 1

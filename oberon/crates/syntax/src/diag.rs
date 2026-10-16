@@ -1,10 +1,9 @@
 //! Diagnostics: the located messages a front end raises, and the renderer that
-//! turns them into `file:line:col: severity: message` (DESIGN §10).
+//! turns them into `file:line:col: severity: message` (DESIGN 10).
 //!
-//! They live with the syntax phase because the lowest ones — a lexical error, a
-//! parse error — are raised here, and because the renderer needs only a span and
-//! the source text. The semantic pass and the back ends construct and consume
-//! the same type.
+//! They live with the syntax phase because it raises lexical and parse errors.
+//! The renderer needs only a span and the source text. The semantic pass and
+//! back ends construct and consume the same type.
 
 use std::fmt::Write as _;
 
@@ -25,8 +24,8 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub span: Span,
     pub message: String,
-    /// A second line of explanation: what the compiler expected, which report
-    /// rule applies, or what the mistaken construct probably meant.
+    /// A second line explains the compiler's expectation, the applicable report
+    /// rule, or the likely meaning of the mistaken construct.
     pub notes: Vec<String>,
 }
 
@@ -46,7 +45,7 @@ impl Diagnostic {
 
     /// Notes accumulate: a syntax error can have both "what would have fitted
     /// here" and "what the recovery discarded", and the reader needs both
-    /// (DESIGN §10).
+    /// (DESIGN 10).
     pub fn with_note(mut self, note: impl Into<String>) -> Diagnostic {
         self.notes.push(note.into());
         self
@@ -72,9 +71,8 @@ pub fn dedup_diagnostics(diags: &mut Vec<Diagnostic>) {
     });
 }
 
-/// Byte offset → `line:column` (1-based), the only place line information is
-/// computed (DESIGN §10): the AST carries byte spans, and whoever prints a
-/// diagnostic pays for the conversion.
+/// Convert a byte offset to `line:column` (1-based) (DESIGN 10). The AST stores
+/// byte spans. The caller printing a diagnostic performs the conversion.
 pub fn line_col(src: &str, offset: u32) -> (u32, u32) {
     let off = (offset as usize).min(src.len());
     let mut line = 1;
@@ -129,8 +127,8 @@ pub fn limit_errors(diags: &mut Vec<Diagnostic>, limit: usize) -> usize {
 
 /// The note for a recovered error: what the parser threw away to carry on.
 /// Every dropped token is a token of the *input*, so nothing is filtered: a
-/// program may legally declare `error` or `Eof` (report §3), and dropping those
-/// from the note would misdescribe what was skipped.
+/// program may legally declare `error` or `Eof` (report section 3), and omitting
+/// either from the note would misdescribe what was skipped.
 pub fn recovery_note(tokens: &[(usize, Token<'_>, usize)]) -> Option<String> {
     let text: Vec<String> = tokens.iter().map(|(_, t, _)| t.to_string()).collect();
     if text.is_empty() {
@@ -147,7 +145,7 @@ pub fn recovery_note(tokens: &[(usize, Token<'_>, usize)]) -> Option<String> {
 }
 
 /// A syntax error as a first-class diagnostic, so that a parse failure is
-/// located and rendered exactly like a type error (DESIGN §5 D7, §10).
+/// located and rendered just like a type error (DESIGN 5 D7, 10).
 pub fn diagnostic_for_parse_error(error: &ParseErr<'_>) -> Diagnostic {
     use lalrpop_util::ParseError as P;
     let expected_note = |expected: &[String]| -> Option<String> {
@@ -157,8 +155,7 @@ pub fn diagnostic_for_parse_error(error: &ParseErr<'_>) -> Diagnostic {
         // LALRPOP names terminals with their own quoting; a reader wants the
         // tokens themselves.
         let clean = |s: &String| s.trim_matches('"').to_string();
-        // A missing separator is the commonest defect, so `;` leads when it
-        // would have fitted; the rest keeps LALRPOP's order.
+        // A missing separator is common. Put `;` first when it would have fitted.
         let mut ordered: Vec<&String> = expected.iter().collect();
         if let Some(i) = ordered.iter().position(|s| clean(s) == ";") {
             let semi = ordered.remove(i);
@@ -253,10 +250,9 @@ pub fn render_diagnostics(path: &str, src: &str, diags: &[Diagnostic]) -> String
     out
 }
 
-/// Parse a module and turn every syntax error into a located diagnostic —
-/// including the fatal one, which a recovery point could not absorb (a missing
-/// `END`, or a lexical error). The module comes back when the parser got far
-/// enough to build one.
+/// Parse a module and turn every syntax error into a located diagnostic,
+/// including a fatal error that recovery could not absorb (a missing `END` or a
+/// lexical error). Return the module when the parser built one.
 pub fn parse_with_diagnostics(input: &str) -> (Option<Module>, Vec<Diagnostic>) {
     parse_with_diagnostics_dialect(input, Dialect::Report)
 }
@@ -274,8 +270,8 @@ pub fn parse_with_diagnostics_dialect(
                 if let Some(n) = recovery_note(&r.dropped_tokens) {
                     d = d.with_note(n);
                 }
-                // A reserved word the program spelled in lower case is only one
-                // because this dialect folds case; say so (W8.10).
+                // This dialect folds case, so it recognizes a lower-case reserved
+                // word (W8.10).
                 if let ParseError::UnrecognizedToken { token: (start, tok, end), .. } = &r.error {
                     let text = input.get(*start..*end).unwrap_or("");
                     if let Some(n) = dialect.collision_note(tok, text) {
@@ -289,11 +285,9 @@ pub fn parse_with_diagnostics_dialect(
     match crate::oberon::CompilationUnitParser::new().parse(&mut errors, dialect.lexer(input)) {
         Ok(module) => {
             let mut diags = recovered(&errors);
-            // The grammar recovers at statement level, so a broken *declaration*
-            // list still yields a module — and stops hiding the errors after the
-            // first one only if the declarations are read chunk by chunk
-            // (PLAN.md W5.1). Only when something already went wrong, so a clean
-            // parse pays nothing and cannot be second-guessed.
+            // Statement-level recovery can still return a module with a broken
+            // declaration list. Check declarations chunk by chunk to find errors
+            // after the first one (PLAN.md W5.1). Clean parses skip this check.
             if diags.iter().any(Diagnostic::is_error) {
                 diags.extend(declaration_diagnostics(input, dialect));
                 dedup_diagnostics(&mut diags);
@@ -304,10 +298,9 @@ pub fn parse_with_diagnostics_dialect(
         Err(fatal) => {
             let mut diags = recovered(&errors);
             diags.push(diagnostic_for_parse_error(&fatal));
-            // The grammar cannot recover *inside* a declaration section — every
-            // section may be empty, so a recovery production would be ambiguous —
-            // but each declaration can be parsed on its own, so a missing `;` no
-            // longer hides every error after it (PLAN.md W5.1).
+            // The grammar cannot recover inside a declaration section because
+            // each section may be empty. Parse declarations individually so a
+            // missing `;` does not hide later errors (PLAN.md W5.1).
             diags.extend(declaration_diagnostics(input, dialect));
             dedup_diagnostics(&mut diags);
             diags.sort_by_key(|d| (d.span.lo, d.span.hi));
@@ -316,14 +309,13 @@ pub fn parse_with_diagnostics_dialect(
     }
 }
 
-/// What each declaration of a broken declaration list says is wrong (PLAN.md
-/// W5.1). The module parse stops at the first declaration it cannot read, and the
-/// grammar cannot be given a recovery production there; the three entry points
-/// (`ConstDeclParser`, `TypeDeclParser`, `VarDeclParser`) can each read one
-/// declaration, so this walks the token stream, cuts the sections into
-/// `;`-separated chunks at nesting depth zero and asks each chunk's parser what it
-/// thinks. The chunks that are fine say nothing, which is why a module whose only
-/// mistake is a missing `;` gets one message rather than one per declaration.
+/// Find errors in each declaration of a broken declaration list (PLAN.md W5.1).
+/// The module parse stops at the first unreadable declaration, and the grammar
+/// has no recovery production there. The `ConstDeclParser`, `TypeDeclParser`,
+/// and `VarDeclParser` entry points each read one declaration. This function
+/// splits the token stream at depth-zero semicolons, then asks the matching
+/// parser to check each chunk. Valid chunks leave diagnostics unchanged, so a
+/// missing `;` produces one message rather than one per declaration.
 fn declaration_diagnostics(input: &str, dialect: Dialect) -> Vec<Diagnostic> {
     let mut toks: Vec<(usize, Token<'_>, usize)> = Vec::new();
     for next in dialect.lexer(input) {
@@ -347,10 +339,9 @@ fn declaration_diagnostics(input: &str, dialect: Dialect) -> Vec<Diagnostic> {
             }
         };
         i += 1;
-        // One section: a declaration, then `;`, until the section ends at the next
-        // section keyword, the module's `BEGIN` or a `PROCEDURE`. A `;` inside a
-        // `RECORD` or inside parentheses does not separate declarations, so the
-        // scan keeps a depth.
+        // Scan one section's declarations, separated by `;`, until the next
+        // section keyword, module `BEGIN`, or `PROCEDURE`. Semicolons inside a
+        // `RECORD` or parentheses do not separate declarations, so track depth.
         loop {
             let mut depth = 0i32;
             let mut j = i;
@@ -381,8 +372,7 @@ fn declaration_diagnostics(input: &str, dialect: Dialect) -> Vec<Diagnostic> {
             if j > i {
                 let chunk = &toks[i..j];
                 let mut sink = Vec::new();
-                // The three parsers produce three different (and here unwanted)
-                // types, so the error is what is asked for.
+                // These parsers return different types, so only check for errors.
                 let failed = match kind {
                     0 => crate::oberon::ConstDeclParser::new()
                         .parse(&mut sink, chunk.iter().cloned())

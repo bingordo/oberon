@@ -39,7 +39,7 @@ static size_t ob_heap_bytes = 0;     /* what the heap holds, headers included */
 
 /* `OB_GC_STATS=1` reports a pause distribution instead of an impression (PLAN.md
  * W10.3): per collection, the heap before and after, how many blocks were kept
- * and freed, and the time spent inside `ob_collect` — which is the pause, since
+ * and freed, and the time spent inside `ob_collect`. This is the pause, since
  * the mutator is stopped for all of it. Written to stderr, so a program's own
  * output is untouched, and never on by default. */
 static int ob_stats = 0;
@@ -535,7 +535,7 @@ void ob_rt_rec_copy(void *dst, const void *src, int32_t n, const ObDesc *self) {
 
 /* A guard's report. The C back end bakes the byte into a literal per guard site
  * ("type guard failed at byte N"), which a lowered call cannot do, so the byte is
- * a parameter and the text is formatted here — byte for byte what that literal
+ * a parameter and the text is formatted here. It matches the literal output
  * prints, with `at` negative so the reporter adds no suffix of its own. */
 void ob_rt_pack(float *x, int32_t n) {
     rt_pack(x, n);

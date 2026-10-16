@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# A performance *report*, not a suite: it prints numbers and never fails a run.
+#+This performance report prints numbers. It never fails a run.
 # Timings are noisy and machine-dependent, so there is nothing here to assert.
 #
 # Two shapes, because they answer different questions. `Arith.mod` is a tight
-# integer loop with no calls and no arrays -- straight-line code generation, where
+#+integer loop with no calls and no arrays. This measures straight-line code generation, where
 # the second back end is within a third of `gcc -O2`. `CallArray.mod` calls a
 # procedure and indexes an array once per iteration: `gcc` inlines the call and
 # vectorises the loop, neither of which Cranelift does here, so the gap there is
-# about *structure* -- and with the runtime checks on it widens, because the C
+#+about *structure*. The runtime checks widen it, because the C
 # back end's checks are an inline compare to a cold trap while the second's are a
 # call to `rt_index`/`rt_rt` per access. Both are built with the driver's own
 # flags, so the comparison is `-O2` against `opt_level=speed` with the same runtime.

@@ -1,35 +1,34 @@
 //! The layout of the types both back ends emit, computed rather than delegated.
 //!
-//! The C back end does not compute a layout at all: it emits C structs
+//! The C back end leaves layout to the compiler. It emits C structs
 //! (`struct R { const ObDesc *desc; int32_t x; }`, an extension's base as its
-//! first member) and lets the C compiler place the members — `field_path`
-//! produces a *member path*, and `rt_new` is handed `sizeof(T)` (DESIGN §16).
-//! So there is nothing to share, and this module's whole job is to reproduce
-//! what `cc` does for those structs, for the shapes this compiler emits: scalars,
-//! fixed arrays and records (with an extension embedding its base first).
+//! first member), and the C compiler places the members. `field_path` produces
+//! a *member path*, and `rt_new` receives `sizeof(T)` (DESIGN section 16).
+//! This module reproduces what `cc` does for those structs, for
+//! shapes this compiler emits: scalars, fixed arrays and records (with an
+//! extension embedding its base first).
 //!
-//! Being a reproduction is why it is *checked* rather than trusted: `e2e`'s
+//! Since this is a reproduction, it is *checked* rather than trusted: `e2e`'s
 //! layout block compares this table, fact by fact, with `sizeof`/`offsetof`
-//! computed by `cc` from the very header the C back end wrote, so `cc` is the
-//! authority and this file is the claim. A second back end that allocated a
-//! record the C side reads (or the other way round) depends on the two agreeing
-//! byte for byte.
+//! computed by `cc` from the very header the C back end wrote. The C compiler
+//! is the authority and this file is the claim. A second back end that allocated
+//! a record the C side reads, or vice versa, depends on the two agreeing byte
+//! for byte.
 //!
-//! The four rules that are decisions rather than arithmetic, each of them the C
-//! ABI's and each one pinned by that comparison:
+//! Decisions rather than arithmetic, each pinned by that comparison:
 //!
 //! * `char` (and `BYTE`) is one byte with alignment 1, so a `CHAR` between two
 //!   `INTEGER`s is packed into the padding rather than shifting the next word;
-//! * a pointer has the *target's* width and alignment — taken from the ISA the
-//!   object is built for, never from a literal — which is what pads a field
-//!   after an odd number of words;
-//! * a record is its members in declaration order, each at the next multiple of
-//!   its own alignment, and the whole padded to the largest of them: `struct {
-//!   int32_t x; char c; }` is 8 bytes with `c` at 4;
-//! * every record has a descriptor word at offset 0 — in the base-most record of
-//!   a chain (extensions embed their base first, so the word is at offset 0 of
-//!   every view, which is what `IS`, a guard and a type-`CASE` read: §9.3) — and
-//!   that is also why `RECORD END` is one pointer and not nothing.
+//! * a pointer has the *target's* width and alignment, taken from the ISA the
+//!   object is built for, never from a literal. This pads a field after an odd
+//!   number of words;
+//! * a record places members in declaration order, each at the next multiple of
+//!   its own alignment. The whole record is padded to the largest alignment:
+//!   `struct { int32_t x; char c; }` is 8 bytes with `c` at 4;
+//! * every record has a descriptor word at offset 0 in the base-most record of
+//!   a chain (extensions embed their base first), so the word is at offset 0 in
+//!   every view. `IS`, guards and type-`CASE` read this word (DESIGN 9.3).
+//!   `RECORD END` is one pointer.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -62,11 +61,11 @@ pub struct Member {
     pub offset: u64,
 }
 
-/// What a field access needs of a record: the base it embeds (whose fields are
-/// its own, at the base's offsets), and its *own* fields with the offsets and
-/// types the C struct has. Both the descriptor and the base are at offset 0
-/// (§9.3, and the facts `e2e`'s comparison pins: `Cell.desc offset=0`,
-/// `Paired.base offset=0`), so nothing here has to carry them.
+/// A field access needs the base a record embeds and the fields the record
+/// declares. The base's fields use its own offsets. This record's fields use
+/// the offsets and types in the C struct. The descriptor and base are both at
+/// offset 0 (DESIGN 9.3; `e2e` pins `Cell.desc offset=0` and
+/// `Paired.base offset=0`), so neither needs to be carried here.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RecordLayout {
     pub base: Option<TypeId>,
@@ -81,9 +80,9 @@ pub struct Tables {
     pub records: HashMap<TypeId, RecordLayout>,
 }
 
-/// The layouts of one module's types, memoized: a record's layout is its
-/// members' layouts, and the type graph is a DAG through arrays and bases (a
-/// record reached through a pointer is not a member, so the walk terminates).
+/// The layouts of one module's types, memoized. A record's layout comes from
+/// its members' layouts. Arrays and bases form a DAG; a record reached through
+/// a pointer is not a member, so the walk stops.
 pub struct Layouts<'a> {
     types: &'a Types,
     pointer: u64,
@@ -93,8 +92,8 @@ pub struct Layouts<'a> {
 }
 
 impl<'a> Layouts<'a> {
-    /// `pointer_bytes` is the target's pointer width — 8 for the hosts this
-    /// compiler has been built on, but read from the ISA rather than assumed.
+    /// `pointer_bytes` is the target's pointer width, 8 for supported hosts,
+    /// but read from the ISA rather than assumed.
     pub fn new(types: &'a Types, pointer_bytes: u64) -> Layouts<'a> {
         Layouts {
             types,
@@ -118,21 +117,19 @@ impl<'a> Layouts<'a> {
             return *cached;
         }
         let layout = match self.types.get(t).clone() {
-            // One byte, alignment 1: the C emitter's `char`/`uint8_t` (§9.2).
+            // One byte, alignment 1: the C emitter's `char`/`uint8_t` (report 9.2).
             Type::Basic(Basic::Char) | Type::Basic(Basic::Byte) => Some(Layout::new(1, 1)),
             // `int32_t`, `float` and `uint32_t` are all one word (and so is
             // `BOOLEAN`, which the C back end emits as an `int32_t`).
             Type::Basic(_) => Some(Layout::new(4, 4)),
-            // A pointer, and a procedure value, are an address — and the walk
-            // continues into what a pointer points at, because `NEW`, a field
-            // access and the collector's map all need *that* type's layout and
-            // members. The recursion terminates: a pointer's base is a declared
-            // type, so a cycle goes through a pointer.
+            // Pointers and procedure values hold addresses. The walk also visits
+            // a pointer's target because `NEW`, field access and collector maps need
+            // its layout and members. The base is a declared type, so it can be
+            // laid out separately.
             Type::Pointer { base } => {
-                // The pointer's own layout is known before the walk goes on, so a
-                // cycle through it (`P = POINTER TO Node; Node = RECORD next: P
-                // END`) terminates: the cache is filled here rather than after the
-                // recursion.
+                // Cache the pointer's own layout before walking its base. A cycle
+                // such as `P = POINTER TO Node; Node = RECORD next: P END` can then
+                // reuse the cached pointer layout.
                 let layout = Some(Layout::new(self.pointer, self.pointer));
                 self.cache.insert(t, layout);
                 let _ = self.of(base);
@@ -233,8 +230,8 @@ impl<'a> Layouts<'a> {
         self.records.get(&rec).cloned()
     }
 
-    /// The members a record *declares*: its descriptor or base, then its own
-    /// fields, in the order the C struct has them.
+    /// The members a record declares, in C struct order: its descriptor or
+    /// base, followed by its own fields.
     pub fn members(&mut self, rec: TypeId) -> Vec<Member> {
         if !self.members.contains_key(&rec) {
             let _ = self.of(rec);
@@ -243,13 +240,12 @@ impl<'a> Layouts<'a> {
     }
 }
 
-/// The offsets inside the runtime's `ObDesc`, which the C side has as a struct
-/// (`oberon.h`): `{ const ObDesc *base; int32_t id; const char *name; const
-/// ObFld *fields; int32_t nfields; }`. It is a fixed shape rather than a
-/// program's type, so it is computed here once — with the same padding rule as
-/// everything else — instead of being written out as literals that a change to
-/// the C struct would silently falsify. The collector reads `fields`/`nfields`
-/// on every mark, so a mistake here is a crash rather than a wrong number.
+/// The C side defines `ObDesc` in `oberon.h` with this fixed shape:
+/// `{ const ObDesc *base; int32_t id; const char *name; const ObFld *fields;
+/// int32_t nfields; }`. Compute its offsets with the same padding rule as other
+/// layouts. Literal offsets could become stale if the C struct changes. The
+/// collector reads `fields`/`nfields` on every mark, so a mistake crashes rather
+/// than returning a wrong number.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObDesc {
     pub size: u64,
@@ -260,8 +256,8 @@ pub struct ObDesc {
     pub nfields: u64,
 }
 
-/// The same for `ObFld { size_t off; size_t stride; size_t n; const ObDesc
-/// *desc; }` — all `size_t`, so every member is pointer-aligned.
+/// The same applies to `ObFld { size_t off; size_t stride; size_t n; const ObDesc
+/// *desc; }`. All fields are `size_t`, so each is pointer-aligned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObFld {
     pub size: u64,
@@ -312,11 +308,10 @@ pub(crate) fn round_up(off: u64, align: u64) -> u64 {
     (off + align - 1) & !(align - 1)
 }
 
-/// The table `obc emit --layout` prints: one fact per line, in the order the
-/// comparison in `e2e` reads them — a type's size and alignment, then each
-/// member the C struct has at its offset. One line per fact rather than a nested
-/// format, because the other side of the comparison is a C program printing
-/// `sizeof` and `offsetof`, and the check is line for line.
+/// The `obc emit --layout` command prints one fact per line. The output order
+/// matches the `e2e` comparison: type size and alignment, then each member offset.
+/// The C program prints `sizeof` and `offsetof`, so the test compares lines
+/// directly.
 ///
 /// The facts are the module's `TYPE` section, which is what a fixture can carry
 /// and what a client of the module needs; a type declared inside a procedure has

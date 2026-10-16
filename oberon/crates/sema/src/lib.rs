@@ -1,6 +1,6 @@
-//! The semantic phase: name resolution, the type algebra, the constant folder
-//! and the checks of DESIGN §7–§8. It consumes the syntax AST and produces a
-//! checked module plus its diagnostics; it never re-reads the source text.
+//! Name resolution, the type algebra, and the constant folder support the
+//! checks in DESIGN 7-8. This phase consumes the syntax AST and produces a
+//! checked module plus its diagnostics. It never reads the source text again.
 
 pub mod const_eval;
 pub mod resolve;
@@ -43,8 +43,7 @@ pub fn check_module_recovering_dialect(
     }
 }
 
-/// Parse a module and run the semantic pass over it (DESIGN §7-§8). The module
-/// comes back with its selectors reclassified, so tests can inspect both.
+/// Parse a module and run the semantic pass over it (DESIGN 7-8). The module
 pub fn check_module<'input>(
     input: &'input str,
     interfaces: &[Interface],
