@@ -98,13 +98,14 @@ pub fn emit_object_full<'input>(
     interfaces: &[sym::Interface],
     checks: Checks,
     dialect: Dialect,
+    opt: &str,
 ) -> Result<Result<Vec<u8>, Vec<Diagnostic>>, ParseErr<'input>> {
     let mut m = parse_module_dialect(input, dialect)?;
     let sema = Sema::check_owned(&mut m, interfaces);
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return Ok(Err(sema.diags.clone()));
     }
-    Ok(clif::clif::emit_object(&m, &sema.types, &sema, checks))
+    Ok(clif::clif::emit_object(&m, &sema.types, &sema, checks, opt))
 }
 
 /// The layout table `obc emit --layout` prints: the C ABI's size, alignment and

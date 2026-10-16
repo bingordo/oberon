@@ -90,6 +90,11 @@ struct Opts {
     /// Which dialect to accept: the report's Oberon-07 unless `-Odialect=lower`
     /// (DESIGN §5, PLAN.md W8.10).
     dialect: Dialect,
+    /// What the second back end optimises for, in Cranelift's vocabulary: `speed`
+    /// unless `-Oopt=…` says otherwise (DESIGN §16, PLAN.md W9.7). The C back
+    /// end's level is `gcc`'s business and is chosen with `--cflag -O…`, so this
+    /// only ever reaches the Cranelift back end.
+    opt: String,
 }
 
 /// One module in the link: code this build emitted, or C found on disk. What
@@ -119,6 +124,8 @@ fn usage() -> ExitCode {
          \x20 -Ochecks[=LIST]   runtime checks: all (default), none, or a list of
          \x20                   index, nil, guard and case
          \x20 -Odialect=NAME    report (default) or lower, which folds reserved-word case\n\
+         \x20 -Oopt=LEVEL      the second back end's optimisation: speed (default),\n\
+         \x20                  none for the fastest compiles, or speed_and_size\n\
          \x20 --backend=NAME    c (default) writes C, clif writes an object file per\n\
          \x20                   module with the Cranelift back end (PLAN.md W9.1)\n\
          \x20 --layout          print the C ABI's layout of the module's types and stop\n\
@@ -185,6 +192,7 @@ fn parse_args(args: &[String]) -> Option<Opts> {
         ferror_limit: 20,
         checks: cgen::cgen::Checks::ALL,
         dialect: Dialect::Report,
+        opt: "speed".to_string(),
     };
     let mut i = 2;
     while i < args.len() {
@@ -235,6 +243,17 @@ fn parse_args(args: &[String]) -> Option<Opts> {
                         return None;
                     }
                 }
+            }
+            other if other.starts_with("-Oopt=") => {
+                let name = &other["-Oopt=".len()..];
+                if !matches!(name, "none" | "speed" | "speed_and_size" | "speed-and-size") {
+                    eprintln!(
+                        "obc: `-Oopt={name}` names no optimisation level; \
+                         expected none, speed or speed_and_size"
+                    );
+                    return None;
+                }
+                o.opt = name.to_string();
             }
             "-Ochecks" => o.checks = cgen::cgen::Checks::ALL,
             other if other.starts_with("-Ochecks=") => {
@@ -535,7 +554,7 @@ fn emit_tree(
             o.out.join(format!("{name}.c"))
         }
         Backend::Clif => {
-            let object = emit_object_full(src, interfaces, o.checks, o.dialect)
+            let object = emit_object_full(src, interfaces, o.checks, o.dialect, &o.opt)
                 .map_err(|e| format!("{}: {e}", path.display()))?
                 .map_err(|diags| {
                     print!("{}", render_diagnostics(&path.display().to_string(), src, &diags));

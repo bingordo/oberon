@@ -2210,6 +2210,21 @@ were stable to a few percent across runs; the tight one moved by half again, whi
 what a third of a second of work on a busy machine does. Numbers are one machine and
 `gcc 16.2.0`; `bench/run.sh` re-measures them rather than this paragraph asserting them.
 
+**What Cranelift leaves to the embedder, and what it does not.** Its defaults are
+`opt_level = "none"` — this back end compiles at `"speed"` unless `-Oopt=…` says
+otherwise, and a user of the library who does not set it is compiling unoptimised code —
+`enable_alias_analysis = true`,
+`enable_verifier = true` and `unwind_info = true`. Of those, the alias analysis is built
+*inside* `Context::compile` (`AliasAnalysis::new(&self.func, &self.domtree)`), so nothing
+has to attach it; the verifier costs compile time and buys correctness while this back end
+is young; and unwind information, though the flag is on, is *emitted* only if the embedder
+asks (`CompiledCode::create_unwind_info`, which `cranelift-object` does not call for us) —
+ours has none, which is W9.5. The two Spectre-mitigation defaults are also on and do not
+apply here, because this back end does not use the heap-addressing construct they guard.
+Inlining is the other thing the library supplies without a policy (W9.4), and it is the
+only inter-procedural pass there is: no loop optimisation and no auto-vectoriser exists to
+enable, which is what the benchmark's call-heavy case is measuring.
+
 **That is enforced, not asserted**: `e2e`'s
 `mixed-backend-*` rows build one program out of four modules, two from each back end,
 link it with the host `cc` and run it, passing an argument, a result and a module

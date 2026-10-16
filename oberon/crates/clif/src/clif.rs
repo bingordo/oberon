@@ -202,8 +202,9 @@ pub fn emit_object<'a>(
     types: &'a Types,
     sema: &'a Sema<'a>,
     checks: cgen::cgen::Checks,
+    opt: &str,
 ) -> Result<Vec<u8>, Vec<Diagnostic>> {
-    build(module, types, sema, checks).map_err(|d| vec![d])
+    build(module, types, sema, checks, opt).map_err(|d| vec![d])
 }
 
 fn build<'a>(
@@ -211,8 +212,9 @@ fn build<'a>(
     types: &'a Types,
     sema: &'a Sema<'a>,
     checks: cgen::cgen::Checks,
+    opt: &str,
 ) -> Result<Vec<u8>, Diagnostic> {
-    let isa = host_isa()?;
+    let isa = host_isa(opt)?;
     let obj = ObjectModule::new(
         ObjectBuilder::new(
             isa,
@@ -237,10 +239,26 @@ fn build<'a>(
 /// format from the ISA's triple, and the design's second back end is the ELF one.
 /// A host whose format is something else is told so, rather than handed an object
 /// nothing here was written for.
-fn host_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, Diagnostic> {
+/// The optimisation level the caller asked for (`-Oopt=…`), normalised to
+/// Cranelift's own spelling. `speed` is this compiler's default: the C back end
+/// goes through `gcc -O2`, and Cranelift's *own* default — `none`, chosen for the
+/// fastest compiles — would leave the two back ends incomparable (DESIGN §16,
+/// PLAN.md W9.7).
+fn opt_level(name: &str) -> Result<&'static str, Diagnostic> {
+    match name {
+        "none" => Ok("none"),
+        "speed" => Ok("speed"),
+        "speed_and_size" | "speed-and-size" => Ok("speed_and_size"),
+        other => Err(host(format!(
+            "`-Oopt={other}` names no optimisation level; expected none, speed or speed_and_size"
+        ))),
+    }
+}
+
+fn host_isa(opt: &str) -> Result<cranelift_codegen::isa::OwnedTargetIsa, Diagnostic> {
     let mut flags = settings::builder();
     flags
-        .set("opt_level", "speed")
+        .set("opt_level", opt_level(opt)?)
         .map_err(|e| host(format!("opt_level: {e}")))?;
     let isa_builder = cranelift_native::builder().map_err(|e| host(format!("the host's ISA: {e}")))?;
     if isa_builder.triple().binary_format != BinaryFormat::Elf {
@@ -258,7 +276,9 @@ fn host_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, Diagnostic> {
 /// The target's pointer width in bytes, which is what a layout needs and what a
 /// caller without an object module (`--layout`) has to ask for separately.
 pub fn pointer_bytes() -> Result<u64, String> {
-    let isa = host_isa().map_err(|d| d.message)?;
+    // The layout is the same at every optimisation level, so this path — which
+    // only prints sizes and offsets — asks for the ISA without choosing one.
+    let isa = host_isa("speed").map_err(|d| d.message)?;
     Ok(u64::from(isa.frontend_config().pointer_bytes()))
 }
 

@@ -1417,8 +1417,7 @@ module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`
 Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
-**W9.4 inlining, if it is wanted** — **open, named by `bench/run.sh`; the payoff is
-bounded and the policy is the work**
+**W9.4 inlining: the policy, then the pass** — **committed, and the next back-end work**
 Why: `bench/CallArray.mod` calls a procedure once per iteration and this back end emits
 the call. Cranelift ships the machinery but not the decision — `cranelift-codegen`'s
 `inline.rs` calls itself "inlining as a library", says compilation is per-function so it
@@ -1432,8 +1431,50 @@ does not change `VAR` semantics, since the address is still the caller's, but it
 change code size, and a bad policy costs more than it saves. The payoff is bounded: of
 the ~10x gap on that benchmark, inlining is one of three causes, and neither
 vectorisation nor the check lowering (W9.3) is affected by it.
-Done when: a benchmark says so — the call-heavy ratio moves and `e2e`, the corpus and
-the gate are unmoved.
+It is wanted because a call per iteration is the shape this back end is worst at —
+`bench/run.sh` puts `CallArray` at ~10x the C time — and because inlining is the one
+inter-procedural pass Cranelift has at all: there is no loop optimisation to reach for
+and no auto-vectoriser (see W9.5's sibling note in DESIGN §16).
+Steps, in order: lower every procedure into a `Context` it keeps; implement `Inline`
+(small, non-recursive, one call deep to start); run `Context::inline` on each before
+defining it.
+Done when: `bench/run.sh`'s call-heavy ratio moves and `e2e`, the corpus and the gate
+are unmoved.
+
+**W9.7 the optimisation level is the driver's to choose** — **done**
+Why: the back end hard-coded Cranelift's `opt_level = "speed"`, which is right — the C
+path goes through `gcc -O2` and Cranelift's own default is `none` — but it left no way to
+ask for `none` (the fastest compiles, for a syntax check that still has to link) or for
+`speed_and_size` (which is worth having where the choice is real). `obc … -Oopt=LEVEL`
+now takes `none`, `speed` (the default) or `speed_and_size`, in Cranelift's vocabulary,
+and refuses anything else by name rather than ignoring it. The option reaches only the
+second back end: the C path's level is `gcc`'s and is chosen with `--cflag -O…`.
+Done when: `e2e`'s `opt-level-*` rows pass on both back ends' runs — they build `Hello.mod`
+at each level under `--backend=clif` and run it, and check that a name that is not a
+level fails the build.
+
+**W9.6 the alias analysis — no embedder work, recorded so it is not re-derived**
+Why this is an item at all: it is the one Cranelift feature that *sounds* like W9.4 and
+W9.5 — something the embedder has to switch on or attach — and it is not. `context.rs`
+builds `AliasAnalysis::new(&self.func, &self.domtree)` inside `Context::compile`, so the
+embedder supplies nothing, and `enable_alias_analysis` is `true` by default, which this
+back end's `flags` block does not touch (it sets `opt_level = "speed"` and nothing else).
+Checkable in one grep, which is the whole item: nothing to do, nothing to configure, and
+the risk to watch for is only that a future `settings` change turns it off silently —
+`grep -n 'flags.set' crates/clif/src/clif.rs` is the place that would show it.
+Done when: n/a — this records a measurement, and the `settings` block it points at.
+
+**W9.5 unwind information** — **open, measured: the objects have none**
+Why: `unwind_info = true` is the default, but *emitting* it is the embedder's job —
+Cranelift's `Context::create_unwind_info` is deprecated in favour of
+`CompiledCode::create_unwind_info`, and `cranelift-object` does not call it for us.
+Measured on one module: the object `cc` builds has `.eh_frame` and `.rela.eh_frame`, and
+the object this back end builds has neither. Nothing can unwind through a frame this back
+end emitted, so a gdb backtrace, `perf`, or a C++ exception passing through stops there.
+It is a diagnostics limitation and not a program-correctness one — a procedure here does
+not unwind — which is why it sits below W9.4.
+Done when: an object from this back end carries unwind information and `readelf -S` shows
+it, with the suites unmoved.
 
 **W9.3 the second back end's runtime checks are calls, not branches** — **open, found
 by `bench/run.sh` (DESIGN §16)**

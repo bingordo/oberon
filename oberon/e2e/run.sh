@@ -1127,6 +1127,30 @@ mixed_status=0
 "$MIX/mixed" || mixed_status=$?
 check "mixed-backend-runs[clif calls C, C calls clif: argument, result and variable each way]" "0" "$mixed_status"
 
+# 24. The second back end's optimisation level is the caller's (`-Oopt=LEVEL`,
+#     Cranelift's own vocabulary). The default is `speed`, because the C path goes
+#     through `gcc -O2` and Cranelift's own default is `none`; each level has to
+#     build and run the same program, and a name that is not a level has to fail
+#     the build rather than be ignored. `$C_OBC` and an explicit `--backend=clif`
+#     keep this row the same under both BACKEND settings.
+for level in none speed speed_and_size; do
+    if "$C_OBC" build Hello.mod -I . --out "$DRV/opt-$level" -o "$DRV/opt-$level.bin" \
+            --backend=clif -Oopt=$level 2>"$DRV/opt-$level.log"; then
+        echo "PASS opt-level-builds[$level]"
+        pass=$((pass + 1))
+        opt_status=0
+        "$DRV/opt-$level.bin" >/dev/null 2>&1 || opt_status=$?
+        check "opt-level-runs[$level]" "0" "$opt_status"
+    else
+        echo "FAIL opt-level-builds[$level]: $(tail -1 "$DRV/opt-$level.log")"
+        fail=$((fail + 1))
+    fi
+done
+"$C_OBC" build Hello.mod -I . --out "$DRV/opt-bad" -o "$DRV/opt-bad.bin" \
+    --backend=clif -Oopt=bogus >/dev/null 2>"$DRV/opt-bad.log" || true
+check "opt-level-refuses-an-unknown-name[by name, not silently]" "1" \
+    "$(grep -c 'names no optimisation level' "$DRV/opt-bad.log")"
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
