@@ -1151,6 +1151,30 @@ done
 check "opt-level-refuses-an-unknown-name[by name, not silently]" "1" \
     "$(grep -c 'names no optimisation level' "$DRV/opt-bad.log")"
 
+# 25. Inlining must not change what a program means, and the way it did was that a
+#     spliced body's *data* named the caller's object: `cranelift-codegen` copies a
+#     callee's `GlobalValueData` verbatim, and its `User` name is an index into the
+#     *function's* name table, so two functions have to declare the same data in the
+#     same order (PLAN.md W9.4). These two modules are that shape kept: `InlStr` is
+#     the string literal that first printed the wrong text, and `InlDesc` guards on a
+#     record descriptor the caller never names. Both check themselves with ASSERTs,
+#     so the exit status is the verdict. `--backend=clif` is explicit because the
+#     inlining is the second back end's, so the row reads the same under either
+#     BACKEND setting.
+for inl_mod in InlStr InlDesc; do
+    if "$C_OBC" build "$inl_mod.mod" -I . --out "$DRV/inl-$inl_mod" -o "$DRV/inl-$inl_mod.bin" \
+            --backend=clif 2>"$DRV/inl-$inl_mod.log"; then
+        echo "PASS inlining-preserves-meaning[$inl_mod]"
+        pass=$((pass + 1))
+        inl_status=0
+        "$DRV/inl-$inl_mod.bin" >/dev/null 2>&1 || inl_status=$?
+        check "inlining-runs[$inl_mod]" "0" "$inl_status"
+    else
+        echo "FAIL inlining-preserves-meaning[$inl_mod]: $(tail -1 "$DRV/inl-$inl_mod.log")"
+        fail=$((fail + 1))
+    fi
+done
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

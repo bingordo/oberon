@@ -1417,8 +1417,8 @@ module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`
 Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
-**W9.4 inlining: the policy, then the pass** — **written, measured, and reverted: the
-splice changes program output and the cause is not yet understood**
+**W9.4 inlining: the policy, then the pass** — **done: it is in, and the reason it first
+changed program output is recorded below**
 Why: `bench/CallArray.mod` calls a procedure once per iteration and this back end emits
 the call. Cranelift ships the machinery but not the decision — `cranelift-codegen`'s
 `inline.rs` calls itself "inlining as a library", says compilation is per-function so it
@@ -1457,9 +1457,25 @@ entities for the inliner, and *that* is the first thing to answer, before the po
 worth revisiting. Until then this stays off: a 4x benchmark win is not worth a wrong
 string.
 
+**And it was fixed.** The cause was not the policy but what the inliner assumes about the
+embedder's names: `Context::inline` copies a callee's `GlobalValueData` *verbatim* —
+including a `Symbol`'s `User` name — where it *does* translate a `FuncRef`'s name. A `User`
+name is an index into the *function's own* name table, so it only means the same thing in
+another function if both declare the same data in the same order. Declaring only the
+strings a body mentions, which is what this back end did, made an inlined literal resolve
+to whatever the caller had declared at that index — hence `Greet` printing the module
+body's string. The fix: declare the module's strings once, and have every function hand out
+a `GlobalValue` for *all* of them in one order. `Bis4` (`/tmp` scratch, ten lines: a callee
+assigning a string literal, checked by one character) is the shape that isolated it, and
+`e2e`'s `driver-built-program-runs` and `driver-output` under `BACKEND=clif` are the rows
+that catch a regression. The same hazard applies to every *conditional* data declaration —
+descriptors, which a function declares as it uses them, are the next candidate — so the
+rule for this back end is: a function declares the module's data uniformly or not at all.
+
 Done when: the same rows pass with the inliner on — `driver-built-program-runs` under
 `BACKEND=clif` is the one that catches it — and `bench/run.sh`'s call-heavy ratio is still
-where inlining put it.
+where inlining put it. **Met**: `e2e` 138/0 in both modes, the call-heavy ratio 9.96x to
+6.51x without checks (and ~21x to 11.95x with them), and the corpus green.
 
 **W9.7 the optimisation level is the driver's to choose** — **done**
 Why: the back end hard-coded Cranelift's `opt_level = "speed"`, which is right — the C

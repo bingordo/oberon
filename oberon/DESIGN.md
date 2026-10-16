@@ -2191,21 +2191,18 @@ one implementation, so the generated code calls it exactly as the emitted C does
 call `rt_*`/`ob_*` by the same C names. **Performance, measured rather than assumed.** `bench/run.sh` builds the same program
 both ways, with the driver's own flags on each side — `gcc -O2 -fwrapv` against
 Cranelift at `opt_level=speed` — and times the best of three runs. On a tight integer
-loop with no calls and no arrays, the second back end runs at **1.1x–1.6x** the C time
+loop with no calls and no arrays, the second back end runs at **1.0x–1.6x** the C time
 across runs, with the runtime checks on or off: straight-line code is close. On a loop
-that calls a procedure and indexes an array each iteration it is **~10x** without checks
-and **~21x** with them, and the reasons are structural rather than per-instruction. `gcc`
-inlines the call and vectorises the loop. Neither happens here, and the first is not a
-switch that is off: Cranelift ships inlining *as a library* — `Context::inline`, with an
-`Inline` trait the embedder writes — and deliberately defines no heuristics for it,
-because its compilation is per-function and it "does not know which functions are hot and
-which are cold"; the policy is the embedder's. This back end lowers each procedure into
-its own `Context` and defines it, keeping no callee body to splice, so using it would
-mean retaining every procedure's IR, writing that policy and running the pass before
-finalising (PLAN.md W9.4). What is left *is* structural, and
-the checks are *calls* to `rt_index`/`rt_*` per access where the C back end's are an
-inline compare to a cold trap — which is why the ratio roughly doubles when they are on,
-and why that is a named item (PLAN.md W9.3) rather than a mystery. The loop-heavy ratios
+that calls a procedure and indexes an array each iteration it is **~6.5x** without checks
+and **~12x** with them. Inlining is where ~10x became ~6.5x: this back end now lowers a
+callee, keeps its body and runs `Context::inline` under a policy of its own, because
+Cranelift supplies the mechanics and deliberately no heuristics — its compilation is
+per-function and it "does not know which functions are hot and which are cold" (PLAN.md
+W9.4, which also records the name-translation trap that first made that change output the
+wrong string). What is left *is* structural: `gcc` vectorises the loop, which this back end
+does not offer at all, and the checks are *calls* to `rt_index`/`rt_*` per access where the
+C back end's are an inline compare to a cold trap — which is why the ratio roughly doubles
+when they are on, and why that is a named item (PLAN.md W9.3) rather than a mystery. The loop-heavy ratios
 were stable to a few percent across runs; the tight one moved by half again, which is
 what a third of a second of work on a busy machine does. Numbers are one machine and
 `gcc 16.2.0`; `bench/run.sh` re-measures them rather than this paragraph asserting them.
@@ -2221,9 +2218,11 @@ is young; and unwind information, though the flag is on, is *emitted* only if th
 asks (`CompiledCode::create_unwind_info`, which `cranelift-object` does not call for us) —
 ours has none, which is W9.5. The two Spectre-mitigation defaults are also on and do not
 apply here, because this back end does not use the heap-addressing construct they guard.
-Inlining is the other thing the library supplies without a policy (W9.4 — written, and
-reverted because the splice changed what a `GlobalValue` reference meant; the record is
-there), and it is the only inter-procedural pass there is: no loop optimisation and no auto-vectoriser exists to
+Inlining is the other thing the library supplies without a policy (W9.4 — in, with the
+name-translation trap it cost recorded there: the inliner translates a callee's `FuncRef`
+names but copies its `GlobalValueData` verbatim, so a function must declare the module's
+data uniformly or the splice reads the wrong object), and it is the only inter-procedural
+pass there is: no loop optimisation and no auto-vectoriser exists to
 enable, which is what the benchmark's call-heavy case is measuring.
 
 **That is enforced, not asserted**: `e2e`'s

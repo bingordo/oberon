@@ -747,6 +747,53 @@ fn not_yet(what: &str, span: Span) -> Diagnostic {
     )
 }
 
+/// How large a callee may be and still be inlined (PLAN.md W9.4).
+const INLINE_INSTRUCTION_LIMIT: usize = 64;
+
+/// The inlining policy: Cranelift's inliner asks, and this answers. The split is
+/// the library's own design — `cranelift-codegen/src/inline.rs` calls itself
+/// "inlining as a library" and defines no heuristics, because its compilation is
+/// per-function and it cannot see the call graph.
+struct Policy<'a> {
+    /// What is being inlined *into*, so a call to itself is never inlined.
+    caller: u32,
+    /// Every body this back end has lowered, by the `FuncId` its name carries.
+    bodies: &'a HashMap<u32, ir::Function>,
+    limit: usize,
+}
+
+impl<'a> cranelift_codegen::inline::Inline for Policy<'a> {
+    fn inline(
+        &mut self,
+        caller: &ir::Function,
+        _inst: ir::Inst,
+        _opcode: ir::Opcode,
+        callee: ir::FuncRef,
+        _args: &[ir::Value],
+    ) -> cranelift_codegen::inline::InlineCommand<'_> {
+        use cranelift_codegen::inline::InlineCommand;
+        // Which of the module's procedures this is. A runtime import is
+        // `User`-named too, so the name is not the test — the body is, and only
+        // these procedures have one.
+        let id = match caller.dfg.ext_funcs[callee].name {
+            ir::ExternalName::User(r) => caller.params.user_named_funcs()[r].index,
+            _ => return InlineCommand::KeepCall,
+        };
+        if id == self.caller {
+            return InlineCommand::KeepCall;
+        }
+        // `visit_callee: false`: the inlined body is not walked for further
+        // inlining, which bounds recursion without the call graph.
+        match self.bodies.get(&id) {
+            Some(body) if body.dfg.num_insts() <= self.limit => InlineCommand::Inline {
+                callee: std::borrow::Cow::Borrowed(body),
+                visit_callee: false,
+            },
+            _ => InlineCommand::KeepCall,
+        }
+    }
+}
+
 struct Backend<'a> {
     /// The module, for the type declarations a label or a guard names.
     module: &'a Module,
@@ -786,6 +833,22 @@ struct Backend<'a> {
     /// parameterless call written without parentheses has no `Call` selector).
     procs: HashMap<String, FuncId>,
     proc_formals: HashMap<String, Vec<Formal>>,
+    /// Every string literal in the module, in one order for every function, and
+    /// the bodies this back end has lowered, by `FuncId`, for the inliner.
+    ///
+    /// The first is not an optimisation but a correctness requirement of
+    /// inlining: `cranelift-module` names a declaration with a counter that is
+    /// *per function*, so a `UserExternalName` is only meaningful next to the
+    /// function that produced it — and the inliner translates those names by
+    /// value when it splices a body in. Two functions must therefore declare the
+    /// same things in the same order, or a callee's literal resolves to whatever
+    /// the caller put at that position (PLAN.md W9.4).
+    module_strings: Vec<(u32, String)>,
+    /// Each of those strings' data object, declared and defined once, so that the
+    /// per-function pass only adds a `GlobalValue` for an object that already
+    /// exists — declaring it per function would define the symbol twice.
+    string_data: HashMap<u32, DataId>,
+    bodies: HashMap<u32, ir::Function>,
     /// The module's variables, as data objects.
     vars: HashMap<String, DataId>,
     /// What each module variable's type is: an index into one needs the length
@@ -840,6 +903,9 @@ impl<'a> Backend<'a> {
             proc_level: HashMap::new(),
             procs: HashMap::new(),
             proc_formals: HashMap::new(),
+            module_strings: Vec::new(),
+            string_data: HashMap::new(),
+            bodies: HashMap::new(),
             vars: HashMap::new(),
             var_ty: HashMap::new(),
             rt: HashMap::new(),
@@ -854,6 +920,29 @@ impl<'a> Backend<'a> {
 
     fn run(&mut self, module: &Module) -> Result<(), Diagnostic> {
         let span = module.span;
+        // The module's string literals, collected once and declared by *every*
+        // function in this order. Not an optimisation: `Context::inline` copies a
+        // callee's `GlobalValueData` verbatim, including a `Symbol`'s `User` name,
+        // and that name is an index into the *function's* name table — so two
+        // functions have to declare the same data in the same order, or a spliced
+        // body's literal resolves to whatever the caller declared at that index.
+        // (The inliner translates `FuncRef`s, which is why calls survive it.)
+        {
+            let mut all = Vec::new();
+            for p in &module.decls.procs {
+                collect_strings(&p.body, &mut all);
+            }
+            collect_strings(&module.body, &mut all);
+            all.sort_unstable();
+            all.dedup();
+            self.module_strings = all;
+            // Declared and defined here, once, so the per-function pass below only
+            // hands out `GlobalValue`s for objects that already exist.
+            for (at, text) in &self.module_strings.clone() {
+                let id = self.declare_string(&format!("str_{at}"), text)?;
+                self.string_data.insert(*at, id);
+            }
+        }
         // 0. The C ABI's layout for every type this module stores (DESIGN §16,
         //    `layout.rs`): the array strides below are read from it, as are the
         //    record member offsets W9.2's pointers and records will need.
@@ -1849,8 +1938,11 @@ impl<'a> Backend<'a> {
         // references for the same reason.
         let uses = uses_of(self.sema, self.types, self.module, body);
         let mut string_ids = Vec::new();
-        for (at, text) in &uses.strings {
-            string_ids.push((*at, self.declare_string(&format!("str_{at}"), text)?));
+        // Every string in the module, not only the ones this body mentions: a
+        // spliced `GlobalValue` is only meaningful if both functions' name tables
+        // agree, and the objects are the ones declared once in `run`.
+        for (at, _) in &self.module_strings.clone() {
+            string_ids.push((*at, self.string_data[at]));
         }
 
         let mut ctx = self.obj.make_context();
@@ -2109,6 +2201,21 @@ impl<'a> Backend<'a> {
             l.bcx.seal_all_blocks();
             l.bcx.finalize(l.b.obj.target_config());
         }
+        // The policy (DESIGN §16, PLAN.md W9.4): this body goes into the map first
+        // so a *later* procedure's call to it can be inlined, and the policy
+        // refuses a call to the procedure being inlined into, which is what a
+        // recursive or mutually recursive pair looks like from here.
+        self.bodies.insert(id.as_u32(), ctx.func.clone());
+        let mut policy = Policy {
+            caller: id.as_u32(),
+            bodies: &self.bodies,
+            limit: INLINE_INSTRUCTION_LIMIT,
+        };
+        ctx.inline(&mut policy).map_err(|e| host(format!("{e:?}")))?;
+        if std::env::var_os("OB_TRACE_IR").is_some() {
+            eprintln!("---- fn {}:\n{}", id.as_u32(), ctx.func.display());
+        }
+
         self.obj
             .define_function(id, &mut ctx)
             .map_err(|e| host(format!("{e:?}")))?;
