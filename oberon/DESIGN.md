@@ -2221,8 +2221,9 @@ is young; and unwind information, though the flag is on, is *emitted* only if th
 asks (`CompiledCode::create_unwind_info`, which `cranelift-object` does not call for us) —
 ours has none, which is W9.5. The two Spectre-mitigation defaults are also on and do not
 apply here, because this back end does not use the heap-addressing construct they guard.
-Inlining is the other thing the library supplies without a policy (W9.4), and it is the
-only inter-procedural pass there is: no loop optimisation and no auto-vectoriser exists to
+Inlining is the other thing the library supplies without a policy (W9.4 — written, and
+reverted because the splice changed what a `GlobalValue` reference meant; the record is
+there), and it is the only inter-procedural pass there is: no loop optimisation and no auto-vectoriser exists to
 enable, which is what the benchmark's call-heavy case is measuring.
 
 **That is enforced, not asserted**: `e2e`'s

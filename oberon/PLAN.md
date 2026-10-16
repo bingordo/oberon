@@ -1417,7 +1417,8 @@ module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`
 Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
-**W9.4 inlining: the policy, then the pass** — **committed, and the next back-end work**
+**W9.4 inlining: the policy, then the pass** — **written, measured, and reverted: the
+splice changes program output and the cause is not yet understood**
 Why: `bench/CallArray.mod` calls a procedure once per iteration and this back end emits
 the call. Cranelift ships the machinery but not the decision — `cranelift-codegen`'s
 `inline.rs` calls itself "inlining as a library", says compilation is per-function so it
@@ -1438,8 +1439,27 @@ and no auto-vectoriser (see W9.5's sibling note in DESIGN §16).
 Steps, in order: lower every procedure into a `Context` it keeps; implement `Inline`
 (small, non-recursive, one call deep to start); run `Context::inline` on each before
 defining it.
-Done when: `bench/run.sh`'s call-heavy ratio moves and `e2e`, the corpus and the gate
-are unmoved.
+**What happened when it was written.** The policy worked as advertised: `bench/run.sh`'s
+call-heavy case fell from 9.96x to 5.97x the C time without checks and from ~21x to ~12x
+with them — a 4x speedup on the shape it exists for — and the C-mode suite stayed green.
+But `driver-built-program-runs` failed under `BACKEND=clif` and nowhere else: `Hello.mod`
+writes "Hello, world!" from its module body and "Hello again from a command" from `Greet`,
+and it printed the first string twice. The IR says why in one line — the *spliced*
+`WriteString` call carries `iconst 27` (the callee's text length) with the *caller's* data
+reference — so a `GlobalValue` reference does not survive the splice the way this back end
+hands one over. Four things were ruled out by inspection on the way, not by guessing: the
+`FuncRef`-to-`FuncId` mapping (the body's own name is `namespace 0, index 17`, and it is
+the right procedure), the map's contents, the string data (`declare_string` gives each
+literal its own symbol and `DataId`), and a stale build. Cranelift's contract asks for a
+callee that is "legalized, valid, and a correct implementation of the callee" — which the
+clone is — so what is missing is something about how the embedder must prepare the callee's
+entities for the inliner, and *that* is the first thing to answer, before the policy is
+worth revisiting. Until then this stays off: a 4x benchmark win is not worth a wrong
+string.
+
+Done when: the same rows pass with the inliner on — `driver-built-program-runs` under
+`BACKEND=clif` is the one that catches it — and `bench/run.sh`'s call-heavy ratio is still
+where inlining put it.
 
 **W9.7 the optimisation level is the driver's to choose** — **done**
 Why: the back end hard-coded Cranelift's `opt_level = "speed"`, which is right — the C
