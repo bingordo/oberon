@@ -2188,7 +2188,22 @@ diagnostics — a message and a source byte — and the C runtime already is the
 one implementation, so the generated code calls it exactly as the emitted C does
 (§9.4's table). That is also what makes a mixed build link: both back ends put
 `<Module>__init`, `<Module>__load` and the command table in the object, and both
-call `rt_*`/`ob_*` by the same C names. **That is enforced, not asserted**: `e2e`'s
+call `rt_*`/`ob_*` by the same C names. **Performance, measured rather than assumed.** `bench/run.sh` builds the same program
+both ways, with the driver's own flags on each side — `gcc -O2 -fwrapv` against
+Cranelift at `opt_level=speed` — and times the best of three runs. On a tight integer
+loop with no calls and no arrays, the second back end runs at **1.1x–1.6x** the C time
+across runs, with the runtime checks on or off: straight-line code is close. On a loop
+that calls a procedure and indexes an array each iteration it is **~10x** without checks
+and **~21x** with them, and the reasons are structural rather than per-instruction. `gcc`
+inlines the call and vectorises the loop, which this back end does not do at all, and
+the checks are *calls* to `rt_index`/`rt_*` per access where the C back end's are an
+inline compare to a cold trap — which is why the ratio roughly doubles when they are on,
+and why that is a named item (PLAN.md W9.3) rather than a mystery. The loop-heavy ratios
+were stable to a few percent across runs; the tight one moved by half again, which is
+what a third of a second of work on a busy machine does. Numbers are one machine and
+`gcc 16.2.0`; `bench/run.sh` re-measures them rather than this paragraph asserting them.
+
+**That is enforced, not asserted**: `e2e`'s
 `mixed-backend-*` rows build one program out of four modules, two from each back end,
 link it with the host `cc` and run it, passing an argument, a result and a module
 variable in *both* directions; the two back ends' objects for the same module must also

@@ -1417,6 +1417,18 @@ module and object plumbing, the C ABI boundary for the runtime calls, `OptLevel`
 Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
+**W9.3 the second back end's runtime checks are calls, not branches** — **open, found
+by `bench/run.sh` (DESIGN §16)**
+Why: on `bench/CallArray.mod` the second back end runs at ~10x the C back end's time
+without checks and ~22x with them, and the checks are the difference: the C back end
+emits an inline compare against the bound and jumps to a cold trap on failure, while
+this back end calls `rt_index`/`rt_rt` per access. The same divergence covers `NIL`,
+the guard and the type-`CASE`. It is a code shape, not a semantics question — the
+helper is the semantics — so it does not change what a program computes, only what it
+costs.
+Done when: `bench/run.sh`'s checked-to-unchecked gap on `CallArray` is much smaller
+than the ~2.2x it is now, with the corpus and every suite unmoved.
+
 **W9.2 the rest of the language on the Cranelift back end** — **done**: all four slices
 (a–d) are in and `BACKEND=clif bash e2e/run.sh` is **131 passed, 0 failed** — every row
 the C path passes, which was the acceptance — with the corpus green on both back ends.
