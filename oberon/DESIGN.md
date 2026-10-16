@@ -17,7 +17,7 @@ meant to be kept:
 | `.` (the five compiler crates) | The front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 81 tests pass, clippy clean |
 | `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 88 checks, 0 failures, 1 bug in the test spec itself (R11) |
 | `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**: `golden/Ob.h` and `golden/rt.h` `#include "../crates/cgen/src/oberon_h.inc"`, the file `cgen.rs` also `include_str!`s; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
-| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 126 checks pass, on both back ends — every row the C path passes, the Cranelift path passes too (§16); it found the emitter and checker bugs listed in §14 |
+| `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 131 checks pass, on both back ends — every row the C path passes, the Cranelift path passes too (§16); it found the emitter and checker bugs listed in §14 |
 
 Everything marked **[design]** below is not yet implemented; everything marked
 **[verified]** was executed in this repository (commands in §14).
@@ -2178,7 +2178,11 @@ diagnostics — a message and a source byte — and the C runtime already is the
 one implementation, so the generated code calls it exactly as the emitted C does
 (§9.4's table). That is also what makes a mixed build link: both back ends put
 `<Module>__init`, `<Module>__load` and the command table in the object, and both
-call `rt_*`/`ob_*` by the same C names.
+call `rt_*`/`ob_*` by the same C names. **That is enforced, not asserted**: `e2e`'s
+`mixed-backend-*` rows build one program out of four modules, two from each back end,
+link it with the host `cc` and run it, passing an argument, a result and a module
+variable in *both* directions; the two back ends' objects for the same module must also
+export the same symbols, text and data.
 
 *What the research did not prepare for*: the header's helpers are `static
 inline`, so `rt_div_at`, `rt_index` and `rt_trap_pos` are **macros** over

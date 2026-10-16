@@ -35,7 +35,7 @@ Every change keeps these green (PLAN.md's preamble is the same list):
 cargo test --manifest-path oberon/Cargo.toml
 bash oberon/golden/run.sh      # 67 cases, plain and under ASan/UBSan
 bash oberon/csmoke/run.sh      # 67 C-level cases
-bash oberon/e2e/run.sh         # 126 checks, end to end through the driver
+bash oberon/e2e/run.sh         # 131 checks, end to end through the driver
 bash oberon/fuzz/run.sh        # 86 generated programs in seven blocks, on either back end
 cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings
 ```

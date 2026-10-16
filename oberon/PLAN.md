@@ -1405,10 +1405,16 @@ Cranelift's shift rule, which does *not* match the report's and therefore lands
 squarely on the corpus's deliberate large-count shifts.
 
 **W9.2 the rest of the language on the Cranelift back end** — **done**: all four slices
-(a–d) are in and `BACKEND=clif bash e2e/run.sh` is **126 passed, 0 failed** — every row
+(a–d) are in and `BACKEND=clif bash e2e/run.sh` is **131 passed, 0 failed** — every row
 the C path passes, which was the acceptance — with the corpus green on both back ends.
 `DESIGN.md` §16 carries the record, including the last row's cause (a frame-held record
 local that missed its descriptor walk, whose type-`CASE` then read `NULL + 8`)
+
+**What the mixed-link rows found.** The qualified-call path was complete only in
+*statement* position: `Lib.Twice(21)` written where a *value* is wanted was still refused
+by name, so a back end that passes every e2e row could not take a result from another
+module. `call_value` now has the branch `call_stmt` already had, and the rows below pin
+it — four modules, two per back end, one program, linked by `cc`, in both directions.
 
 *Notes from W9.1, so the next session starts from them rather than re-deriving:*
 

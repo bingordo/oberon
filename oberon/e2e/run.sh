@@ -1073,6 +1073,60 @@ BEGIN
 END NilT.
 '
 
+# 23. The ABI across back ends (DESIGN §16). One program, four modules, two back
+#     ends: `MixLib` and `MixC2` are the C back end's objects, `MixRoot` and
+#     `MixLeaf` the Cranelift back end's. The host `cc` links them, so the symbol
+#     names, the argument and result conventions and the runtime's calls have to
+#     agree -- and the modules' own ASSERTs (an argument into a C module, a value
+#     out of a clif one, and a value each way) have to hold.
+#
+#     `$C_OBC` here is the driver itself, not the wrapper: under BACKEND=clif the
+#     wrapper appends `--backend=clif` after the module, which would override the
+#     explicit flag each half needs.
+#
+#     Each half is emitted into its own directory, because `emit` writes the whole
+#     import graph: asking for `MixRoot` under clif also writes a Cranelift
+#     `MixLib.o`, and the C back end's is the one to link.
+MIX="$DRV/mixed"
+mkdir -p "$MIX/c" "$MIX/k" "$MIX/k2" "$MIX/c2"
+if "$C_OBC" emit MixLib.mod  -I . --out "$MIX/c" >"$MIX/emit.log" 2>&1 &&
+   "$C_OBC" emit MixRoot.mod -I "$MIX/c" -I . --out "$MIX/k" --backend=clif >>"$MIX/emit.log" 2>&1 &&
+   "$C_OBC" emit MixLeaf.mod -I . --out "$MIX/k2" --backend=clif >>"$MIX/emit.log" 2>&1 &&
+   "$C_OBC" emit MixC2.mod   -I "$MIX/k2" -I . --out "$MIX/c2" >>"$MIX/emit.log" 2>&1 &&
+   "$CC" -c "$MIX/c/MixLib.c" -o "$MIX/c/MixLib.o" >>"$MIX/emit.log" 2>&1 &&
+   "$CC" -c "$MIX/c2/MixC2.c" -o "$MIX/c2/MixC2.o" -I "$MIX/c" -I "$MIX/c2" >>"$MIX/emit.log" 2>&1; then
+    echo "PASS mixed-backend-emits[one module per back end, per direction]"
+    pass=$((pass + 1))
+else
+    echo "FAIL mixed-backend-emits:"
+    sed -n '1,10p' "$MIX/emit.log"
+    fail=$((fail + 1))
+fi
+
+# The two back ends' objects for one module must export the same names. Only the
+# *defined* symbols are compared: what each calls is its own business (they reach
+# different runtime helpers), but a name that differs or is missing would be an
+# ABI disagreement, and an undefined one would fail the link below.
+nm "$MIX/c/MixLib.o" | awk '$2 ~ /^[TDB]$/ {print $2, $3}' | sort > "$MIX/sym.c"
+nm "$MIX/k/MixLib.o" | awk '$2 ~ /^[TDB]$/ {print $2, $3}' | sort > "$MIX/sym.k"
+check "mixed-backend-same-symbols[init, load, Take, Twice, its variable]" "same" \
+    "$(cmp -s "$MIX/sym.c" "$MIX/sym.k" && echo same || echo differ)"
+check "mixed-backend-symbols-present" "yes" "$([ "$(wc -l < "$MIX/sym.k")" -ge 5 ] && echo yes || echo no)"
+
+if "$CC" -o "$MIX/mixed" main_mixed.c "$MIX/c/MixLib.o" "$MIX/k/MixRoot.o" \
+        "$MIX/k2/MixLeaf.o" "$MIX/c2/MixC2.o" "$MIX/c/oberon_runtime.c" \
+        -I "$MIX/c" -I "$MIX/c2" -lm 2>"$MIX/link.log"; then
+    echo "PASS mixed-backend-links"
+    pass=$((pass + 1))
+else
+    echo "FAIL mixed-backend-links:"
+    sed -n '1,10p' "$MIX/link.log"
+    fail=$((fail + 1))
+fi
+mixed_status=0
+"$MIX/mixed" || mixed_status=$?
+check "mixed-backend-runs[clif calls C, C calls clif: argument, result and variable each way]" "0" "$mixed_status"
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

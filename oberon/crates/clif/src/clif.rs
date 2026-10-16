@@ -4122,6 +4122,20 @@ impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
         if let Some(v) = self.b.sema.extreme_at(span) {
             return Ok(self.bcx.ins().iconst(I32, i64::from(v)));
         }
+        // A call into another module, from expression position: the symbol and
+        // the ABI are the C back end's, exactly as for the same call written as a
+        // statement (`Lib__Twice`), and `imported_ref` takes the signature — result
+        // included — from the checker's `call_types` at this site.
+        if d.base.len() == 2 {
+            let symbol = format!("{}__{}", d.base[0], mangle(&d.base[1]));
+            let fref = self.imported_ref(&symbol, d)?;
+            let args = self.call_args(d)?.to_vec();
+            let vals = self.pass_args(d, &args)?;
+            let call = self.bcx.ins().call(fref, &vals);
+            return self.bcx.inst_results(call).first().copied().ok_or_else(|| {
+                not_yet(&format!("the call to `{symbol}` as a value"), d.span)
+            });
+        }
         let name = self.base_name(d)?.to_string();
         let key = self.callee_key(&name);
         if let Some(fref) = key.as_ref().and_then(|k| self.frefs.get(k)).copied() {
