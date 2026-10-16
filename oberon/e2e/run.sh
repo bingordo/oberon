@@ -1156,12 +1156,14 @@ check "opt-level-refuses-an-unknown-name[by name, not silently]" "1" \
 #     callee's `GlobalValueData` verbatim, and its `User` name is an index into the
 #     *function's* name table, so two functions have to declare the same data in the
 #     same order (PLAN.md W9.4). These two modules are that shape kept: `InlStr` is
-#     the string literal that first printed the wrong text, and `InlDesc` guards on a
-#     record descriptor the caller never names. Both check themselves with ASSERTs,
+#     the string literal that first printed the wrong text, `InlDesc` guards on a
+#     record descriptor the caller never names, and `InlVar` is the same hazard for
+#     the *order* rather than the set: both functions declare both variables, but a
+#     map does not iterate the same way twice, so the sequence has to be imposed. Both check themselves with ASSERTs,
 #     so the exit status is the verdict. `--backend=clif` is explicit because the
 #     inlining is the second back end's, so the row reads the same under either
 #     BACKEND setting.
-for inl_mod in InlStr InlDesc; do
+for inl_mod in InlStr InlDesc InlVar; do
     if "$C_OBC" build "$inl_mod.mod" -I . --out "$DRV/inl-$inl_mod" -o "$DRV/inl-$inl_mod.bin" \
             --backend=clif 2>"$DRV/inl-$inl_mod.log"; then
         echo "PASS inlining-preserves-meaning[$inl_mod]"

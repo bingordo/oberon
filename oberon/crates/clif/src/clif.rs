@@ -794,6 +794,19 @@ impl<'a> cranelift_codegen::inline::Inline for Policy<'a> {
     }
 }
 
+/// A map's entries in a fixed order.
+///
+/// Every function has to declare the module's data in the *same sequence*, because
+/// a `GlobalValue`'s `Symbol` name is a `User` name — an index into the function's
+/// own name table — and `Context::inline` copies it into the caller verbatim. A
+/// `HashMap`'s iteration order is not the same in two functions (nor in two runs),
+/// so the sequence has to be imposed (PLAN.md W9.4).
+fn sorted<K: Ord, V>(map: HashMap<K, V>) -> Vec<(K, V)> {
+    let mut entries: Vec<(K, V)> = map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
 struct Backend<'a> {
     /// The module, for the type declarations a label or a guard names.
     module: &'a Module,
@@ -1962,24 +1975,31 @@ impl<'a> Backend<'a> {
         for (pname, pid) in self.procs.clone() {
             frefs.insert(pname, self.obj.declare_func_in_func(pid, &mut ctx.func));
         }
+        // The module's data, in a *fixed* order in every function, and all of it
+        // rather than only what this body names. The first matters because a
+        // `GlobalValue` is copied into a caller verbatim, name included, and the
+        // name is an index into the *function's* table — so two functions must
+        // declare the same data in the same sequence (PLAN.md W9.4). The second
+        // matters for the same reason: a set that depends on the body would shift
+        // the sequence.
         let mut gvs = HashMap::new();
-        for (vname, vid) in self.vars.clone() {
+        for (vname, vid) in sorted(self.vars.clone()) {
             gvs.insert(vname, self.obj.declare_data_in_func(vid, &mut ctx.func));
         }
         let mut rts = HashMap::new();
-        for (rt, rid) in self.rt.clone() {
+        for (rt, rid) in sorted(self.rt.clone()) {
             rts.insert(rt, self.obj.declare_func_in_func(rid, &mut ctx.func));
         }
         let mut msgs = HashMap::new();
-        for (msg, mid) in self.msgs.clone() {
+        for (msg, mid) in sorted(self.msgs.clone()) {
             msgs.insert(msg, self.obj.declare_data_in_func(mid, &mut ctx.func));
         }
         let mut descs = HashMap::new();
-        for (t, did) in self.descs.clone() {
+        for (t, did) in sorted(self.descs.clone()) {
             descs.insert(t, self.obj.declare_data_in_func(did, &mut ctx.func));
         }
         let mut roots = HashMap::new();
-        for (name, mid) in self.root_maps.clone() {
+        for (name, mid) in sorted(self.root_maps.clone()) {
             let n = self.region_fields(self.var_ty[&name], 0).len() as i32;
             roots.insert(name, (self.obj.declare_data_in_func(mid, &mut ctx.func), n));
         }

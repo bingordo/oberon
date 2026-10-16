@@ -1468,9 +1468,14 @@ body's string. The fix: declare the module's strings once, and have every functi
 a `GlobalValue` for *all* of them in one order. `Bis4` (`/tmp` scratch, ten lines: a callee
 assigning a string literal, checked by one character) is the shape that isolated it, and
 `e2e`'s `driver-built-program-runs` and `driver-output` under `BACKEND=clif` are the rows
-that catch a regression. The same hazard applies to every *conditional* data declaration —
-descriptors, which a function declares as it uses them, are the next candidate — so the
-rule for this back end is: a function declares the module's data uniformly or not at all.
+that catch a regression. The rule this back end now follows is that a function declares the
+module's data **uniformly — the same objects in the same order — or not at all**, and both
+halves of that are load-bearing: the strings were a *set* that depended on the body, and the
+other five declaration loops (`vars`, `rt`, `msgs`, `descs`, `root_maps`) each walked a
+`HashMap`, whose order differs between functions and between runs. `e2e` carries the shapes
+as `InlStr.mod` (the literal), `InlDesc.mod` (a descriptor the caller never names) and
+`InlVar.mod` (the order hazard, where the sets already agreed and only their sequence
+differed), each with its own assertion.
 
 Done when: the same rows pass with the inliner on — `driver-built-program-runs` under
 `BACKEND=clif` is the one that catches it — and `bench/run.sh`'s call-heavy ratio is still
