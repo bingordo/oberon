@@ -1,0 +1,23 @@
+[package]
+name = "clif"
+version = "0.1.0"
+edition = "2021"
+
+# The second back end (DESIGN §16). It is a crate of its own, and not a module of
+# `cgen`, because the Cranelift crates are 44 crates of the dependency graph and a
+# build that only wants the C back end should not compile them.
+#
+# Its one inward edge is to `cgen`: the two back ends must agree on symbol mangling
+# (an object from one links against a translation unit from the other), and `Checks`
+# is `cgen`'s type. `cgen` does not depend on this crate, in either direction of
+# source or manifest.
+[dependencies]
+syntax = { path = "../syntax" }
+sema = { path = "../sema" }
+cgen = { path = "../cgen" }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-native = { workspace = true }
+cranelift-object = { workspace = true }
+target-lexicon = { workspace = true }

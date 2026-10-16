@@ -3066,7 +3066,7 @@ pub fn interface_of(module: &Module, types: &Types, sema: &Sema<'_>) -> sema::sy
 /// Shared with the Cranelift back end, which resolves a declaration's type the
 /// same way: one AST fact, one function, so a new `TypeExpr` cannot be added to
 /// one back end and forgotten in the other.
-pub(crate) fn span_of_type(t: &TypeExpr) -> Span {
+pub fn span_of_type(t: &TypeExpr) -> Span {
     match t {
         TypeExpr::Named(_, s)
         | TypeExpr::Array { span: s, .. }
@@ -3082,7 +3082,7 @@ pub(crate) fn span_of_type(t: &TypeExpr) -> Span {
 /// Shared with the Cranelift back end: it emits the same `<Module>__<Name>`
 /// symbols, and a program that mixes the two back ends links them against each
 /// other's declarations (DESIGN §16.2), so one mangling has to serve both.
-pub(crate) fn mangle(name: &str) -> String {
+pub fn mangle(name: &str) -> String {
     let name = name.replace('.', "__");
     // An Oberon identifier is case-sensitive, so `int`, `while`, `char`, … are
     // legal Oberon names and must not reach C unchanged. Nothing else needs

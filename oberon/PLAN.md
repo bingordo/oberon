@@ -519,7 +519,7 @@ the binaries still land in `oberon/target/debug/` and no suite or CI path change
 Two moves the note above did not name were forced by the edges and are recorded here:
 
 * `Diagnostic`, `Severity`, `dedup_diagnostics` and the diagnostic renderer moved out
-  of `sema.rs`/`lib.rs` into `syntax/crates/syntax/src/diag.rs`. A lexical or parse error *is* a
+  of `sema.rs`/`lib.rs` into `crates/syntax/src/diag.rs`. A lexical or parse error *is* a
   diagnostic, so its type has to be visible to the parser; putting it in `syntax` is
   what lets the checker import it without a cycle and still keeps `sema` and `cgen`
   from naming LALRPOP.
@@ -539,6 +539,15 @@ PASS, ASan/UBSan clean; `bash csmoke/run.sh` **0 failures**; `bash e2e/run.sh`
 `BACKEND=clif bash fuzz/run.sh` exit 0. `cargo build|test|clippy --manifest-path
 oberon/Cargo.toml` now name the workspace manifest and cover every member, so the CI
 workflow resolves unchanged.
+
+**Its back ends are crates of their own too**, which is what §2's split by phase asks
+for: `crates/clif` holds `clif.rs` and `layout.rs`, and `cgen` is the C back end and
+nothing else. The one inward edge is `clif → cgen` — symbol mangling and the `Checks`
+type, which the two back ends must agree on because an object from one links against a
+translation unit from the other. The suite numbers above are unmoved by it. Worth
+knowing for the next reader: a module named after its own crate is a resolution trap
+(`use x::{x, …}` shadows the crate name for the rest of that module), so the moved
+files are reached by path.
 
 **W4.4 a `.sym`-only fast path** — **deferred, measured** (the condition it waits for has not fired)
 Why: `obc build` has no up-to-date check (nothing in the driver looks at

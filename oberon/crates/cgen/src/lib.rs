@@ -1,7 +1,5 @@
-//! The C back end (DESIGN §9): the emitter, the ABI layout table and the runtime
-//! it emits alongside, plus the second, Cranelift back end (DESIGN §16). Both
-//! consume the same checked module and produce a translation unit or an object.
+//! The C back end (DESIGN §9): the emitter and the runtime it emits alongside.
+//! The second back end is its own crate (`clif`, DESIGN §16) so that a build which
+//! only wants this one does not compile Cranelift.
 
 pub mod cgen;
-pub mod clif;
-pub mod layout;

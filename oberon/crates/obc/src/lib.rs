@@ -8,7 +8,6 @@
 //! others.
 
 use cgen::cgen::{emit_module_checked, interface_of, Checks};
-use cgen::{clif, layout};
 use sema::sema::Sema;
 
 // The façade re-exports the phase items its callers and its own tests name, so
@@ -105,7 +104,7 @@ pub fn emit_object_full<'input>(
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return Ok(Err(sema.diags.clone()));
     }
-    Ok(clif::emit_object(&m, &sema.types, &sema, checks))
+    Ok(clif::clif::emit_object(&m, &sema.types, &sema, checks))
 }
 
 /// The layout table `obc emit --layout` prints: the C ABI's size, alignment and
@@ -125,7 +124,7 @@ pub fn layout_table_full<'input>(
     if sema.diagnostics().iter().any(Diagnostic::is_error) {
         return Ok(Err(sema.diags.clone()));
     }
-    Ok(Ok(layout::table(&m, &sema.types, &sema, pointer_bytes)))
+    Ok(Ok(clif::layout::table(&m, &sema.types, &sema, pointer_bytes)))
 }
 
 /// The run of `Out` from the report's chapter 11, verbatim.

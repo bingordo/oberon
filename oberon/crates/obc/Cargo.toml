@@ -7,3 +7,4 @@ edition = "2021"
 syntax = { path = "../syntax" }
 sema = { path = "../sema" }
 cgen = { path = "../cgen" }
+clif = { path = "../clif" }

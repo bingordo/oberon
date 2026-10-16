@@ -14,7 +14,7 @@ meant to be kept:
 | Artefact | What it is | Status |
 |---|---|---|
 | `crates/obc/src/bin/obgen.rs`, `fuzz/` | **A random program generator used as a self-checking oracle**: it writes a module *and* the value every variable must have (its own interpreter, so no circularity), and a mismatch traps in the module itself | 25 seeds run, 0 survived: it found three defects in the emitted C that the hand-written suites had missed (§13 R20) |
-| `.` (the four compiler crates) | The front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 81 tests pass, clippy clean |
+| `.` (the five compiler crates) | The front end: hand-written lexer, the LALRPOP grammar, the AST, the resolver **and checker** (scopes, type resolution, diagnostics), the interface-file codec, the type algebra and the constant folder, all with tests | builds, 81 tests pass, clippy clean |
 | `csmoke/` | Every C emission rule of §9 that has a non-obvious semantic, compiled and executed | 88 checks, 0 failures, 1 bug in the test spec itself (R11) |
 | `golden/` | The report's own procedures hand-lowered to C in the shape §9.6–9.8 prescribes, a two-module link model with command dispatch, and the constant table the folder is cross-checked against — **compiled against the runtime the compiler emits, not a copy of it**: `golden/Ob.h` and `golden/rt.h` `#include "../crates/cgen/src/oberon_h.inc"`, the file `cgen.rs` also `include_str!`s; run twice (plain and under ASan/UBSan) | 67 cases pass, 3 design corrections found (R12–R14) |
 | `e2e/` | **The whole compiler, end to end**: five Oberon modules (including the report's own `Out` and a hello-world) compiled by this repository's compiler to C, that C compiled by the host `cc` with `-Werror`, the program run and compared with an independently computed expectation — and the same again through the `obc` driver | 126 checks pass, on both back ends — every row the C path passes, the Cranelift path passes too (§16); it found the emitter and checker bugs listed in §14 |
@@ -94,12 +94,22 @@ crates/syntax/             # lexer + grammar + syntax AST + diagnostics
   src/{lib.rs,lexer.rs,ast.rs,diag.rs,oberon.lalrpop}  build.rs
 crates/sema/               # resolver, type checker, constant evaluator
   src/{lib.rs,sym.rs,resolve.rs,types.rs,sema.rs,const_eval.rs}
-crates/cgen/               # C emitter, Cranelift back end + the emitted runtime
-  src/{lib.rs,cgen.rs,layout.rs,clif.rs,oberon_h.inc,oberon_runtime.inc}
+crates/cgen/               # the C emitter and the runtime it emits
+  src/{lib.rs,cgen.rs,oberon_h.inc,oberon_runtime.inc}
+crates/clif/               # the Cranelift back end (§16) and the ABI layout table
+  src/{lib.rs,clif.rs,layout.rs}
 crates/obc/                # the driver and the generator: obc build/run/emit/check
   src/lib.rs  src/bin/{obc.rs,obgen.rs,oberon-front.rs}
 tests/corpus/              # *.Mod with expected diagnostics / expected stdout
 ```
+
+The second back end is a crate of its own, which is what §2's split by phase asks for:
+`cgen` is the C back end and nothing else, `clif` is the Cranelift one. Its one inward
+edge is to `cgen`, for symbol mangling and the `Checks` type — an object from one back
+end links against a translation unit from the other, so the two must agree on names —
+and `cgen` does not depend on `clif`. A module of a crate named after the crate is also
+a resolution trap worth avoiding (`use x::{x, …}` shadows the crate name for the rest
+of that module), so the files are reached by path.
 
 Our file names are the ones that exist, not the earlier sketch of this block:
 the checker is `sema.rs` (the sketch's `check.rs`), the C emitter is `cgen.rs`
@@ -2152,7 +2162,7 @@ link mode), and whether any component outside these crates can emit DWARF.
 
 ### The prototype: a lowerer beside `cgen` **[implemented; `PLAN.md` W9.1]**
 
-`crates/cgen/src/clif.rs` lowers the *same* checked AST and `sema` types `cgen` consumes, and
+`crates/clif/src/clif.rs` lowers the *same* checked AST and `sema` types `cgen` consumes, and
 `obc --backend=clif` (default `c`) writes one object file per module instead of a
 translation unit and a header. The scope is the fuzz corpus's fragment: `INTEGER`
 and `BOOLEAN`, one-dimensional fixed arrays of them, `+ - * DIV MOD /`, `ABS`,
@@ -2264,7 +2274,7 @@ they take apart).
 ### The C ABI's layout, and the comparison that makes `cc` the authority **[implemented; `PLAN.md` W9.2a]**
 
 §16's corrected layout paragraph above is what this section implements:
-`crates/cgen/src/layout.rs` computes, for the shapes this compiler emits, the size, the
+`crates/clif/src/layout.rs` computes, for the shapes this compiler emits, the size, the
 alignment and each member's offset the way the C ABI does — because the C back end
 emits C structs and `cc` is what places their members. Four rules are decisions
 rather than arithmetic, and the comparison below is what settles each of them

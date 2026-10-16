@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use syntax::ast::Module;
-use crate::cgen::{mangle, span_of_type};
+use cgen::cgen::{mangle, span_of_type};
 use sema::sema::Sema;
 use sema::types::{Basic, Type, TypeId, Types};
 

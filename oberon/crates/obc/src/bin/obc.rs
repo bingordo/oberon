@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use cgen::{self, clif};
 use obc::{
     check_module_recovering_dialect, emit_c_full, emit_interface_dialect, emit_object_full,
     layout_table_full, limit_errors, parse_with_diagnostics_dialect, render_diagnostics,
@@ -290,7 +289,7 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
         // this back end does not lower yet can still be asked what layout it
         // would get — which is exactly what the comparison against `cc` needs,
         // and why this prints and stops rather than building anything.
-        let pointer_bytes = clif::pointer_bytes().map_err(|e| format!("--layout: {e}"))?;
+        let pointer_bytes = clif::clif::pointer_bytes().map_err(|e| format!("--layout: {e}"))?;
         match layout_table_full(&root_src, &interfaces, o.dialect, pointer_bytes) {
             Ok(Ok(table)) => print!("{table}"),
             Ok(Err(diags)) => {

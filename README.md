@@ -14,7 +14,7 @@ compiler textbooks). It is not part of the repository: see `.gitignore`.
 |---|---|
 | `oberon/DESIGN.md` | the design: the grammar decisions with the conflicts that forced them, the check catalogue, the codegen rules, the risks (R1…R25) and the decisions taken where the report is silent |
 | `oberon/PLAN.md` | the backlog, item by item, with the evidence each item rests on |
-| `oberon/crates/` | the compiler, split by phase (DESIGN §2): `syntax` (lexer, LALRPOP grammar, AST, diagnostics), `sema` (resolver, checker, constant folder), `cgen` (C emitter and the Cranelift back end), and `obc` (the façade plus the `oberon-front`, `obc` and `obgen` binaries) |
+| `oberon/crates/` | the compiler, split by phase (DESIGN §2): `syntax` (lexer, LALRPOP grammar, AST, diagnostics), `sema` (resolver, checker, constant folder), `cgen` (the C back end), `clif` (the Cranelift back end), and `obc` (the façade plus the `oberon-front`, `obc` and `obgen` binaries) |
 | `oberon/golden/` | the report's own procedures hand-lowered to C, a two-module link model, and the constant table the folder is diffed against — compiled against the runtime the compiler emits, run plain and under ASan/UBSan |
 | `oberon/csmoke/` | every C emission rule with a non-obvious semantic, compiled and executed |
 | `oberon/e2e/` | the whole compiler end to end: Oberon modules → C → `cc -Werror` → run → compare |

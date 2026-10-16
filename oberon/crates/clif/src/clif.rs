@@ -42,7 +42,7 @@ use syntax::ast::{
     BinOp, CaseArm, CaseLabel, Designator, Expr, ExprKind, Module, Proc, Selector, Span, Stmt,
     StmtKind, UnOp,
 };
-use crate::cgen::{self, mangle, span_of_type};
+use cgen::cgen::{mangle, span_of_type};
 use sema::const_eval;
 use crate::layout::{Layout, Layouts};
 use sema::sema::{span_key, Sema};
@@ -201,7 +201,7 @@ pub fn emit_object<'a>(
     module: &'a Module,
     types: &'a Types,
     sema: &'a Sema<'a>,
-    checks: cgen::Checks,
+    checks: cgen::cgen::Checks,
 ) -> Result<Vec<u8>, Vec<Diagnostic>> {
     build(module, types, sema, checks).map_err(|d| vec![d])
 }
@@ -210,7 +210,7 @@ fn build<'a>(
     module: &'a Module,
     types: &'a Types,
     sema: &'a Sema<'a>,
-    checks: cgen::Checks,
+    checks: cgen::cgen::Checks,
 ) -> Result<Vec<u8>, Diagnostic> {
     let isa = host_isa()?;
     let obj = ObjectModule::new(
@@ -733,7 +733,7 @@ struct Backend<'a> {
     module_name: String,
     types: &'a Types,
     sema: &'a Sema<'a>,
-    checks: cgen::Checks,
+    checks: cgen::cgen::Checks,
     obj: ObjectModule,
     /// What an address is in the IR, for the symbol loads and the runtime's
     /// pointer arguments, and how wide it is in bytes.
@@ -796,7 +796,7 @@ impl<'a> Backend<'a> {
         module: &'a Module,
         types: &'a Types,
         sema: &'a Sema<'a>,
-        checks: cgen::Checks,
+        checks: cgen::cgen::Checks,
         obj: ObjectModule,
     ) -> Backend<'a> {
         let ptr = obj.target_config().pointer_type();
