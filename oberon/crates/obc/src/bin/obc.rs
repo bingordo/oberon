@@ -153,6 +153,13 @@ fn main() -> ExitCode {
     if temporary {
         opts.out = std::env::temp_dir().join(format!("obc-{}", std::process::id()));
     }
+    // The build directory carries interfaces too: the runtime's `Args.sym` is
+    // written there with the runtime itself, so a program reaches the host
+    // through an ordinary module without the user adding a search path. Appended
+    // last, so a `-I` still shadows it (DESIGN 11).
+    if !opts.search.contains(&opts.out) {
+        opts.search.push(opts.out.clone());
+    }
     let code = match build_and_maybe_run(&opts) {
         Ok(c) => c,
         Err(e) => {
@@ -295,6 +302,10 @@ fn build_and_maybe_run(o: &Opts) -> Result<ExitCode, String> {
     // search path, or one superseded by a better copy in another directory, must
     // not be reported (PLAN.md W3.2). The reasons are kept here and printed when
     // the check says the interface is missing.
+    // The runtime's interface is written before anything is resolved: `Args.sym`
+    // lives with it, so a program that imports the host's arguments finds it on
+    // the build directory's own search path (DESIGN 11).
+    write_runtime(o)?;
     let (mut interfaces, refused) = find_interfaces(o);
 
     // 2. Emit the module and everything it imports, depth first.
@@ -477,6 +488,11 @@ fn emit_tree(
                     // check/emit only need the interface, which is already loaded.
                     done.insert(m);
                 }
+                None if is_runtime_module(&m) => {
+                    // Its body is in the runtime, which every build links: there is
+                    // nothing to emit and nothing to find on disk (DESIGN 11).
+                    done.insert(m);
+                }
                 None if matches!(o.mode, Mode::Build | Mode::Run) => {
                     return Err(format!(
                         "no implementation for module `{m}`: looked for {m}.mod and {m}.c on the \
@@ -581,8 +597,50 @@ fn emit_tree(
     Ok(())
 }
 
+/// The `Args` module's header, in the shape the emitter writes for an imported
+/// module: the declaration a caller compiles against. The body is in the runtime,
+/// so this file is all the driver has to add to the pair every module has.
+const ARGS_HEADER: &str = "\
+/* The Args module, whose body is in the runtime (DESIGN 11). */
+#ifndef ARGS_H
+#define ARGS_H
+#include \"oberon.h\"
+int32_t Args__Count(void);
+void Args__Get(int32_t i, char *s, int32_t s__len);
+#endif
+";
+
+/// The modules whose bodies the runtime carries, rather than a `.c` on the search
+/// path. To a program they are ordinary modules — an import, an interface, calls
+/// that go through the usual ABI — and the driver's only part is knowing that the
+/// implementation is already in the object every build links. One row per module
+/// the host provides, so the next one (a clock, the environment) costs a row and
+/// its C in the runtime rather than a change anywhere else (DESIGN 11).
+const RUNTIME_MODULES: &[&str] = &["Args"];
+
+fn is_runtime_module(name: &str) -> bool {
+    RUNTIME_MODULES.contains(&name)
+}
+
+/// The `Args` module's interface, in the shape the emitter writes `.sym` files,
+/// and the one interface this driver writes itself: the module's body is in the
+/// runtime, so there is no declaration to emit it from. `Count` is the number of
+/// arguments the program was given — after its own name — and `Get` copies the
+/// `i`-th into a string, empty if there is none (DESIGN 11).
+const ARGS_INTERFACE: &str = "\
+MODULE Args
+VERSION 1
+PROC Count(): INTEGER
+PROC Get(i: INTEGER; VAR s: ARRAY OF CHAR)
+";
+
 fn write_runtime(o: &Opts) -> Result<(), String> {
     write(&o.out.join("oberon.h"), cgen::cgen::RUNTIME_HEADER)?;
+    // `Args` is an ordinary module whose body lives in the runtime, so its
+    // interface is written here beside it. A program that wants the arguments
+    // imports it, and nothing in the compiler knows the name (DESIGN 11).
+    write(&o.out.join("Args.sym"), ARGS_INTERFACE)?;
+    write(&o.out.join("Args.h"), ARGS_HEADER)?;
     write(&o.out.join("oberon_runtime.c"), cgen::cgen::RUNTIME_SOURCE)
 }
 
@@ -671,7 +729,11 @@ fn loader_source(
             }
         }
     }
-    out.push_str("\nint main(void) {\n");
+    // The loader's own first act is to hand the program's arguments to the
+    // runtime, which is where the `Args` module reads them (DESIGN 11). It takes
+    // them even when the program ignores them: one `main` shape for every build
+    // is worth more than a special case per program.
+    out.push_str("\nint main(int argc, char **argv) {\n    ob_set_args(argc, argv);\n");
     for u in units {
         out.push_str(&format!("    {}__load();\n", u.name));
     }

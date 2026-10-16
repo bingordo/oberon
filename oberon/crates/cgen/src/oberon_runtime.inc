@@ -400,6 +400,61 @@ struct ObRegistry {
 static struct ObRegistry ob_registry[OB_MAX_MODULES];
 static int ob_registry_len = 0;
 
+/* ------------------------------------------------- the program's arguments */
+
+/* What the host gave the program, stashed by the loader `main` and read through
+ * the `Args` module below (DESIGN 11). The runtime owns the storage because the
+ * loader is generated per program while the module is shared by all of them.
+ *
+ * The count is of the arguments *after* the program's own name, which is what a
+ * program means by the arguments it was given. An index out of range is an empty
+ * string rather than a fault: asking for an argument that was not passed is a
+ * program with a usage message, not a broken one. */
+static int ob_argc = 0;
+static char **ob_argv = NULL;
+
+void ob_set_args(int argc, char **argv) {
+    ob_argc = argc;
+    ob_argv = argv;
+}
+
+int32_t ob_arg_count(void) {
+    return ob_argc > 0 ? (int32_t)(ob_argc - 1) : 0;
+}
+
+void ob_arg_value(int32_t i, char *buf, int32_t cap) {
+    const char *s = "";
+    int32_t n = 0;
+    if (cap <= 0) {
+        return;
+    }
+    if (ob_argv != NULL && i >= 0 && i + 1 < ob_argc) {
+        s = ob_argv[i + 1];
+    }
+    while (s[n] != '\0' && n + 1 < cap) {
+        buf[n] = s[n];
+        n++;
+    }
+    buf[n] = '\0';
+}
+
+/* The `Args` module. Its interface is `Args.sym`, which the driver writes beside
+ * this file, and its body is here rather than in an emitted translation unit:
+ * a program reaches the host through an ordinary module, in the shape every
+ * imported procedure has, instead of through a name the compiler happens to
+ * know. That is the same arrangement the report's own `Texts` has, and it is why
+ * adding the next thing the host provides costs a module and no compiler change.
+ *
+ * The signatures are the ones the emitter gives those declarations: an open array
+ * is two parameters, the data and its length (DESIGN 9.8). */
+int32_t Args__Count(void) {
+    return ob_arg_count();
+}
+
+void Args__Get(int32_t i, char *s, int32_t s__len) {
+    ob_arg_value(i, s, s__len);
+}
+
 void ob_register_commands(const char *module, const ObCommand *table) {
     int i;
     for (i = 0; i < ob_registry_len; i++) {

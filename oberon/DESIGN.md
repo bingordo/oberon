@@ -2992,3 +2992,39 @@ byte-for-byte with the C path on the cases the driver builds by hand: the same
 hand-written module whose command is dispatched by `--command M.P` through the
 runtime's registry, which is the part of the object/ABI plumbing the corpus
 cannot reach.
+
+---
+
+## 17. What the host provides, and how **[implemented; PLAN.md W11.1]**
+
+The report's answer to "where do the arguments come from" is that it does not
+answer: a module is activated, not invoked with a command line. A real program
+needs them, and something will need a clock, the environment and a terminal
+eventually — and each of those is a place where a compiler can grow a built-in name
+no other implementation has. `oberonc`'s `ARGNUM`/`ARGS` are exactly that: its own
+examples use them, which is why those examples build there and nowhere else.
+
+So this compiler has no built-in names for the host. It has a **module**, `Args`,
+whose body is in the runtime:
+
+* the runtime keeps what the loader stashed — `ob_set_args`, called first thing by
+  the generated `main`, plus `ob_arg_count` and `ob_arg_value`;
+* `Args` is four lines of C over those (`Args__Count`, `Args__Get`), and its
+  interface is an ordinary `.sym` the driver writes beside the runtime;
+* `RUNTIME_MODULES` in the driver is the only place that knows a module's body is
+  not a `.c` on the search path, so `IMPORT Args` builds like any other import and
+  the next host module costs a row, its C and its `.sym` — no checker arm, no
+  back-end arm, no predeclared name.
+
+`Count` is the number of arguments *after* the program's own name, and `Get` copies
+the `i`-th into a string, empty when there is none: asking for an argument that was
+not passed is a program with a usage message, not a fault.
+
+**Two programs written elsewhere are the evidence** (`e2e`'s
+`third-party-program-*` rows). `PrimeNumbers.mod` and `Powers.mod` are from
+`lboasso/oberonc` (MIT), and the port is two lines each — `Args.Count` for
+`ARGNUM()`, `Args.Get` for `ARGS` — with `Util.mod` their own, unmodified. They
+build and run on both back ends. `lib/Out.mod` is the other half of the same idea:
+the `Out` those programs import is a convention of the implementations rather than
+part of the report, so it is a module in a directory a build puts on the search
+path, not something the compiler knows.

@@ -1177,6 +1177,46 @@ for inl_mod in InlStr InlDesc InlVar; do
     fi
 done
 
+# 26. Programs written elsewhere, built and run here. `PrimeNumbers.mod` and
+#     `Powers.mod` are from https://github.com/lboasso/oberonc (MIT), and the only
+#     thing the port changes is how they reach the host's arguments: that compiler
+#     provides `ARGNUM`/`ARGS` as built-ins, which neither the report nor another
+#     implementation has, and here the same information comes from the `Args`
+#     module (DESIGN 11). `lib/` carries the `Out` those programs expect — the
+#     suite's own `Out` is a different module of the same name, so the search path
+#     is what chooses, and `lib` goes first.
+#
+#     `Util.mod` is theirs unmodified. Both programs are checked by their output,
+#     and the value checked is one only a correct run produces: the last power of
+#     two that `Powers 8` writes, and the first prime `PrimeNumbers 50` prints.
+PRG="-I ../lib -I . -I $DRV"
+if "$C_OBC" build PrimeNumbers.mod $PRG --out "$DRV/prog-primes" -o "$DRV/prog-primes.bin" \
+        --backend=clif 2>"$DRV/prog-primes.log"; then
+    echo "PASS third-party-program-builds[PrimeNumbers]"
+    pass=$((pass + 1))
+    prog_out=$("$DRV/prog-primes.bin" 50 2>&1 | head -1)
+    case "$prog_out" in
+        *"    7   11   13"*) echo "PASS third-party-program-runs[PrimeNumbers 50]"; pass=$((pass + 1)) ;;
+        *) echo "FAIL third-party-program-runs[PrimeNumbers 50]: got [$prog_out]"; fail=$((fail + 1)) ;;
+    esac
+else
+    echo "FAIL third-party-program-builds[PrimeNumbers]: $(tail -1 "$DRV/prog-primes.log")"
+    fail=$((fail + 1))
+fi
+if "$C_OBC" build Powers.mod $PRG --out "$DRV/prog-powers" -o "$DRV/prog-powers.bin" \
+        --backend=clif 2>"$DRV/prog-powers.log"; then
+    echo "PASS third-party-program-builds[Powers]"
+    pass=$((pass + 1))
+    prog_out=$("$DRV/prog-powers.bin" 8 2>&1 | tail -1)
+    case "$prog_out" in
+        *"0.0078125"*) echo "PASS third-party-program-runs[Powers 8]"; pass=$((pass + 1)) ;;
+        *) echo "FAIL third-party-program-runs[Powers 8]: got [$prog_out]"; fail=$((fail + 1)) ;;
+    esac
+else
+    echo "FAIL third-party-program-builds[Powers]: $(tail -1 "$DRV/prog-powers.log")"
+    fail=$((fail + 1))
+fi
+
 echo "----"
 echo "SUMMARY e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -59,6 +59,14 @@ struct ObCommand {
 void ob_register_commands(const char *module, const ObCommand *table);
 int ob_run_command(const char *module, const char *name);
 
+/* The program's arguments, and the `Args` module over them (DESIGN 11). The
+ * loader calls `ob_set_args` with what the host passed; a program reads them
+ * through `Args`, whose interface is `Args.sym` — an ordinary imported module,
+ * not a name the compiler knows. */
+void ob_set_args(int argc, char **argv);
+int32_t Args__Count(void);
+void Args__Get(int32_t i, char *s, int32_t s__len);
+
 /* ------------------------------------------------------------------ traps */
 
 static inline void rt_trap_pos(const char *msg, int32_t at) {

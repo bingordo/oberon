@@ -18,6 +18,7 @@ compiler textbooks). It is not part of the repository: see `.gitignore`.
 | `oberon/golden/` | the report's own procedures hand-lowered to C, a two-module link model, and the constant table the folder is diffed against — compiled against the runtime the compiler emits, run plain and under ASan/UBSan |
 | `oberon/csmoke/` | every C emission rule with a non-obvious semantic, compiled and executed |
 | `oberon/e2e/` | the whole compiler end to end: Oberon modules → C → `cc -Werror` → run → compare |
+| `oberon/lib/` | modules a build puts on its search path rather than ones the compiler knows: `Out` in the shape programs written elsewhere expect, with `Args` (the host's arguments) written by the driver as an interface over the runtime |
 | `oberon/fuzz/` | random Oberon programs that know what they must compute, used as a self-checking oracle (`crates/obc/src/bin/obgen.rs`) |
 
 ## Build
@@ -34,8 +35,8 @@ Every change keeps these green (PLAN.md's preamble is the same list):
 ```
 cargo test --manifest-path oberon/Cargo.toml
 bash oberon/golden/run.sh      # 67 cases, plain and under ASan/UBSan
-bash oberon/csmoke/run.sh      # 67 C-level cases
-bash oberon/e2e/run.sh         # 131 checks, end to end through the driver
+bash oberon/csmoke/run.sh      # 88 C-level checks
+bash oberon/e2e/run.sh         # 148 checks, end to end through the driver
 bash oberon/fuzz/run.sh        # 86 generated programs in seven blocks, on either back end
 cargo clippy --all-targets --manifest-path oberon/Cargo.toml -- -D warnings
 ```

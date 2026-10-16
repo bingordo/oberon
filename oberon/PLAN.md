@@ -1941,6 +1941,20 @@ measurement. The instrument is what turns them into one.
   *diagnostic* catalogue (§8.5's 55 rows) is exercised only by unit tests; a few
   modules per row would test the driver path too.
 
+**W11.1 the host's arguments, as a module rather than a built-in** — **done**
+Why: the report has no notion of a command line — a module is activated, not
+invoked — and a real program needs its arguments. The tempting shape is a built-in
+name, which is what `oberonc`'s `ARGNUM`/`ARGS` are and why its own examples build
+there and nowhere else. The shape here is a module whose body is in the runtime
+(DESIGN §17): `IMPORT Args` is an ordinary import, both back ends already know how
+to call it, and the next thing the host provides costs a row in `RUNTIME_MODULES`,
+its C and its `.sym` — no checker arm, no back-end arm, no predeclared name.
+Done when: a program written for another implementation builds and runs here with
+its argument access ported and nothing else changed. **Met**: `e2e`'s
+`third-party-program-*` rows build and run `PrimeNumbers.mod` and `Powers.mod` from
+`lboasso/oberonc` (MIT) — two lines of port each, `Util.mod` unmodified — on both
+back ends, with the suite at 148 rows in either mode.
+
 ## Non-goals (deliberate, DESIGN §1)
 
 Optimisation of any kind — the C compiler does it; Oberon-2 and later dialects;
