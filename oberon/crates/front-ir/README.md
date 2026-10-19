@@ -1,0 +1,1 @@
+Small checked Oberon frontend library for the separate Rust native compiler. Uses `syntax` and `sema` only; no code-generation crate dependencies. API is deliberately narrow and rejects unsupported constructs.

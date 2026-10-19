@@ -1,0 +1,9 @@
+[package]
+name = "oberon-front-ir"
+version = "0.1.0"
+edition = "2021"
+description = "Checked Oberon procedure subset for external compiler backends"
+
+[dependencies]
+sema = { path = "../sema" }
+syntax = { path = "../syntax" }
