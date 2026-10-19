@@ -299,9 +299,7 @@ mod tests {
     }
     #[test]
     fn different_seeds_generate_different_cfgs_and_expressions() {
-        let examples:(Vec<_>,Vec<_>)=((1..48).map(|seed|render(seed,"source").unwrap()).collect(),
-                                       (1..48).map(|seed|Program::generate(seed)).collect());
-        let sources=&examples.0;
+        let sources:Vec<_>=(1..48).map(|seed|render(seed,"source").unwrap()).collect();
         assert!(sources.iter().any(|s|s.contains("ELSIF")));
         assert!(sources.iter().any(|s|s.contains("WHILE i > 0")));
         assert!(sources.iter().any(|s|s.contains("WHILE j <")));
