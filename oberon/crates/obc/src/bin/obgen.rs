@@ -35,6 +35,7 @@ use std::process::Command;
 
 use obc::line_col;
 
+#[path = "obgen/compiler_subset.rs"]
 mod compiler_subset;
 
 // random generator
