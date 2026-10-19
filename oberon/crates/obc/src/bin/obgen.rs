@@ -35,6 +35,8 @@ use std::process::Command;
 
 use obc::line_col;
 
+mod compiler_subset;
+
 // random generator
 
 /// xorshift64*, so a seed reproduces a program exactly, on any machine.
@@ -1261,6 +1263,7 @@ fn main() {
     let mut obc = PathBuf::from("target/debug/obc");
     let mut work = std::env::temp_dir().join("obgen");
     let mut keep = false;
+    let mut compiler_subset_mode:Option<String>=None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1290,6 +1293,9 @@ fn main() {
                 explain = Some(args[i].clone());
             }
             "--keep" => keep = true,
+            option if option.starts_with("--compiler-subset=") => {
+                compiler_subset_mode=Some(option["--compiler-subset=".len()..].to_string());
+            },
             "--adversarial" => adversarial = true,
             other if other.starts_with("--backend=") => {
                 let name = &other["--backend=".len()..];
@@ -1314,6 +1320,16 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    if let Some(mode)=compiler_subset_mode {
+        match compiler_subset::render(base,&mode) {
+            Ok(value)=>{print!("{value}");return;}
+            Err(error)=>{
+                eprintln!("obgen: {error}");
+                std::process::exit(2);
+            }
+        }
     }
 
     if let Some(var) = &explain {
