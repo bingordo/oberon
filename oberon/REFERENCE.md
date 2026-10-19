@@ -87,8 +87,36 @@ With no file, or with `-`, it reads standard input. With only a source file it p
 | `--backend=c\|clif` | Backend passed to `obc`. Default: `c`. |
 | `--cflag ARG` | Compiler argument passed through to `obc`. Repeatable. |
 | `--keep` | Keep generated work files after a run. |
+| `--compiler-subset=source\|selfcheck\|harness` | Reuse obgen's deterministic seed RNG to generate a restricted INTEGER-procedure test, a self-checking Oberon module for the C/Cranelift backends, or an independent C oracle for the standalone Rust compiler. Use `--base SEED`. |
 
 `--print`, `--explain`, and `--per-statement` use the seed selected by `--base`. Normal runs use `--seed-list` or the `--base`/`--seeds` range.
+
+### Shared compiler-subset differential seeds
+
+The new standalone Rust compiler supports a deliberately narrower subset than
+`obc`'s full Oberon-07 language. The existing full `obgen` suite remains
+unchanged; `--compiler-subset=...` creates deterministic procedures with only
+value INTEGER parameters and locals, 32-bit arithmetic, comparisons,
+IF/ELSIF/ELSE, WHILE, assignments and RETURN.
+
+```sh
+obgen --base 7 --compiler-subset=source > Fuzz.mod
+obgen --base 7 --compiler-subset=selfcheck > Fuzz_reference.mod
+obgen --base 7 --compiler-subset=harness > harness.c
+```
+
+All three outputs for a seed share the same `Fuzz.Probe` function. The
+`selfcheck` variant adds module-initialization assertions for 44 input
+triples, suitable for `obc build ... --backend=c` and
+`--backend=clif`. The C harness checks the same independently interpreted
+values against the new compiler's `Fuzz__Probe` assembly entry point.
+The test values include signed-32-bit boundaries and wrapping arithmetic.
+Any seed reproduces the same procedure and expected values.
+
+This mode is intentionally separate from the full fuzzer's module-variable,
+call, recursion, pointer, heap, trap and sanitizer coverage. Those constructs
+will only be included in cross-backend testing as the new compiler supports
+them.
 
 ## Supported Oberon language
 
