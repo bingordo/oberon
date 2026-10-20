@@ -291,6 +291,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lowers_checked_integer_calls_and_rejects_bad_signatures() {
+        let src="MODULE Calls;
+            PROCEDURE Twice*(n: INTEGER): INTEGER;
+            BEGIN RETURN Add(n,n) END Twice;
+            PROCEDURE Add*(a,b: INTEGER): INTEGER;
+            BEGIN RETURN a+b END Add;
+        END Calls.";
+        let module=lower_module(src).unwrap();
+        assert_eq!(module.functions.len(),2);
+        assert!(matches!(&module.functions[0].body[0],
+            Stmt::Return(Expr::Call{name,args}) if
+                name=="Add" && args.len()==2));
+        let bad="MODULE Calls;
+            PROCEDURE Add*(a,b: INTEGER): INTEGER;
+            BEGIN RETURN a+b END Add;
+            PROCEDURE Wrong*(a: INTEGER): INTEGER;
+            BEGIN RETURN Add(a) END Wrong;
+        END Calls.";
+        assert!(lower_module(bad).is_err());
+        let qualified="MODULE Calls; IMPORT Out;
+            PROCEDURE Wrong*(a: INTEGER): INTEGER;
+            BEGIN Out.Int(a); RETURN a END Wrong;
+        END Calls.";
+        assert!(lower_module(qualified).is_err());
+    }
+
+    #[test]
     fn lowers_checked_arithmetic_procedures() {
         let m = lower_module("MODULE Math; PROCEDURE Sum*(x, y: INTEGER): INTEGER; \
             BEGIN RETURN x + y * 3 END Sum; END Math.").unwrap();
