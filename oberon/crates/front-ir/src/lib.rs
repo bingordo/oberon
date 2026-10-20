@@ -266,6 +266,29 @@ mod tests {
     }
 
     #[test]
+    fn lowers_checked_fixed_arrays_and_indexed_expressions() {
+        let src="MODULE Arrays; PROCEDURE Sum*(n: INTEGER): INTEGER;
+            VAR arr: ARRAY 4 OF INTEGER; other: INTEGER;
+            BEGIN arr[0] := n; arr[1] := arr[0] + 2;
+            other := arr[1]; RETURN other END Sum; END Arrays.";
+        let m=lower_module(src).unwrap();
+        let p=&m.functions[0];
+        assert_eq!(p.arrays,vec![ArrayLocal{name:"arr".into(),length:4}]);
+        assert_eq!(p.locals,vec!["other"]);
+        assert!(matches!(&p.body[0],Stmt::AssignArray{array:0,..}));
+        assert!(matches!(&p.body[1],Stmt::AssignArray{
+            value:Expr::Binary(Op::Add,_,_),..}));
+        let e=lower_module("MODULE A; PROCEDURE T*(x: INTEGER): INTEGER;
+            VAR a: ARRAY 0 OF INTEGER;
+            BEGIN RETURN x END T; END A.");
+        assert!(e.is_err(),"zero-length arrays must not be silently accepted");
+        let e=lower_module("MODULE A; PROCEDURE T*(x: INTEGER): INTEGER;
+            VAR a: ARRAY 2, 3 OF INTEGER;
+            BEGIN RETURN x END T; END A.");
+        assert!(e.is_err(),"multidimensional arrays need separate layout rules");
+    }
+
+    #[test]
     fn type_errors_are_not_ignored() {
         let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
             BEGIN RETURN unknown + x END P; END M.");
