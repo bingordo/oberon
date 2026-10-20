@@ -38,6 +38,8 @@ pub enum Expr {
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
+    /// Checked same-module INTEGER function call, including recursion.
+    Call { name:String, args:Vec<Expr> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,13 +53,46 @@ pub enum Stmt {
     Assign { variable: usize, value: Expr },
     AssignArray { array: usize, index: Expr, value: Expr },
     Return(Expr),
+    /// Evaluate a procedure call for its effect, ignoring its result.
+    Call(Expr),
     If { condition: Expr, then_body: Vec<Stmt>, else_body: Vec<Stmt> },
     While { condition: Expr, body: Vec<Stmt> },
 }
 
+fn lower_call(d:&syntax::ast::Designator,
+              names:&HashMap<&str,usize>,
+              arrays:&HashMap<&str,usize>,
+              functions:&HashMap<String,usize>)->Result<Expr,String> {
+    if d.base.len()!=1 || d.sels.len()!=1 {
+        return Err("unsupported qualified or selected function call".into());
+    }
+    let symbol=&d.base[0];
+    let expected=*functions.get(symbol)
+        .ok_or_else(||format!("unsupported call to non-local function {symbol}"))?;
+    let raw_args=match &d.sels[0] {
+        syntax::ast::Selector::Call(args)=>args.as_slice(),
+        syntax::ast::Selector::Args(args)=>args.as_deref().unwrap_or(&[]),
+        _=>return Err("expected direct function call".into()),
+    };
+    if raw_args.len()!=expected {
+        return Err(format!("{symbol}: call argument count mismatch"));
+    }
+    let mut args=Vec::with_capacity(raw_args.len());
+    for arg in raw_args {
+        args.push(lower_expr(arg,names,arrays,functions)?);
+    }
+    Ok(Expr::Call{name:symbol.clone(),args})
+}
+
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
-              arrays: &HashMap<&str, usize>) -> Result<Expr, String> {
+              arrays: &HashMap<&str, usize>,
+              functions:&HashMap<String,usize>) -> Result<Expr, String> {
     match &expr.kind {
+        ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
+            && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
+                        syntax::ast::Selector::Args(_)) => {
+            lower_call(d,names,arrays,functions)
+        }
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
         ExprKind::Designator(d) if d.sels.is_empty() && d.base.len() == 1 => {
@@ -70,7 +105,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                     let array=*arrays.get(d.base[0].as_str())
                         .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
                     Ok(Expr::ArrayElement {
-                        array,index:Box::new(lower_expr(&indices[0],names,arrays)?),
+                        array,index:Box::new(lower_expr(&indices[0],names, arrays, functions)?),
                     })
                 }
                 _=>Err(format!("unsupported array selector at {}",d.span.lo)),
@@ -89,28 +124,31 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 BinOp::Ge => Op::Ge,
                 _ => return Err(format!("unsupported binary expression: {op:?}")),
             };
-            Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays)?),
-                            Box::new(lower_expr(b, names, arrays)?)))
+            Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays, functions)?),
+                            Box::new(lower_expr(b, names, arrays, functions)?)))
         }
-        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names, arrays),
+        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names, arrays, functions),
         ExprKind::Unary(UnOp::Neg, a) =>
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
-                            Box::new(lower_expr(a, names, arrays)?))),
+                            Box::new(lower_expr(a, names, arrays, functions)?))),
         _ => Err(format!("unsupported expression at {}", expr.span.lo)),
     }
 }
 
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
-              arrays: &HashMap<&str, usize>) -> Result<Vec<Stmt>, String>
+              arrays: &HashMap<&str, usize>,
+              functions:&HashMap<String,usize>) -> Result<Vec<Stmt>, String>
 {
     let mut out = Vec::new();
     for s in stmts {
         match &s.kind {
+            StmtKind::Call(d)=>out.push(Stmt::Call(
+                lower_call(d,names,arrays,functions)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
                 let variable = names.get(target.base[0].as_str()).copied()
                     .ok_or_else(|| format!("unknown local or parameter: {}", target.base[0]))?;
-                out.push(Stmt::Assign { variable, value: lower_expr(value, names, arrays)? });
+                out.push(Stmt::Assign { variable, value: lower_expr(value, names, arrays, functions)? });
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
@@ -120,26 +158,26 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                             .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
                         out.push(Stmt::AssignArray {
                             array,
-                            index:lower_expr(&indices[0],names,arrays)?,
-                            value:lower_expr(value,names,arrays)?,
+                            index:lower_expr(&indices[0],names, arrays, functions)?,
+                            value:lower_expr(value,names, arrays, functions)?,
                         });
                     }
                     _=>return Err(format!("unsupported array assignment at {}",s.span.lo)),
                 }
             }
             StmtKind::Return(Some(e)) =>
-                out.push(Stmt::Return(lower_expr(e, names, arrays)?)),
+                out.push(Stmt::Return(lower_expr(e, names, arrays, functions)?)),
             StmtKind::If { arms, els } => {
                 if arms.is_empty() { return Err("IF with no arm".into()); }
                 let mut tail = match els {
-                    Some(stmts) => lower_stmts(stmts, names, arrays)?,
+                    Some(stmts) => lower_stmts(stmts, names, arrays, functions)?,
                     None => Vec::new(),
                 };
                 // ELSIF is lowered into a nested IF in the previous else arm.
                 for (condition, body) in arms.iter().rev() {
                     tail = vec![Stmt::If {
-                        condition: lower_expr(condition, names, arrays)?,
-                        then_body: lower_stmts(body, names, arrays)?,
+                        condition: lower_expr(condition, names, arrays, functions)?,
+                        then_body: lower_stmts(body, names, arrays, functions)?,
                         else_body: tail,
                     }];
                 }
@@ -148,8 +186,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
             StmtKind::While { arms } if arms.len() == 1 => {
                 let (condition, body) = &arms[0];
                 out.push(Stmt::While {
-                    condition: lower_expr(condition, names, arrays)?,
-                    body: lower_stmts(body, names, arrays)?,
+                    condition: lower_expr(condition, names, arrays, functions)?,
+                    body: lower_stmts(body, names, arrays, functions)?,
                 });
             }
             _ => return Err(format!("unsupported Oberon statement at {}", s.span.lo)),
@@ -172,6 +210,15 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err("module imports, declarations and initialization are not yet supported".into());
     }
 
+    // Predeclare direct-call signatures before lowering bodies, so forward
+    // references and recursive calls resolve without introducing imports.
+    let mut signatures=HashMap::<String,usize>::new();
+    for proc in &module.decls.procs {
+        let count=proc.params.iter().map(|section|section.names.len()).sum();
+        if signatures.insert(proc.name.clone(),count).is_some() {
+            return Err(format!("duplicate procedure {}",proc.name));
+        }
+    }
     let mut functions = Vec::new();
     for proc in &module.decls.procs {
         if !matches!(proc.result.as_deref(), Some([t]) if t == "INTEGER") {
@@ -217,7 +264,7 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
             .enumerate().map(|(i, name)| (name.as_str(), i)).collect();
         let arrays:HashMap<_,_>=fixed_arrays.iter().enumerate()
             .map(|(i,a)|(a.name.as_str(),i)).collect();
-        let body = lower_stmts(&proc.body, &names, &arrays)?;
+        let body = lower_stmts(&proc.body, &names, &arrays, &signatures)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
         if !contains_return(&body) {
