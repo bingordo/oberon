@@ -92,7 +92,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
             Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays)?),
                             Box::new(lower_expr(b, names, arrays)?)))
         }
-        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names),
+        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names, arrays),
         ExprKind::Unary(UnOp::Neg, a) =>
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
                             Box::new(lower_expr(a, names, arrays)?))),
@@ -200,14 +200,14 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
                     matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
                     // Do not invent a constant evaluator or assume a stride
                     // for a non-integer/multidimensional element type.
-                    let ExprKind::Int(length)=dims[0].kind else {
+                    let ExprKind::Int(length)=&dims[0].kind else {
                         return Err(format!("{}: array length must be an INTEGER literal",proc.name));
                     };
-                    if length==0 || length>1024 {
+                    if *length==0 || *length>1024 {
                         return Err(format!("{}: array length must be within 1..=1024",proc.name));
                     }
                     for (name,_) in &decl.names {
-                        fixed_arrays.push(ArrayLocal{name:name.clone(),length});
+                        fixed_arrays.push(ArrayLocal{name:name.clone(),length:*length});
                     }
                 }
                 _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
