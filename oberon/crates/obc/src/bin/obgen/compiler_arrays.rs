@@ -169,10 +169,10 @@ mod tests {
     }
     #[test]
     fn seeds_cover_short_and_large_array_layouts(){
-        let lengths:(Vec<usize>)=(1..100).map(|seed|
+        let lengths:Vec<usize>=(1..100).map(|seed|
             ArrayCase::generate(seed).len).collect();
         for length in LENGTHS {assert!(lengths.contains(&length));}
-        let varied:(Vec<_>)=(1..12).map(|seed|
+        let varied:Vec<_>=(1..12).map(|seed|
             ArrayCase::generate(seed).expected(7,-3,15)).collect();
         assert!(varied.windows(2).any(|w|w[0]!=w[1]));
     }
