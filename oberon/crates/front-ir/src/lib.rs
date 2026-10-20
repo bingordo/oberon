@@ -197,7 +197,10 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
 }
 
 /// Parse/type-check in process, then export a small checked procedure subset.
-/// Module imports and external/runtime references are not implemented.
+/// Same-module integer calls, including forward and recursive calls, are
+/// projected only when the callee signature is supported (up to six value
+/// INTEGER parameters). Module imports and external/runtime references are
+/// not implemented.
 pub fn lower_module(source: &str) -> Result<Module, String> {
     let (checked, diagnostics) = sema::check_module_recovering(source, &[]);
     if let Some(d) = diagnostics.iter().find(|d| d.is_error()) {
