@@ -197,7 +197,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
 }
 
 /// Parse/type-check in process, then export a small checked procedure subset.
-/// Same-module integer calls, including forward and recursive calls, are
+/// Same-module integer calls to declared functions and recursive calls are
 /// projected only when the callee signature is supported (up to six value
 /// INTEGER parameters). Module imports and external/runtime references are
 /// not implemented.
@@ -213,8 +213,9 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err("module imports, declarations and initialization are not yet supported".into());
     }
 
-    // Predeclare direct-call signatures before lowering bodies, so forward
-    // references and recursive calls resolve without introducing imports.
+    // Collect the checked signatures before lowering procedure bodies. The
+    // Oberon semantic checker already enforces source declaration order;
+    // this map does not authorize forward references.
     let mut signatures=HashMap::<String,usize>::new();
     for proc in &module.decls.procs {
         let count=proc.params.iter().map(|section|section.names.len()).sum();
@@ -296,14 +297,14 @@ mod tests {
     #[test]
     fn lowers_checked_integer_calls_and_rejects_bad_signatures() {
         let src="MODULE Calls;
-            PROCEDURE Twice*(n: INTEGER): INTEGER;
-            BEGIN RETURN Add(n,n) END Twice;
             PROCEDURE Add*(a,b: INTEGER): INTEGER;
             BEGIN RETURN a+b END Add;
+            PROCEDURE Twice*(n: INTEGER): INTEGER;
+            BEGIN RETURN Add(n,n) END Twice;
         END Calls.";
         let module=lower_module(src).unwrap();
         assert_eq!(module.functions.len(),2);
-        assert!(matches!(&module.functions[0].body[0],
+        assert!(matches!(&module.functions[1].body[0],
             Stmt::Return(Expr::Call{name,args}) if
                 name=="Add" && args.len()==2));
         let bad="MODULE Calls;
