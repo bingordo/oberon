@@ -19,12 +19,22 @@ pub struct Function {
     pub parameters: Vec<String>,
     /// Zero-initialized INTEGER locals, in source order.
     pub locals: Vec<String>,
+    /// Fixed-size single-dimensional local INTEGER arrays. Nonzero lengths.
+    pub arrays: Vec<ArrayLocal>,
     pub body: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayLocal {
+    pub name: String,
+    pub length: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Variable(usize),
+    /// Index into Function.arrays; the subscript is a checked INTEGER expr.
+    ArrayElement { array: usize, index: Box<Expr> },
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
@@ -39,12 +49,14 @@ pub enum Op {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
     Assign { variable: usize, value: Expr },
+    AssignArray { array: usize, index: Expr, value: Expr },
     Return(Expr),
     If { condition: Expr, then_body: Vec<Stmt>, else_body: Vec<Stmt> },
     While { condition: Expr, body: Vec<Stmt> },
 }
 
-fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>) -> Result<Expr, String> {
+fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
+              arrays: &HashMap<&str, usize>) -> Result<Expr, String> {
     match &expr.kind {
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
@@ -52,6 +64,18 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>) -> Result<Expr, S
             names.get(d.base[0].as_str()).copied().map(Expr::Variable)
                 .ok_or_else(|| format!("unsupported variable or constant: {}", d.base[0]))
         }
+        ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1 => {
+            match &d.sels[0] {
+                syntax::ast::Selector::Index(indices) if indices.len()==1 => {
+                    let array=*arrays.get(d.base[0].as_str())
+                        .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
+                    Ok(Expr::ArrayElement {
+                        array,index:Box::new(lower_expr(&indices[0],names,arrays)?),
+                    })
+                }
+                _=>Err(format!("unsupported array selector at {}",d.span.lo)),
+            }
+        },
         ExprKind::Binary(op, a, b) => {
             let op = match op {
                 BinOp::Add => Op::Add,
@@ -65,19 +89,19 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>) -> Result<Expr, S
                 BinOp::Ge => Op::Ge,
                 _ => return Err(format!("unsupported binary expression: {op:?}")),
             };
-            Ok(Expr::Binary(op, Box::new(lower_expr(a, names)?),
-                            Box::new(lower_expr(b, names)?)))
+            Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays)?),
+                            Box::new(lower_expr(b, names, arrays)?)))
         }
         ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names),
         ExprKind::Unary(UnOp::Neg, a) =>
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
-                            Box::new(lower_expr(a, names)?))),
+                            Box::new(lower_expr(a, names, arrays)?))),
         _ => Err(format!("unsupported expression at {}", expr.span.lo)),
     }
 }
 
-fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>)
-    -> Result<Vec<Stmt>, String>
+fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
+              arrays: &HashMap<&str, usize>) -> Result<Vec<Stmt>, String>
 {
     let mut out = Vec::new();
     for s in stmts {
@@ -86,21 +110,36 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>)
                                                    target.base.len() == 1 => {
                 let variable = names.get(target.base[0].as_str()).copied()
                     .ok_or_else(|| format!("unknown local or parameter: {}", target.base[0]))?;
-                out.push(Stmt::Assign { variable, value: lower_expr(value, names)? });
+                out.push(Stmt::Assign { variable, value: lower_expr(value, names, arrays)? });
+            }
+            StmtKind::Assign { target, value } if target.base.len()==1 &&
+                                                    target.sels.len()==1 => {
+                match &target.sels[0] {
+                    syntax::ast::Selector::Index(indices) if indices.len()==1 => {
+                        let array=*arrays.get(target.base[0].as_str())
+                            .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
+                        out.push(Stmt::AssignArray {
+                            array,
+                            index:lower_expr(&indices[0],names,arrays)?,
+                            value:lower_expr(value,names,arrays)?,
+                        });
+                    }
+                    _=>return Err(format!("unsupported array assignment at {}",s.span.lo)),
+                }
             }
             StmtKind::Return(Some(e)) =>
-                out.push(Stmt::Return(lower_expr(e, names)?)),
+                out.push(Stmt::Return(lower_expr(e, names, arrays)?)),
             StmtKind::If { arms, els } => {
                 if arms.is_empty() { return Err("IF with no arm".into()); }
                 let mut tail = match els {
-                    Some(stmts) => lower_stmts(stmts, names)?,
+                    Some(stmts) => lower_stmts(stmts, names, arrays)?,
                     None => Vec::new(),
                 };
                 // ELSIF is lowered into a nested IF in the previous else arm.
                 for (condition, body) in arms.iter().rev() {
                     tail = vec![Stmt::If {
-                        condition: lower_expr(condition, names)?,
-                        then_body: lower_stmts(body, names)?,
+                        condition: lower_expr(condition, names, arrays)?,
+                        then_body: lower_stmts(body, names, arrays)?,
                         else_body: tail,
                     }];
                 }
@@ -109,8 +148,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>)
             StmtKind::While { arms } if arms.len() == 1 => {
                 let (condition, body) = &arms[0];
                 out.push(Stmt::While {
-                    condition: lower_expr(condition, names)?,
-                    body: lower_stmts(body, names)?,
+                    condition: lower_expr(condition, names, arrays)?,
+                    body: lower_stmts(body, names, arrays)?,
                 });
             }
             _ => return Err(format!("unsupported Oberon statement at {}", s.span.lo)),
@@ -151,21 +190,41 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
             for (name, _) in &section.names { parameters.push(name.clone()); }
         }
         let mut locals = Vec::new();
+        let mut fixed_arrays = Vec::new();
         for decl in &proc.decls.vars {
-            if !matches!(&decl.ty, TypeExpr::Named(q, _) if q.as_slice() == ["INTEGER"]) {
-                return Err(format!("{}: only INTEGER local variables are supported", proc.name));
+            match &decl.ty {
+                TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
+                    for (name,_) in &decl.names {locals.push(name.clone());}
+                }
+                TypeExpr::Array{dims,elem,..} if dims.len()==1 &&
+                    matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
+                    // Do not invent a constant evaluator or assume a stride
+                    // for a non-integer/multidimensional element type.
+                    let ExprKind::Int(length)=dims[0].kind else {
+                        return Err(format!("{}: array length must be an INTEGER literal",proc.name));
+                    };
+                    if length==0 || length>1024 {
+                        return Err(format!("{}: array length must be within 1..=1024",proc.name));
+                    }
+                    for (name,_) in &decl.names {
+                        fixed_arrays.push(ArrayLocal{name:name.clone(),length});
+                    }
+                }
+                _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
             }
-            for (name, _) in &decl.names { locals.push(name.clone()); }
         }
         let names: HashMap<_, _> = parameters.iter().chain(locals.iter())
             .enumerate().map(|(i, name)| (name.as_str(), i)).collect();
-        let body = lower_stmts(&proc.body, &names)?;
+        let arrays:HashMap<_,_>=fixed_arrays.iter().enumerate()
+            .map(|(i,a)|(a.name.as_str(),i)).collect();
+        let body = lower_stmts(&proc.body, &names, &arrays)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
         if !contains_return(&body) {
             return Err(format!("{}: function must return a value", proc.name));
         }
-        functions.push(Function { name: proc.name.clone(), parameters, locals, body });
+        functions.push(Function { name: proc.name.clone(), parameters, locals,
+                                  arrays:fixed_arrays, body });
     }
     if functions.is_empty() { return Err("no supported procedures in module".into()); }
     Ok(Module { name: module.name, functions })
