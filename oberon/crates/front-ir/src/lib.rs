@@ -198,7 +198,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
 
 /// Parse/type-check in process, then export a small checked procedure subset.
 /// Same-module integer calls to declared functions and recursive calls are
-/// projected only when the callee signature is supported (up to six value
+/// projected only when the callee signature is supported (up to sixteen value
 /// INTEGER parameters). Module imports and external/runtime references are
 /// not implemented.
 pub fn lower_module(source: &str) -> Result<Module, String> {
