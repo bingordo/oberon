@@ -307,6 +307,15 @@ mod tests {
         assert!(matches!(&module.functions[1].body[0],
             Stmt::Return(Expr::Call{name,args}) if
                 name=="Add" && args.len()==2));
+        // The semantic checker follows Oberon's declaration-order rule:
+        // calling a later procedure without a prior declaration is invalid.
+        let forward="MODULE Calls;
+            PROCEDURE Twice*(n: INTEGER): INTEGER;
+            BEGIN RETURN Add(n,n) END Twice;
+            PROCEDURE Add*(a,b: INTEGER): INTEGER;
+            BEGIN RETURN a+b END Add;
+        END Calls.";
+        assert!(lower_module(forward).is_err());
         let bad="MODULE Calls;
             PROCEDURE Add*(a,b: INTEGER): INTEGER;
             BEGIN RETURN a+b END Add;
