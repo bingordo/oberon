@@ -2,11 +2,10 @@
 resolver = "2"
 members = ["crates/*"]
 
-# Pinned in one place (DESIGN §2): `lalrpop` and `lalrpop-util` must be at the
-# same version, and only `syntax` may name either.
+# The LALRPOP generator lives in tools/parser-codegen; ordinary builds
+# only use its lightweight runtime with the handwritten Oberon lexer.
 [workspace.dependencies]
-lalrpop = "0.23"
-lalrpop-util = { version = "0.23", features = ["lexer", "unicode"] }
+lalrpop-util = { version = "=0.23.1", default-features = false }
 cranelift-codegen = "0.136"
 cranelift-frontend = "0.136"
 cranelift-module = "0.136"

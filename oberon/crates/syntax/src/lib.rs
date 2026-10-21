@@ -13,7 +13,9 @@ pub mod lexer;
 // LALRPOP's generated parser takes `&mut Vec<ErrorRecovery<..>>` for the
 // recovery hook, which is its API, not a choice of ours: `clippy::ptr_arg`
 // fires 244 times inside the generated file and nowhere in ours (PLAN.md W0.1).
-lalrpop_util::lalrpop_mod!(#[allow(clippy::ptr_arg)] pub oberon);
+#[path = "oberon.rs"]
+#[allow(clippy::ptr_arg)]
+pub mod oberon;
 
 use ast::{Module, TypeExpr};
 use lexer::{Lexer, LexicalError, Token};

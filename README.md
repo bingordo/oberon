@@ -77,3 +77,18 @@ The C back end uses these required base flags:
 
 `-fwrapv` ensures Oberon's `INTEGER` wraps, as specified in the design (section 9.1, R4),
 instead of leaving it to C.
+
+## Updating the Oberon grammar
+
+Normal builds use a checked-in generated parser and do not run LALRPOP.
+Edit `oberon/crates/syntax/src/oberon.lalrpop`, then run:
+
+```sh
+cargo run --manifest-path oberon/tools/parser-codegen/Cargo.toml -- --write
+cargo run --manifest-path oberon/tools/parser-codegen/Cargo.toml -- --check
+cargo test --manifest-path oberon/Cargo.toml -p syntax -p sema -p oberon-front-ir
+```
+
+Commit the grammar and generated `src/oberon.rs` together. The generation
+tool is an independent Cargo workspace, intentionally absent from normal
+build dependency resolution.

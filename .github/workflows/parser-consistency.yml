@@ -1,0 +1,22 @@
+name: Oberon parser consistency
+on:
+  pull_request:
+    paths:
+      - 'oberon/crates/syntax/src/oberon.lalrpop'
+      - 'oberon/crates/syntax/src/oberon.rs'
+      - 'oberon/tools/parser-codegen/**'
+      - '.github/workflows/parser-consistency.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  generated-parser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oberon/tools/parser-codegen -> target
+      - run: cargo run --manifest-path oberon/tools/parser-codegen/Cargo.toml -- --check
+      - run: cargo test --manifest-path oberon/Cargo.toml -p syntax -p sema -p oberon-front-ir

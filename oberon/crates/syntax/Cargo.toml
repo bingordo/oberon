@@ -3,8 +3,5 @@ name = "syntax"
 version = "0.1.0"
 edition = "2021"
 
-[build-dependencies]
-lalrpop = { workspace = true }
-
 [dependencies]
 lalrpop-util = { workspace = true }
