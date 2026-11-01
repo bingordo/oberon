@@ -13,8 +13,11 @@ pub mod lexer;
 // LALRPOP's generated parser takes `&mut Vec<ErrorRecovery<..>>` for the
 // recovery hook, which is its API, not a choice of ours: `clippy::ptr_arg`
 // fires 244 times inside the generated file and nowhere in ours (PLAN.md W0.1).
+// Recent Clippy also warns about `let __nt = ...` in parser actions whose
+// generated semantic value is unit. Both lints originate in generated code,
+// so keep their suppression scoped to that module rather than handwritten Rust.
 #[path = "oberon.rs"]
-#[allow(clippy::ptr_arg)]
+#[allow(clippy::ptr_arg, clippy::let_unit_value)]
 pub mod oberon;
 
 use ast::{Module, TypeExpr};
