@@ -9,7 +9,17 @@ use syntax::ast::{BinOp, Expr as OberonExpr, ExprKind, Stmt as OberonStmt,
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Module {
     pub name: String,
+    /// Module-level INTEGER objects, in source order.
+    pub globals: Vec<Global>,
     pub functions: Vec<Function>,
+}
+
+/// Exported module objects are linker-visible; private objects keep local
+/// linkage. The bridge currently supports zero-initialized INTEGER only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Global {
+    pub name: String,
+    pub exported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +31,9 @@ pub struct Function {
     pub locals: Vec<String>,
     /// Fixed-size single-dimensional local INTEGER arrays. Nonzero lengths.
     pub arrays: Vec<ArrayLocal>,
+    /// Ordered module globals. Variable indexes after parameters and
+    /// local scalar variables refer to this list (never to frame slots).
+    pub globals: Vec<String>,
     pub body: Vec<Stmt>,
 }
 
@@ -208,9 +221,17 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
     }
     let module = checked.ok_or("Oberon parser did not produce a module")?;
     if !module.imports.is_empty() || !module.body.is_empty() ||
-       !module.decls.vars.is_empty() || !module.decls.consts.is_empty() ||
-       !module.decls.types.is_empty() {
-        return Err("module imports, declarations and initialization are not yet supported".into());
+       !module.decls.consts.is_empty() || !module.decls.types.is_empty() {
+        return Err("module imports, constants, types or initialization are not yet supported".into());
+    }
+    let mut globals = Vec::<Global>::new();
+    for decl in &module.decls.vars {
+        if !matches!(&decl.ty, TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
+            return Err("only scalar INTEGER module globals are supported".into());
+        }
+        for (name, exported) in &decl.names {
+            globals.push(Global { name: name.clone(), exported: *exported });
+        }
     }
 
     // Collect the checked signatures before lowering procedure bodies. The
@@ -264,8 +285,15 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
                 _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
             }
         }
-        let names: HashMap<_, _> = parameters.iter().chain(locals.iter())
-            .enumerate().map(|(i, name)| (name.as_str(), i)).collect();
+        // Modules and procedures use separate scopes: a local or parameter
+        // shadows a global of the same name. Global indexes begin after
+        // the complete local scalar index range.
+        let mut names: HashMap<&str, usize> = globals.iter().enumerate()
+            .map(|(i, g)| (g.name.as_str(), parameters.len() + locals.len() + i))
+            .collect();
+        for (i, name) in parameters.iter().chain(locals.iter()).enumerate() {
+            names.insert(name.as_str(), i);
+        }
         let arrays:HashMap<_,_>=fixed_arrays.iter().enumerate()
             .map(|(i,a)|(a.name.as_str(),i)).collect();
         let body = lower_stmts(&proc.body, &names, &arrays, &signatures)?;
@@ -275,10 +303,12 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
             return Err(format!("{}: function must return a value", proc.name));
         }
         functions.push(Function { name: proc.name.clone(), parameters, locals,
-                                  arrays:fixed_arrays, body });
+                                  arrays:fixed_arrays,
+                                  globals: globals.iter().map(|g| g.name.clone()).collect(),
+                                  body });
     }
     if functions.is_empty() { return Err("no supported procedures in module".into()); }
-    Ok(Module { name: module.name, functions })
+    Ok(Module { name: module.name, globals, functions })
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
