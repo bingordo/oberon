@@ -413,6 +413,48 @@ mod tests {
     }
 
     #[test]
+    fn module_integer_globals_and_local_shadowing() {
+        let source="MODULE Globals;
+            VAR counter*, private: INTEGER;
+            PROCEDURE Add*(step: INTEGER): INTEGER;
+            BEGIN counter := counter + step; RETURN counter END Add;
+            PROCEDURE Shadow*(step: INTEGER): INTEGER;
+            VAR counter: INTEGER;
+            BEGIN counter := step + 7; RETURN counter END Shadow;
+            PROCEDURE Private*(step: INTEGER): INTEGER;
+            BEGIN private := private + step; RETURN private END Private;
+            END Globals.";
+        let module=lower_module(source).unwrap();
+        assert_eq!(module.globals, vec![
+            Global{name:"counter".into(),exported:true},
+            Global{name:"private".into(),exported:false},
+        ]);
+        assert_eq!(module.functions.len(), 3);
+        assert_eq!(module.functions[0].globals, ["counter", "private"]);
+        let add=&module.functions[0];
+        // One value parameter, no locals: global counter is index 1.
+        assert!(matches!(&add.body[0], Stmt::Assign{variable:1,..}));
+        let shadow=&module.functions[1];
+        // One param, one local: local counter is index 1, module
+        // counter is index 2 and must NOT be used by this procedure.
+        assert!(matches!(&shadow.body[0],Stmt::Assign{variable:1,..}));
+        let private=&module.functions[2];
+        assert!(matches!(&private.body[0],Stmt::Assign{variable:2,..}));
+    }
+
+    #[test]
+    fn unsupported_global_types_are_rejected() {
+        let array="MODULE M; VAR a: ARRAY 3 OF INTEGER;
+            PROCEDURE R*(v: INTEGER): INTEGER;
+            BEGIN RETURN v END R; END M.";
+        assert!(lower_module(array).unwrap_err().contains("scalar INTEGER module globals"));
+        let real="MODULE M; VAR a: REAL;
+            PROCEDURE R*(v: INTEGER): INTEGER;
+            BEGIN RETURN v END R; END M.";
+        assert!(lower_module(real).is_err());
+    }
+
+    #[test]
     fn unsupported_operations_fail_closed() {
         let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
             BEGIN RETURN x DIV 3 END P; END M.");
