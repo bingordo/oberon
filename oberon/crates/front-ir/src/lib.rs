@@ -307,7 +307,9 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
-    if functions.is_empty() { return Err("no supported procedures in module".into()); }
+    if functions.is_empty() && globals.is_empty() {
+        return Err("module has no supported procedures or INTEGER globals".into());
+    }
     Ok(Module { name: module.name, globals, functions })
 }
 
@@ -440,6 +442,16 @@ mod tests {
         assert!(matches!(&shadow.body[0],Stmt::Assign{variable:1,..}));
         let private=&module.functions[2];
         assert!(matches!(&private.body[0],Stmt::Assign{variable:2,..}));
+    }
+
+    #[test]
+    fn module_with_only_global_storage_is_a_valid_data_translation_unit() {
+        let m=lower_module("MODULE Data; VAR counter*, hidden: INTEGER; END Data.").unwrap();
+        assert!(m.functions.is_empty());
+        assert_eq!(m.globals,vec![
+            Global{name:"counter".into(),exported:true},
+            Global{name:"hidden".into(),exported:false},
+        ]);
     }
 
     #[test]
