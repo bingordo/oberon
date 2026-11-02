@@ -528,10 +528,10 @@ mod tests {
 
     #[test]
     fn unsupported_global_types_are_rejected() {
-        let array="MODULE M; VAR a: ARRAY 3 OF INTEGER;
+        let array="MODULE M; VAR a: ARRAY 3, 2 OF INTEGER;
             PROCEDURE R*(v: INTEGER): INTEGER;
             BEGIN RETURN v END R; END M.";
-        assert!(lower_module(array).unwrap_err().contains("scalar INTEGER module globals"));
+        assert!(lower_module(array).unwrap_err().contains("fixed INTEGER arrays"));
         let real="MODULE M; VAR a: REAL;
             PROCEDURE R*(v: INTEGER): INTEGER;
             BEGIN RETURN v END R; END M.";
