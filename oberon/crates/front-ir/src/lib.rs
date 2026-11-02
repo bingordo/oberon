@@ -11,6 +11,7 @@ pub struct Module {
     pub name: String,
     /// Module-level INTEGER objects, in source order.
     pub globals: Vec<Global>,
+    pub global_arrays: Vec<ArrayGlobal>,
     pub functions: Vec<Function>,
 }
 
@@ -19,6 +20,14 @@ pub struct Module {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Global {
     pub name: String,
+    pub exported: bool,
+}
+
+/// Zero-initialized, bounds-checked module INTEGER array.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayGlobal {
+    pub name: String,
+    pub length: u32,
     pub exported: bool,
 }
 
@@ -31,6 +40,8 @@ pub struct Function {
     pub locals: Vec<String>,
     /// Fixed-size single-dimensional local INTEGER arrays. Nonzero lengths.
     pub arrays: Vec<ArrayLocal>,
+    /// Module arrays follow locals in array-index numbering.
+    pub global_arrays: Vec<ArrayGlobal>,
     /// Ordered module globals. Variable indexes after parameters and
     /// local scalar variables refer to this list (never to frame slots).
     pub globals: Vec<String>,
@@ -307,10 +318,10 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
-    if functions.is_empty() && globals.is_empty() {
+    if functions.is_empty() && globals.is_empty() && global_arrays.is_empty() {
         return Err("module has no supported procedures or INTEGER globals".into());
     }
-    Ok(Module { name: module.name, globals, functions })
+    Ok(Module { name: module.name, globals, global_arrays, functions })
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
