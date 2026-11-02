@@ -13,6 +13,8 @@ pub struct Module {
     pub globals: Vec<Global>,
     pub global_arrays: Vec<ArrayGlobal>,
     pub functions: Vec<Function>,
+    /// Checked module BEGIN body; emitted as a private constructor.
+    pub initializer: Option<Function>,
 }
 
 /// Exported module objects are linker-visible; private objects keep local
