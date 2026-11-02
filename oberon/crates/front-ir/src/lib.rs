@@ -489,6 +489,44 @@ mod tests {
     }
 
     #[test]
+    fn checked_module_arrays_support_reads_stores_and_local_shadowing() {
+        let src="MODULE Arrays;
+            VAR shared*: ARRAY 4 OF INTEGER; hidden: ARRAY 3 OF INTEGER;
+            PROCEDURE Update*(n: INTEGER): INTEGER;
+            BEGIN shared[1] := n; hidden[2] := shared[1] + 2;
+            RETURN hidden[2] END Update;
+            PROCEDURE Shadow*(n: INTEGER): INTEGER;
+            VAR shared: ARRAY 2 OF INTEGER;
+            BEGIN shared[0] := n; RETURN shared[0] END Shadow;
+            END Arrays.";
+        let module=lower_module(src).unwrap();
+        assert_eq!(module.global_arrays, vec![
+            ArrayGlobal{name:"shared".into(),length:4,exported:true},
+            ArrayGlobal{name:"hidden".into(),length:3,exported:false},
+        ]);
+        assert!(module.globals.is_empty());
+        let update=&module.functions[0];
+        assert!(update.arrays.is_empty());
+        assert!(matches!(&update.body[0],Stmt::AssignArray{array:0,..}));
+        assert!(matches!(&update.body[1],Stmt::AssignArray{array:1,..}));
+        let shadow=&module.functions[1];
+        assert_eq!(shadow.arrays.len(),1);
+        assert!(matches!(&shadow.body[0],Stmt::AssignArray{array:0,..}));
+        assert_eq!(shadow.global_arrays.len(),2);
+    }
+
+    #[test]
+    fn data_only_array_module_is_accepted_but_unsupported_extents_are_rejected() {
+        let module=lower_module("MODULE Data; VAR values*: ARRAY 8 OF INTEGER; END Data.").unwrap();
+        assert!(module.functions.is_empty());
+        assert_eq!(module.global_arrays[0].length,8);
+        for dim in ["0", "1025", "2, 2"] {
+            let src=format!("MODULE Data; VAR values: ARRAY {dim} OF INTEGER; END Data.");
+            assert!(lower_module(&src).is_err());
+        }
+    }
+
+    #[test]
     fn unsupported_global_types_are_rejected() {
         let array="MODULE M; VAR a: ARRAY 3 OF INTEGER;
             PROCEDURE R*(v: INTEGER): INTEGER;
