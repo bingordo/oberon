@@ -322,8 +322,13 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         for (i, name) in parameters.iter().chain(locals.iter()).enumerate() {
             names.insert(name.as_str(), i);
         }
-        let arrays:HashMap<_,_>=fixed_arrays.iter().enumerate()
-            .map(|(i,a)|(a.name.as_str(),i)).collect();
+        // Local array names shadow module array names; global arrays
+        // follow local arrays in the checked bridge's array index space.
+        let mut arrays:HashMap<&str,usize>=global_arrays.iter().enumerate()
+            .map(|(i,a)|(a.name.as_str(),fixed_arrays.len()+i)).collect();
+        for (i, array) in fixed_arrays.iter().enumerate() {
+            arrays.insert(array.name.as_str(), i);
+        }
         let body = lower_stmts(&proc.body, &names, &arrays, &signatures)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
@@ -332,6 +337,7 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         }
         functions.push(Function { name: proc.name.clone(), parameters, locals,
                                   arrays:fixed_arrays,
+                                  global_arrays:global_arrays.clone(),
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
