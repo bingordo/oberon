@@ -343,10 +343,32 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
-    if functions.is_empty() && globals.is_empty() && global_arrays.is_empty() {
-        return Err("module has no supported procedures or INTEGER globals".into());
+    let initializer = if module.body.is_empty() {
+        None
+    } else {
+        // Module code has no parameters or function-local variables. Only
+        // verified module globals are legal roots for assignments/indexing.
+        let names: HashMap<&str, usize> = globals.iter().enumerate()
+            .map(|(i, item)| (item.name.as_str(), i)).collect();
+        let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
+            .map(|(i, item)| (item.name.as_str(), i)).collect();
+        let body = lower_stmts(&module.body, &names, &arrays, &signatures)?;
+        if contains_return(&body) {
+            return Err("module initialization cannot return a value".into());
+        }
+        Some(Function {
+            name: "__module_init".into(),
+            parameters: Vec::new(), locals: Vec::new(), arrays: Vec::new(),
+            global_arrays: global_arrays.clone(),
+            globals: globals.iter().map(|g| g.name.clone()).collect(),
+            body,
+        })
+    };
+    if functions.is_empty() && globals.is_empty() && global_arrays.is_empty()
+        && initializer.is_none() {
+        return Err("module has no supported procedures, globals or initialization".into());
     }
-    Ok(Module { name: module.name, globals, global_arrays, functions })
+    Ok(Module { name: module.name, globals, global_arrays, functions, initializer })
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
