@@ -11,6 +11,7 @@ pub struct Module {
     pub name: String,
     /// Module-level INTEGER objects, in source order.
     pub globals: Vec<Global>,
+    pub global_arrays: Vec<ArrayGlobal>,
     pub functions: Vec<Function>,
 }
 
@@ -19,6 +20,14 @@ pub struct Module {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Global {
     pub name: String,
+    pub exported: bool,
+}
+
+/// Zero-initialized, bounds-checked module INTEGER array.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayGlobal {
+    pub name: String,
+    pub length: u32,
     pub exported: bool,
 }
 
@@ -31,6 +40,8 @@ pub struct Function {
     pub locals: Vec<String>,
     /// Fixed-size single-dimensional local INTEGER arrays. Nonzero lengths.
     pub arrays: Vec<ArrayLocal>,
+    /// Module arrays follow locals in array-index numbering.
+    pub global_arrays: Vec<ArrayGlobal>,
     /// Ordered module globals. Variable indexes after parameters and
     /// local scalar variables refer to this list (never to frame slots).
     pub globals: Vec<String>,
@@ -225,12 +236,29 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err("module imports, constants, types or initialization are not yet supported".into());
     }
     let mut globals = Vec::<Global>::new();
+    let mut global_arrays = Vec::<ArrayGlobal>::new();
     for decl in &module.decls.vars {
-        if !matches!(&decl.ty, TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
-            return Err("only scalar INTEGER module globals are supported".into());
-        }
-        for (name, exported) in &decl.names {
-            globals.push(Global { name: name.clone(), exported: *exported });
+        match &decl.ty {
+            TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
+                for (name, exported) in &decl.names {
+                    globals.push(Global { name: name.clone(), exported: *exported });
+                }
+            }
+            TypeExpr::Array { dims, elem, .. } if dims.len()==1 &&
+                matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
+                let ExprKind::Int(length)=&dims[0].kind else {
+                    return Err("module array length must be an INTEGER literal".into());
+                };
+                if *length == 0 || *length > 1024 {
+                    return Err("module array length must be within 1..=1024".into());
+                }
+                for (name, exported) in &decl.names {
+                    global_arrays.push(ArrayGlobal {
+                        name: name.clone(), length: *length, exported: *exported,
+                    });
+                }
+            }
+            _ => return Err("only INTEGER globals and fixed INTEGER arrays are supported".into()),
         }
     }
 
@@ -294,8 +322,13 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         for (i, name) in parameters.iter().chain(locals.iter()).enumerate() {
             names.insert(name.as_str(), i);
         }
-        let arrays:HashMap<_,_>=fixed_arrays.iter().enumerate()
-            .map(|(i,a)|(a.name.as_str(),i)).collect();
+        // Local array names shadow module array names; global arrays
+        // follow local arrays in the checked bridge's array index space.
+        let mut arrays:HashMap<&str,usize>=global_arrays.iter().enumerate()
+            .map(|(i,a)|(a.name.as_str(),fixed_arrays.len()+i)).collect();
+        for (i, array) in fixed_arrays.iter().enumerate() {
+            arrays.insert(array.name.as_str(), i);
+        }
         let body = lower_stmts(&proc.body, &names, &arrays, &signatures)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
@@ -304,13 +337,14 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         }
         functions.push(Function { name: proc.name.clone(), parameters, locals,
                                   arrays:fixed_arrays,
+                                  global_arrays:global_arrays.clone(),
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
-    if functions.is_empty() && globals.is_empty() {
+    if functions.is_empty() && globals.is_empty() && global_arrays.is_empty() {
         return Err("module has no supported procedures or INTEGER globals".into());
     }
-    Ok(Module { name: module.name, globals, functions })
+    Ok(Module { name: module.name, globals, global_arrays, functions })
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
@@ -455,11 +489,49 @@ mod tests {
     }
 
     #[test]
+    fn checked_module_arrays_support_reads_stores_and_local_shadowing() {
+        let src="MODULE Arrays;
+            VAR shared*: ARRAY 4 OF INTEGER; hidden: ARRAY 3 OF INTEGER;
+            PROCEDURE Update*(n: INTEGER): INTEGER;
+            BEGIN shared[1] := n; hidden[2] := shared[1] + 2;
+            RETURN hidden[2] END Update;
+            PROCEDURE Shadow*(n: INTEGER): INTEGER;
+            VAR shared: ARRAY 2 OF INTEGER;
+            BEGIN shared[0] := n; RETURN shared[0] END Shadow;
+            END Arrays.";
+        let module=lower_module(src).unwrap();
+        assert_eq!(module.global_arrays, vec![
+            ArrayGlobal{name:"shared".into(),length:4,exported:true},
+            ArrayGlobal{name:"hidden".into(),length:3,exported:false},
+        ]);
+        assert!(module.globals.is_empty());
+        let update=&module.functions[0];
+        assert!(update.arrays.is_empty());
+        assert!(matches!(&update.body[0],Stmt::AssignArray{array:0,..}));
+        assert!(matches!(&update.body[1],Stmt::AssignArray{array:1,..}));
+        let shadow=&module.functions[1];
+        assert_eq!(shadow.arrays.len(),1);
+        assert!(matches!(&shadow.body[0],Stmt::AssignArray{array:0,..}));
+        assert_eq!(shadow.global_arrays.len(),2);
+    }
+
+    #[test]
+    fn data_only_array_module_is_accepted_but_unsupported_extents_are_rejected() {
+        let module=lower_module("MODULE Data; VAR values*: ARRAY 8 OF INTEGER; END Data.").unwrap();
+        assert!(module.functions.is_empty());
+        assert_eq!(module.global_arrays[0].length,8);
+        for dim in ["0", "1025", "2, 2"] {
+            let src=format!("MODULE Data; VAR values: ARRAY {dim} OF INTEGER; END Data.");
+            assert!(lower_module(&src).is_err());
+        }
+    }
+
+    #[test]
     fn unsupported_global_types_are_rejected() {
-        let array="MODULE M; VAR a: ARRAY 3 OF INTEGER;
+        let array="MODULE M; VAR a: ARRAY 3, 2 OF INTEGER;
             PROCEDURE R*(v: INTEGER): INTEGER;
             BEGIN RETURN v END R; END M.";
-        assert!(lower_module(array).unwrap_err().contains("scalar INTEGER module globals"));
+        assert!(lower_module(array).unwrap_err().contains("fixed INTEGER arrays"));
         let real="MODULE M; VAR a: REAL;
             PROCEDURE R*(v: INTEGER): INTEGER;
             BEGIN RETURN v END R; END M.";
