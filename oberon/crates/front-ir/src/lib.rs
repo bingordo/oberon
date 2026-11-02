@@ -236,12 +236,29 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err("module imports, constants, types or initialization are not yet supported".into());
     }
     let mut globals = Vec::<Global>::new();
+    let mut global_arrays = Vec::<ArrayGlobal>::new();
     for decl in &module.decls.vars {
-        if !matches!(&decl.ty, TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
-            return Err("only scalar INTEGER module globals are supported".into());
-        }
-        for (name, exported) in &decl.names {
-            globals.push(Global { name: name.clone(), exported: *exported });
+        match &decl.ty {
+            TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
+                for (name, exported) in &decl.names {
+                    globals.push(Global { name: name.clone(), exported: *exported });
+                }
+            }
+            TypeExpr::Array { dims, elem, .. } if dims.len()==1 &&
+                matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
+                let ExprKind::Int(length)=&dims[0].kind else {
+                    return Err("module array length must be an INTEGER literal".into());
+                };
+                if *length == 0 || *length > 1024 {
+                    return Err("module array length must be within 1..=1024".into());
+                }
+                for (name, exported) in &decl.names {
+                    global_arrays.push(ArrayGlobal {
+                        name: name.clone(), length: *length, exported: *exported,
+                    });
+                }
+            }
+            _ => return Err("only INTEGER globals and fixed INTEGER arrays are supported".into()),
         }
     }
 
