@@ -13,6 +13,8 @@ pub struct Module {
     pub globals: Vec<Global>,
     pub global_arrays: Vec<ArrayGlobal>,
     pub functions: Vec<Function>,
+    /// Checked module BEGIN body; emitted as a private constructor.
+    pub initializer: Option<Function>,
 }
 
 /// Exported module objects are linker-visible; private objects keep local
@@ -231,9 +233,9 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
     }
     let module = checked.ok_or("Oberon parser did not produce a module")?;
-    if !module.imports.is_empty() || !module.body.is_empty() ||
+    if !module.imports.is_empty() ||
        !module.decls.consts.is_empty() || !module.decls.types.is_empty() {
-        return Err("module imports, constants, types or initialization are not yet supported".into());
+        return Err("module imports, constants or types are not yet supported".into());
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
@@ -341,10 +343,32 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
-    if functions.is_empty() && globals.is_empty() && global_arrays.is_empty() {
-        return Err("module has no supported procedures or INTEGER globals".into());
+    let initializer = if module.body.is_empty() {
+        None
+    } else {
+        // Module code has no parameters or function-local variables. Only
+        // verified module globals are legal roots for assignments/indexing.
+        let names: HashMap<&str, usize> = globals.iter().enumerate()
+            .map(|(i, item)| (item.name.as_str(), i)).collect();
+        let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
+            .map(|(i, item)| (item.name.as_str(), i)).collect();
+        let body = lower_stmts(&module.body, &names, &arrays, &signatures)?;
+        if contains_return(&body) {
+            return Err("module initialization cannot return a value".into());
+        }
+        Some(Function {
+            name: "__module_init".into(),
+            parameters: Vec::new(), locals: Vec::new(), arrays: Vec::new(),
+            global_arrays: global_arrays.clone(),
+            globals: globals.iter().map(|g| g.name.clone()).collect(),
+            body,
+        })
+    };
+    if functions.is_empty() && globals.is_empty() && global_arrays.is_empty()
+        && initializer.is_none() {
+        return Err("module has no supported procedures, globals or initialization".into());
     }
-    Ok(Module { name: module.name, globals, global_arrays, functions })
+    Ok(Module { name: module.name, globals, global_arrays, functions, initializer })
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
@@ -359,6 +383,46 @@ fn contains_return(body: &[Stmt]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projects_checked_module_begin_using_globals_arrays_and_calls() {
+        let source="MODULE Init;
+            VAR counter*: INTEGER; data*: ARRAY 4 OF INTEGER;
+            PROCEDURE Twice*(n: INTEGER): INTEGER;
+            BEGIN RETURN n * 2 END Twice;
+            BEGIN
+                counter := Twice(11);
+                data[2] := counter + 3;
+                IF data[2] > 0 THEN counter := data[2] END
+            END Init.";
+        let module=lower_module(source).unwrap();
+        let init=module.initializer.as_ref().unwrap();
+        assert_eq!(init.name,"__module_init");
+        assert!(init.parameters.is_empty()&&init.locals.is_empty()&&init.arrays.is_empty());
+        assert_eq!(init.globals,["counter"]);
+        assert_eq!(init.global_arrays[0].length,4);
+        assert!(matches!(&init.body[0],Stmt::Assign{variable:0,
+            value:Expr::Call{name,args}} if name=="Twice"&&args.len()==1));
+        assert!(matches!(&init.body[1],Stmt::AssignArray{array:0,..}));
+        assert!(matches!(&init.body[2],Stmt::If{..}));
+        assert!(module.functions.iter().all(|f|f.name!="__module_init"));
+    }
+
+    #[test]
+    fn bodyless_and_body_only_modules_remain_distinct() {
+        let old=lower_module("MODULE M; VAR n*: INTEGER; END M.").unwrap();
+        assert!(old.initializer.is_none());
+        let source="MODULE M;
+            VAR n*: INTEGER;
+            BEGIN n := 47
+            END M.";
+        let init=lower_module(source).unwrap();
+        assert!(matches!(init.initializer.unwrap().body.as_slice(),
+            [Stmt::Assign{variable:0,value:Expr::Integer(47)}]));
+        let invalid="MODULE M; VAR n*: INTEGER;
+            BEGIN n := TRUE END M.";
+        assert!(lower_module(invalid).is_err());
+    }
 
     #[test]
     fn lowers_checked_integer_calls_and_rejects_bad_signatures() {
