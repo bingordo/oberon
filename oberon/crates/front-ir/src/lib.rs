@@ -233,9 +233,9 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
     }
     let module = checked.ok_or("Oberon parser did not produce a module")?;
-    if !module.imports.is_empty() || !module.body.is_empty() ||
+    if !module.imports.is_empty() ||
        !module.decls.consts.is_empty() || !module.decls.types.is_empty() {
-        return Err("module imports, constants, types or initialization are not yet supported".into());
+        return Err("module imports, constants or types are not yet supported".into());
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
