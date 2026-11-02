@@ -385,6 +385,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn projects_checked_module_begin_using_globals_arrays_and_calls() {
+        let source="MODULE Init;
+            VAR counter*: INTEGER; data*: ARRAY 4 OF INTEGER;
+            PROCEDURE Twice*(n: INTEGER): INTEGER;
+            BEGIN RETURN n * 2 END Twice;
+            BEGIN
+                counter := Twice(11);
+                data[2] := counter + 3;
+                IF data[2] > 0 THEN counter := data[2] END
+            END Init.";
+        let module=lower_module(source).unwrap();
+        let init=module.initializer.as_ref().unwrap();
+        assert_eq!(init.name,"__module_init");
+        assert!(init.parameters.is_empty()&&init.locals.is_empty()&&init.arrays.is_empty());
+        assert_eq!(init.globals,["counter"]);
+        assert_eq!(init.global_arrays[0].length,4);
+        assert!(matches!(&init.body[0],Stmt::Assign{variable:0,
+            value:Expr::Call{name,args}} if name=="Twice"&&args.len()==1));
+        assert!(matches!(&init.body[1],Stmt::AssignArray{array:0,..}));
+        assert!(matches!(&init.body[2],Stmt::If{..}));
+        assert!(module.functions.iter().all(|f|f.name!="__module_init"));
+    }
+
+    #[test]
+    fn bodyless_and_body_only_modules_remain_distinct() {
+        let old=lower_module("MODULE M; VAR n*: INTEGER; END M.").unwrap();
+        assert!(old.initializer.is_none());
+        let source="MODULE M;
+            VAR n*: INTEGER;
+            BEGIN n := 47
+            END M.";
+        let init=lower_module(source).unwrap();
+        assert!(matches!(init.initializer.unwrap().body.as_slice(),
+            [Stmt::Assign{variable:0,value:Expr::Integer(47)}]));
+        let invalid="MODULE M; VAR n*: INTEGER;
+            BEGIN n := TRUE END M.";
+        assert!(lower_module(invalid).is_err());
+    }
+
+    #[test]
     fn lowers_checked_integer_calls_and_rejects_bad_signatures() {
         let src="MODULE Calls;
             PROCEDURE Add*(a,b: INTEGER): INTEGER;
