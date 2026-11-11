@@ -182,6 +182,12 @@ pub struct CheckedRecordObject {
     pub record: String,
 }
 
+/// Existing checked Module, source export names, record declarations and
+/// per-object identities. Named to keep the public API readable.
+pub type CheckedRecordProjection = (
+    Module, Vec<String>, Vec<CheckedRecordLayout>, Vec<CheckedRecordObject>,
+);
+
 /// Build metadata only from the already semantically checked module AST.
 /// Each source record declaration is emitted exactly once; nested inline
 /// records receive stable path-scoped identities and named aliases retain
@@ -527,7 +533,7 @@ pub fn lower_module_with_metadata(source: &str)
 /// supported records and the module/procedure objects that instantiate them.
 /// Existing front-ir output remains ABI- and layout-compatible.
 pub fn lower_module_with_record_objects(source: &str)
-    -> Result<(Module, Vec<String>, Vec<CheckedRecordLayout>, Vec<CheckedRecordObject>), String> {
+    -> Result<CheckedRecordProjection, String> {
     let (checked, diagnostics) = sema::check_module_recovering(source, &[]);
     if let Some(d) = diagnostics.iter().find(|d| d.is_error()) {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
