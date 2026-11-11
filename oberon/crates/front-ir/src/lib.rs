@@ -286,13 +286,100 @@ fn checked_record_layout(
     }
 }
 
-type RecordObjects = HashMap<String,(usize,Vec<String>)>;
-fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<(usize,Expr),String> {
-    let (object,fields)=records.get(base)
+/// The source record owns exact byte offsets; an INTEGER-only source
+/// retains the old word-index bridge for differential tests. Mixed records
+/// use explicit byte-addressable leaf operations, never name-guessed slots.
+#[derive(Clone,Debug)]
+struct RecordShape {
+    fields: Vec<String>,
+    bytes: Vec<(u32,u8)>,
+    has_byte: bool,
+    words: u32,
+}
+
+fn record_shape(
+    identity:&str, layouts:&[CheckedRecordLayout], legacy_fields:&[String],
+) -> Result<RecordShape,String> {
+    fn visit(
+        id:&str,prefix:&str,offset:u32,layouts:&[CheckedRecordLayout],
+        out:&mut Vec<(String,u32,u8)>,
+    )->Result<(),String> {
+        let record=layouts.iter().find(|r|r.declaration==id)
+            .ok_or("checked record object refers to missing record declaration")?;
+        if let Some(base)=&record.base {
+            visit(base,prefix,offset,layouts,out)?;
+        }
+        for field in &record.fields {
+            let field_offset=offset.checked_add(field.offset_bytes)
+                .ok_or("record field byte offset overflow")?;
+            let path=format!("{prefix}{}",field.name);
+            match &field.ty {
+                CheckedRecordFieldType::Integer=>out.push((path,field_offset,32)),
+                CheckedRecordFieldType::Byte=>out.push((path,field_offset,8)),
+                CheckedRecordFieldType::Record(child)=>{
+                    visit(child,&format!("{path}."),field_offset,layouts,out)?;
+                },
+            }
+        }
+        Ok(())
+    }
+    let layout=layouts.iter().find(|r|r.declaration==identity)
+        .ok_or("record object layout missing")?;
+    // First executable mixed slice reuses the native 4-byte frame-array
+    // root, including its existing zeroing and checked provenance.
+    // Pure BYTE objects need exact-sized byte roots and stay fail-closed.
+    if layout.alignment_bytes!=4 || layout.size_bytes%4!=0 {
+        return Err("BYTE-only record storage requires native byte allocation".into());
+    }
+    let mut leaves=Vec::new();
+    visit(identity,"",0,layouts,&mut leaves)?;
+    if leaves.iter().map(|x|x.0.as_str()).ne(legacy_fields.iter().map(String::as_str)) {
+        return Err("record layout leaf order disagrees with checked field projection".into());
+    }
+    let size=layout.size_bytes;
+    for (_,offset,bits) in &leaves {
+        if offset.checked_add(u32::from(*bits)/8).is_none_or(|end|end>size) {
+            return Err("record leaf exceeds verified byte object extent".into());
+        }
+    }
+    let has_byte=leaves.iter().any(|x|x.2==8);
+    Ok(RecordShape {
+        fields:legacy_fields.to_vec(),
+        bytes:leaves.iter().map(|x|(x.1,x.2)).collect(),
+        has_byte,words:size/4,
+    })
+}
+
+type RecordObjects = HashMap<String,(usize,RecordShape)>;
+fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<Expr,String> {
+    let (object,shape)=records.get(base)
         .ok_or_else(||format!("unsupported record object {base}"))?;
-    let offset=fields.iter().position(|f|f==field)
+    let offset=shape.fields.iter().position(|f|f==field)
         .ok_or_else(||format!("unsupported record field {base}.{field}"))?;
-    Ok((*object,Expr::Integer(offset as i32)))
+    if shape.has_byte {
+        let (byte_offset,bits)=shape.bytes[offset];
+        Ok(Expr::RecordField {
+            array:*object,byte_offset,bits,
+        })
+    } else {
+        Ok(Expr::ArrayElement {
+            array:*object,index:Box::new(Expr::Integer(offset as i32)),
+        })
+    }
+}
+
+fn record_store(
+    records:&RecordObjects, base:&str,field:&str,value:Expr,
+)->Result<Stmt,String> {
+    Ok(match record_field(records,base,field)? {
+        Expr::ArrayElement {array,index}=>Stmt::AssignArray {
+            array,index:*index,value,
+        },
+        Expr::RecordField {array,byte_offset,bits}=>Stmt::AssignRecordField {
+            array,byte_offset,bits,value,
+        },
+        _=>return Err("checked record selector must refer to a scalar field".into()),
+    })
 }
 
 /// Only direct checked record objects and field chains are supported:
@@ -313,13 +400,13 @@ fn record_selector_path(d:&syntax::ast::Designator)->Option<String> {
 fn record_region(records:&RecordObjects, root:&str, path:&str)
     -> Option<(usize,Vec<(usize,String)>)>
 {
-    let (array,fields)=records.get(root)?;
+    let (array,shape)=records.get(root)?;
     if path.is_empty() {
-        return Some((*array,fields.iter().enumerate().map(|(i,name)|
+        return Some((*array,shape.fields.iter().enumerate().map(|(i,name)|
             (i,name.clone())).collect()));
     }
     let prefix=format!("{path}.");
-    let words=fields.iter().enumerate().filter_map(|(offset,name)|
+    let words=shape.fields.iter().enumerate().filter_map(|(offset,name)|
         name.strip_prefix(&prefix).map(|suffix|(offset,suffix.to_owned())))
         .collect::<Vec<_>>();
     (!words.is_empty()).then_some((*array,words))
@@ -341,6 +428,12 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
         .ok_or("unsupported selected record assignment source")?;
     let (source,src_words)=record_region(records,&src.base[0],&src_path)
         .ok_or("record assignment source must be a supported record object")?;
+    // A mixed-width copy must include every source byte/padding and alias
+    // effect. The old leaf-word copy is not an acceptable substitute.
+    if records.get(&target.base[0]).is_some_and(|(_,s)|s.has_byte) ||
+       records.get(&src.base[0]).is_some_and(|(_,s)|s.has_byte) {
+        return Err("mixed-width record copy requires byte-range legalization".into());
+    }
     if src_words.len()<dst_words.len() ||
        !src_words.iter().zip(&dst_words).all(|(from,to)|from.1==to.1) {
         return Err("record assignment requires compatible source prefix".into())
@@ -404,14 +497,12 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 syntax::ast::Selector::Field(name)=>name.as_str(),
                 _=>unreachable!("guarded field selectors"),
             }).collect::<Vec<_>>().join(".");
-            let (array,index)=record_field(records,&d.base[0],&fields)?;
-            Ok(Expr::ArrayElement {array,index:Box::new(index)})
+            record_field(records,&d.base[0],&fields)
         }
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1 => {
             match &d.sels[0] {
                 syntax::ast::Selector::Field(field) => {
-                    let (array,index)=record_field(records,&d.base[0],field)?;
-                    Ok(Expr::ArrayElement {array,index:Box::new(index)})
+                    record_field(records,&d.base[0],field)
                 }
                 syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                     let array=*arrays.get(d.base[0].as_str())
@@ -476,21 +567,16 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 } else {
                     let fields=record_selector_path(target)
                         .ok_or("unsupported record selector")?;
-                    let (array,index)=record_field(records,&target.base[0],&fields)?;
-                    out.push(Stmt::AssignArray {
-                        array,index,value:lower_expr(value,names,arrays,records,functions)?,
-                    });
+                    out.push(record_store(records,&target.base[0],&fields,
+                        lower_expr(value,names,arrays,records,functions)?)?);
                 }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
                 match &target.sels[0] {
                     syntax::ast::Selector::Field(field) => {
-                        let (array,index)=record_field(records,&target.base[0],field)?;
-                        out.push(Stmt::AssignArray {
-                            array,index,
-                            value:lower_expr(value,names,arrays,records,functions)?,
-                        });
+                        out.push(record_store(records,&target.base[0],field,
+                            lower_expr(value,names,arrays,records,functions)?)?);
                     }
                     syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                         let array=*arrays.get(target.base[0].as_str())
