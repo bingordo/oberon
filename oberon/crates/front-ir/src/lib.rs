@@ -172,6 +172,16 @@ pub enum CheckedRecordFieldType {
     Record(String),
 }
 
+/// The source-checked object declaration and its exact nominal record.
+/// Procedure-local objects use `function=Some(procedure_name)`; module
+/// globals use `None`. This is metadata, not an ABI-visible record type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedRecordObject {
+    pub function: Option<String>,
+    pub name: String,
+    pub record: String,
+}
+
 /// Build metadata only from the already semantically checked module AST.
 /// Each source record declaration is emitted exactly once; nested inline
 /// records receive stable path-scoped identities and named aliases retain
@@ -509,6 +519,15 @@ pub fn lower_module_with_exports(source: &str) -> Result<(Module, Vec<String>), 
 /// nominal record/field identity and byte layouts. No raw AST is exposed.
 pub fn lower_module_with_metadata(source: &str)
     -> Result<(Module, Vec<String>, Vec<CheckedRecordLayout>), String> {
+    lower_module_with_record_objects(source)
+        .map(|(module, exports, layouts, _)| (module, exports, layouts))
+}
+
+/// Parse and check once, preserving the declaration identity of both
+/// supported records and the module/procedure objects that instantiate them.
+/// Existing front-ir output remains ABI- and layout-compatible.
+pub fn lower_module_with_record_objects(source: &str)
+    -> Result<(Module, Vec<String>, Vec<CheckedRecordLayout>, Vec<CheckedRecordObject>), String> {
     let (checked, diagnostics) = sema::check_module_recovering(source, &[]);
     if let Some(d) = diagnostics.iter().find(|d| d.is_error()) {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
@@ -524,6 +543,7 @@ pub fn lower_module_with_metadata(source: &str)
     let mut record_types = HashMap::<String, Vec<String>>::new();
     let mut record_nominals = HashMap::<String, String>::new();
     let mut checked_layouts = Vec::<CheckedRecordLayout>::new();
+    let mut checked_objects = Vec::<CheckedRecordObject>::new();
     for decl in &module.decls.types {
         if decl.export {
             return Err("exported record types require a native ABI layout".into());
@@ -542,6 +562,11 @@ pub fn lower_module_with_metadata(source: &str)
     let mut module_record_fields=HashMap::<String,Vec<String>>::new();
     for decl in &module.decls.vars {
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+            let first = decl.names.first().ok_or("record variable declaration has no names")?;
+            let identity = format!("{}.global.{}", module.name, first.0);
+            let record = checked_record_layout(
+                &decl.ty, &identity, &record_nominals, &mut checked_layouts,
+            )?.ok_or("checked global record identity is missing")?;
             for (name, exported) in &decl.names {
                 if *exported {
                     return Err("exported record objects require a native ABI layout".into());
@@ -550,6 +575,9 @@ pub fn lower_module_with_metadata(source: &str)
                     name:name.clone(),length:fields.len() as u32,exported:false,
                 });
                 module_record_fields.insert(name.clone(),fields.clone());
+                checked_objects.push(CheckedRecordObject {
+                    function:None, name:name.clone(), record:record.clone(),
+                });
             }
             continue;
         }
@@ -609,11 +637,20 @@ pub fn lower_module_with_metadata(source: &str)
         let mut local_record_fields=HashMap::<String,Vec<String>>::new();
         for decl in &proc.decls.vars {
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+                let first = decl.names.first().ok_or("local record declaration has no names")?;
+                let identity = format!("{}.{}.local.{}", module.name, proc.name, first.0);
+                let record = checked_record_layout(
+                    &decl.ty, &identity, &record_nominals, &mut checked_layouts,
+                )?.ok_or("checked local record identity is missing")?;
                 for (name, _) in &decl.names {
                     fixed_arrays.push(ArrayLocal {
                         name:name.clone(),length:fields.len() as u32,
                     });
                     local_record_fields.insert(name.clone(),fields.clone());
+                    checked_objects.push(CheckedRecordObject {
+                        function:Some(proc.name.clone()), name:name.clone(),
+                        record:record.clone(),
+                    });
                 }
                 continue;
             }
@@ -711,6 +748,7 @@ pub fn lower_module_with_metadata(source: &str)
         Module { name: module.name, globals, global_arrays, functions, initializer },
         exported_procedures,
         checked_layouts,
+        checked_objects,
     ))
 }
 
