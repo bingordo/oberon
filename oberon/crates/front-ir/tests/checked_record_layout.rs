@@ -5,7 +5,7 @@ use oberon_front_ir::{lower_module, lower_module_with_exports,
 fn source_checked_record_layouts_preserve_nested_identity_and_offsets() {
     let source = "MODULE M;
         TYPE Pair = RECORD a,b: INTEGER END;
-        TYPE Tree = RECORD (Pair) inner: Pair; leaf: RECORD z: INTEGER END END;
+        Tree = RECORD (Pair) inner: Pair; leaf: RECORD z: INTEGER END END;
         VAR tree: Tree;
         PROCEDURE Read*(n: INTEGER): INTEGER;
         BEGIN
@@ -37,7 +37,7 @@ fn source_checked_record_layouts_preserve_nested_identity_and_offsets() {
 fn aliases_preserve_nominal_identity_without_duplicate_layouts() {
     let source = "MODULE Alias;
         TYPE Pair = RECORD a,b: INTEGER END;
-        TYPE Same = Pair;
+        Same = Pair;
         VAR p: Same;
         PROCEDURE F*(n: INTEGER): INTEGER;
         BEGIN p.a:=n; RETURN p.a END F;
