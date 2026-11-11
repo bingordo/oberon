@@ -85,6 +85,37 @@ pub enum Stmt {
     While { condition: Expr, body: Vec<Stmt> },
 }
 
+// Private INTEGER-only records are represented as independent scalar slots.
+// The synthesized separator cannot collide with an Oberon identifier (which
+// cannot contain underscores). No record address, layout, or ABI is exposed.
+fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
+    -> Result<Option<Vec<String>>, String>
+{
+    match ty {
+        TypeExpr::Named(q, _) if q.len()==1 => Ok(types.get(&q[0]).cloned()),
+        TypeExpr::Record { base, fields, .. } => {
+            if base.is_some() {
+                return Err("record extension needs a native layout".into());
+            }
+            let mut result = Vec::new();
+            for field in fields {
+                if !matches!(&field.ty, TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
+                    return Err("only INTEGER record fields can be projected".into());
+                }
+                for (name, _) in &field.names {
+                    result.push(name.clone());
+                }
+            }
+            Ok(Some(result))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn field_slot(base: &str, field: &str) -> String {
+    format!("{base}__{field}")
+}
+
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
               arrays:&HashMap<&str,usize>,
@@ -127,6 +158,11 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
         }
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1 => {
             match &d.sels[0] {
+                syntax::ast::Selector::Field(field) => {
+                    let slot = field_slot(&d.base[0], field);
+                    names.get(slot.as_str()).copied().map(Expr::Variable)
+                        .ok_or_else(|| format!("unsupported record field at {}", d.span.lo))
+                }
                 syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                     let array=*arrays.get(d.base[0].as_str())
                         .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
@@ -179,6 +215,15 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
                 match &target.sels[0] {
+                    syntax::ast::Selector::Field(field) => {
+                        let slot = field_slot(&target.base[0], field);
+                        let variable = names.get(slot.as_str()).copied()
+                            .ok_or_else(|| format!("unsupported record assignment at {}", s.span.lo))?;
+                        out.push(Stmt::Assign {
+                            variable,
+                            value: lower_expr(value, names, arrays, functions)?,
+                        });
+                    }
                     syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                         let array=*arrays.get(target.base[0].as_str())
                             .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
@@ -233,13 +278,34 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
     }
     let module = checked.ok_or("Oberon parser did not produce a module")?;
-    if !module.imports.is_empty() ||
-       !module.decls.consts.is_empty() || !module.decls.types.is_empty() {
-        return Err("module imports, constants or types are not yet supported".into());
+    if !module.imports.is_empty() || !module.decls.consts.is_empty() {
+        return Err("module imports or constants are not yet supported".into());
+    }
+    let mut record_types = HashMap::<String, Vec<String>>::new();
+    for decl in &module.decls.types {
+        if decl.export {
+            return Err("exported record types require a native ABI layout".into());
+        }
+        let fields = record_fields(&decl.ty, &record_types)?
+            .ok_or_else(|| format!("unsupported type declaration: {}", decl.name))?;
+        record_types.insert(decl.name.clone(), fields);
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
     for decl in &module.decls.vars {
+        if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+            for (name, exported) in &decl.names {
+                if *exported {
+                    return Err("exported record objects require a native ABI layout".into());
+                }
+                for field in &fields {
+                    globals.push(Global {
+                        name: field_slot(name, field), exported: false,
+                    });
+                }
+            }
+            continue;
+        }
         match &decl.ty {
             TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
                 for (name, exported) in &decl.names {
@@ -294,6 +360,14 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
         for decl in &proc.decls.vars {
+            if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+                for (name, _) in &decl.names {
+                    for field in &fields {
+                        locals.push(field_slot(name, field));
+                    }
+                }
+                continue;
+            }
             match &decl.ty {
                 TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
                     for (name,_) in &decl.names {locals.push(name.clone());}
@@ -383,6 +457,59 @@ fn contains_return(body: &[Stmt]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projects_private_integer_record_fields_without_abi_or_address_exposure() {
+        let source = "MODULE Records;
+            TYPE Pair = RECORD left, right: INTEGER END;
+            VAR pair: Pair; tally: INTEGER;
+            PROCEDURE Sum*(n: INTEGER): INTEGER;
+            VAR tmp: Pair; sum: INTEGER;
+            BEGIN
+                tmp.left := n;
+                tmp.right := pair.left;
+                sum := tmp.left + tmp.right;
+                RETURN sum
+            END Sum;
+            BEGIN
+                pair.left := 7;
+                pair.right := pair.left + 2;
+                tally := pair.right
+            END Records.";
+        let module = lower_module(source).unwrap();
+        assert_eq!(module.globals.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+                   ["pair__left", "pair__right", "tally"]);
+        assert!(module.globals.iter().all(|g| !g.exported));
+        let f = &module.functions[0];
+        assert_eq!(f.locals, ["tmp__left", "tmp__right", "sum"]);
+        assert!(matches!(&f.body[0], Stmt::Assign {
+            variable: 1, value: Expr::Variable(0)
+        }));
+        assert!(matches!(&f.body[1], Stmt::Assign {
+            variable: 2, value: Expr::Variable(4)
+        }));
+        assert!(matches!(&module.initializer.as_ref().unwrap().body[0],
+                         Stmt::Assign { variable: 0, value: Expr::Integer(7) }));
+    }
+
+    #[test]
+    fn record_projection_rejects_unrepresentable_layouts_and_operations() {
+        let exported = "MODULE M; TYPE Pair = RECORD x: INTEGER END;
+            VAR p*: Pair; END M.";
+        assert!(lower_module(exported).is_err());
+        let pointer = "MODULE M; TYPE R = RECORD p: POINTER TO R END;
+            VAR r: R; END M.";
+        assert!(lower_module(pointer).is_err());
+        let extension = "MODULE M;
+            TYPE Base = RECORD x: INTEGER END;
+                 Derived = RECORD (Base) y: INTEGER END;
+            VAR r: Derived; END M.";
+        assert!(lower_module(extension).is_err());
+        let whole_record = "MODULE M;
+            VAR a,b: RECORD x: INTEGER END;
+            BEGIN a := b END M.";
+        assert!(lower_module(whole_record).is_err());
+    }
 
     #[test]
     fn projects_checked_module_begin_using_globals_arrays_and_calls() {
