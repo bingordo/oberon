@@ -105,15 +105,30 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
                     .ok_or("unsupported record extension base")?
             } else { Vec::new() };
             for field in fields {
-                if !matches!(&field.ty, TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
-                    return Err("only INTEGER record fields can be projected".into());
-                }
+                let nested=if matches!(&field.ty,
+                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
+                    None
+                } else {
+                    Some(record_fields(&field.ty, types)?
+                        .ok_or("record fields must be INTEGER or supported private records")?)
+                };
                 for (name, _) in &field.names {
-                    result.push(name.clone());
+                    if let Some(paths)=&nested {
+                        for path in paths {
+                            // Dots are not legal Oberon identifier characters.
+                            // Hence this path is unambiguous for nested fields.
+                            result.push(format!("{name}.{path}"));
+                        }
+                    } else {
+                        result.push(name.clone());
+                    }
+                    if result.len()>1024 {
+                        return Err("native INTEGER record exceeds 1024 words".into());
+                    }
                 }
             }
-            if result.is_empty() || result.len() > 1024 {
-                return Err("native INTEGER record needs 1..=1024 fields".into());
+            if result.is_empty() {
+                return Err("native INTEGER record must contain a field".into());
             }
             Ok(Some(result))
         }
@@ -171,6 +186,15 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
         ExprKind::Designator(d) if d.sels.is_empty() && d.base.len() == 1 => {
             names.get(d.base[0].as_str()).copied().map(Expr::Variable)
                 .ok_or_else(|| format!("unsupported variable or constant: {}", d.base[0]))
+        }
+        ExprKind::Designator(d) if d.base.len()==1 && !d.sels.is_empty() &&
+            d.sels.iter().all(|sel|matches!(sel,syntax::ast::Selector::Field(_))) => {
+            let fields=d.sels.iter().map(|sel|match sel {
+                syntax::ast::Selector::Field(name)=>name.as_str(),
+                _=>unreachable!("guarded field selectors"),
+            }).collect::<Vec<_>>().join(".");
+            let (array,index)=record_field(records,&d.base[0],&fields)?;
+            Ok(Expr::ArrayElement {array,index:Box::new(index)})
         }
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1 => {
             match &d.sels[0] {
@@ -255,6 +279,18 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     out.push(Stmt::Assign {variable,value:
                         lower_expr(value,names,arrays,records,functions)?});
                 }
+            }
+            StmtKind::Assign { target, value } if target.base.len()==1 &&
+                !target.sels.is_empty() &&
+                target.sels.iter().all(|sel|matches!(sel,syntax::ast::Selector::Field(_))) => {
+                let fields=target.sels.iter().map(|sel|match sel {
+                    syntax::ast::Selector::Field(name)=>name.as_str(),
+                    _=>unreachable!("guarded field selectors"),
+                }).collect::<Vec<_>>().join(".");
+                let (array,index)=record_field(records,&target.base[0],&fields)?;
+                out.push(Stmt::AssignArray {
+                    array,index,value:lower_expr(value,names,arrays,records,functions)?,
+                });
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
@@ -620,6 +656,60 @@ mod tests {
             VAR base: Base; child: Child;
             BEGIN child := base END Bad.";
         assert!(lower_module(invalid).is_err(),"base-to-derived assignment must reject");
+    }
+
+    #[test]
+    fn nested_integer_records_are_contiguous_and_have_stable_field_paths() {
+        let source="MODULE Nested;
+            TYPE Leaf = RECORD a,b: INTEGER END;
+                 Mid = RECORD one: Leaf; middle: INTEGER; two: Leaf END;
+                 Top = RECORD head: Mid; last: INTEGER END;
+            VAR global: Top;
+            PROCEDURE Work*(x: INTEGER): INTEGER;
+            VAR local: Top;
+            BEGIN
+                local.head.one.a:=x;
+                local.head.one.b:=x+1;
+                local.head.middle:=x+2;
+                local.head.two.a:=x+3;
+                local.head.two.b:=x+4;
+                local.last:=x+5;
+                global.head.one.a:=local.head.one.a;
+                global.head.two.b:=local.head.two.b;
+                RETURN global.head.one.a+global.head.two.b
+            END Work;
+            END Nested.";
+        let m=lower_module(source).unwrap();
+        assert_eq!(m.global_arrays,
+            [ArrayGlobal{name:"global".into(),length:6,exported:false}]);
+        let f=&m.functions[0];
+        assert_eq!(f.arrays,[ArrayLocal{name:"local".into(),length:6}]);
+        for offset in 0..6 {
+            assert!(matches!(&f.body[offset],
+                Stmt::AssignArray{array:0,index:Expr::Integer(i),..}
+                if *i==offset as i32));
+        }
+        assert!(matches!(&f.body[6],
+            Stmt::AssignArray {array:1,index:Expr::Integer(0),
+                value:Expr::ArrayElement{array:0,..}}));
+        assert!(matches!(&f.body[7],
+            Stmt::AssignArray {array:1,index:Expr::Integer(4),
+                value:Expr::ArrayElement{array:0,..}}));
+    }
+
+    #[test]
+    fn nested_record_field_paths_reject_scalar_intermediates() {
+        let invalid="MODULE Bad;
+            TYPE R = RECORD a: INTEGER END;
+            VAR r: R;
+            PROCEDURE F*(): INTEGER;
+            BEGIN RETURN r.a.b END F
+            END Bad.";
+        assert!(lower_module(invalid).is_err());
+        let unsupported="MODULE Bad;
+            TYPE R = RECORD a: ARRAY 3 OF INTEGER END;
+            VAR r: R; END Bad.";
+        assert!(lower_module(unsupported).is_err());
     }
 
     #[test]
