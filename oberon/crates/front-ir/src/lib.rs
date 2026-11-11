@@ -113,6 +113,16 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
                         .ok_or("record fields must be INTEGER or supported private records")?)
                 };
                 for (name, _) in &field.names {
+                    // Oberon accepts an extension that hides a base field,
+                    // with a diagnostic. Our compact leaf-name projection
+                    // cannot distinguish the two nominal declarations:
+                    // silently picking the first offset would miscompile.
+                    // Reject until source field declaration IDs are retained.
+                    if result.iter().any(|path|
+                        path.split('.').next() == Some(name.as_str())) {
+                        return Err(format!(
+                            "record field {name} hides another field; native layout needs declaration identity"));
+                    }
                     if let Some(paths)=&nested {
                         for path in paths {
                             // Dots are not legal Oberon identifier characters.
@@ -143,6 +153,67 @@ fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<(usize,Ex
     let offset=fields.iter().position(|f|f==field)
         .ok_or_else(||format!("unsupported record field {base}.{field}"))?;
     Ok((*object,Expr::Integer(offset as i32)))
+}
+
+/// Only direct checked record objects and field chains are supported:
+/// pointer dereferences, module-qualified roots and indexing stay rejected.
+fn record_selector_path(d:&syntax::ast::Designator)->Option<String> {
+    if d.base.len()!=1 || !d.sels.iter().all(|s|
+        matches!(s,syntax::ast::Selector::Field(_))) {
+        return None;
+    }
+    Some(d.sels.iter().map(|s|match s {
+        syntax::ast::Selector::Field(name)=>name.as_str(),
+        _=>unreachable!("guarded field selector"),
+    }).collect::<Vec<_>>().join("."))
+}
+
+/// Return the contiguous leaf-word interval and relative leaf names for a
+/// whole record or a selected subrecord. A scalar field has no descendants.
+fn record_region(records:&RecordObjects, root:&str, path:&str)
+    -> Option<(usize,Vec<(usize,String)>)>
+{
+    let (array,fields)=records.get(root)?;
+    if path.is_empty() {
+        return Some((*array,fields.iter().enumerate().map(|(i,name)|
+            (i,name.clone())).collect()));
+    }
+    let prefix=format!("{path}.");
+    let words=fields.iter().enumerate().filter_map(|(offset,name)|
+        name.strip_prefix(&prefix).map(|suffix|(offset,suffix.to_owned())))
+        .collect::<Vec<_>>();
+    (!words.is_empty()).then_some((*array,words))
+}
+
+/// A whole record or selected subrecord assignment uses only frontend-checked
+/// direct objects, with identical leaf paths or a derived-to-base prefix.
+/// Contiguous field copies are ordered like memmove for same-object aliasing.
+fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
+                     records:&RecordObjects)->Result<Option<Vec<Stmt>>,String> {
+    let Some(dst_path)=record_selector_path(target) else {return Ok(None)};
+    let Some((dest,dst_words))=record_region(records,&target.base[0],&dst_path) else {
+        return Ok(None)
+    };
+    let ExprKind::Designator(src)=&value.kind else {
+        return Err("record assignment requires direct record designator".into())
+    };
+    let src_path=record_selector_path(src)
+        .ok_or("unsupported selected record assignment source")?;
+    let (source,src_words)=record_region(records,&src.base[0],&src_path)
+        .ok_or("record assignment source must be a supported record object")?;
+    if src_words.len()<dst_words.len() ||
+       !src_words.iter().zip(&dst_words).all(|(from,to)|from.1==to.1) {
+        return Err("record assignment requires compatible source prefix".into())
+    }
+    let backward=source==dest && dst_words[0].0>src_words[0].0;
+    let mut offsets=(0..dst_words.len()).collect::<Vec<_>>();
+    if backward {offsets.reverse();}
+    Ok(Some(offsets.into_iter().map(|i|Stmt::AssignArray {
+        array:dest,index:Expr::Integer(dst_words[i].0 as i32),
+        value:Expr::ArrayElement {
+            array:source,index:Box::new(Expr::Integer(src_words[i].0 as i32)),
+        },
+    }).collect()))
 }
 
 fn lower_call(d:&syntax::ast::Designator,
@@ -248,31 +319,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 lower_call(d,names,arrays,records,functions)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
-                if let Some((dest,fields))=records.get(&target.base[0]) {
-                    // Source checker already validated nominal record equality.
-                    // A direct variable-to-variable copy is lowered fieldwise
-                    // through the same contiguous memory objects; other shapes
-                    // continue to reject until aggregate operations exist.
-                    let ExprKind::Designator(src)=&value.kind else {
-                        return Err("unsupported aggregate source expression".into());
-                    };
-                    if src.base.len()!=1 || !src.sels.is_empty() {
-                        return Err("record assignment requires direct source variable".into());
-                    }
-                    let (source,source_fields)=records.get(&src.base[0])
-                        .ok_or("record assignment requires record variable")?;
-                    if !source_fields.starts_with(fields) {
-                        return Err("record projection requires matching base prefix".into());
-                    }
-                    for offset in 0..fields.len() {
-                        let index=Expr::Integer(offset as i32);
-                        out.push(Stmt::AssignArray {
-                            array:*dest,index:index.clone(),
-                            value:Expr::ArrayElement {
-                                array:*source,index:Box::new(index),
-                            },
-                        });
-                    }
+                if let Some(copies)=lower_record_copy(target,value,records)? {
+                    out.extend(copies);
                 } else {
                     let variable=names.get(target.base[0].as_str()).copied()
                         .ok_or_else(||format!("unknown local or parameter: {}",target.base[0]))?;
@@ -283,14 +331,16 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                 !target.sels.is_empty() &&
                 target.sels.iter().all(|sel|matches!(sel,syntax::ast::Selector::Field(_))) => {
-                let fields=target.sels.iter().map(|sel|match sel {
-                    syntax::ast::Selector::Field(name)=>name.as_str(),
-                    _=>unreachable!("guarded field selectors"),
-                }).collect::<Vec<_>>().join(".");
-                let (array,index)=record_field(records,&target.base[0],&fields)?;
-                out.push(Stmt::AssignArray {
-                    array,index,value:lower_expr(value,names,arrays,records,functions)?,
-                });
+                if let Some(copies)=lower_record_copy(target,value,records)? {
+                    out.extend(copies);
+                } else {
+                    let fields=record_selector_path(target)
+                        .ok_or("unsupported record selector")?;
+                    let (array,index)=record_field(records,&target.base[0],&fields)?;
+                    out.push(Stmt::AssignArray {
+                        array,index,value:lower_expr(value,names,arrays,records,functions)?,
+                    });
+                }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
@@ -698,6 +748,46 @@ mod tests {
     }
 
     #[test]
+    fn copies_nested_records_between_roots_and_siblings() {
+        let src="MODULE NestedCopy;
+            TYPE Pair = RECORD a,b: INTEGER END;
+                 Tree = RECORD left,right: Pair; tail: INTEGER END;
+            VAR global: Tree;
+            PROCEDURE F*(n: INTEGER): INTEGER;
+            VAR tree: Tree; separate: Pair;
+            BEGIN
+                separate.a:=n; separate.b:=n+1;
+                tree.left:=separate;
+                tree.right:=tree.left;
+                tree.tail:=n+2;
+                global:=tree;
+                RETURN global.left.a+global.right.b+global.tail
+            END F;
+            END NestedCopy.";
+        let module=lower_module(src).unwrap();
+        assert_eq!(module.global_arrays[0].length,5);
+        let f=&module.functions[0];
+        assert_eq!(f.arrays[0].length,5);
+        assert_eq!(f.arrays[1].length,2);
+        assert_eq!(f.body.iter().filter(|s|matches!(s,Stmt::AssignArray{..})).count(),12);
+        // Read from separate[0], write into tree[0].
+        assert!(matches!(&f.body[2],Stmt::AssignArray {
+            array:0,index:Expr::Integer(0),
+            value:Expr::ArrayElement{array:1,index,..}
+        } if matches!(index.as_ref(),Expr::Integer(0))));
+        // For a same-object copy to a higher address the memmove-safe
+        // direction is right[1] := left[1], then right[0] := left[0].
+        assert!(matches!(&f.body[4],Stmt::AssignArray {
+            array:0,index:Expr::Integer(3),
+            value:Expr::ArrayElement{array:0,index,..}
+        } if matches!(index.as_ref(),Expr::Integer(1))));
+        assert!(matches!(&f.body[5],Stmt::AssignArray {
+            array:0,index:Expr::Integer(2),
+            value:Expr::ArrayElement{array:0,index,..}
+        } if matches!(index.as_ref(),Expr::Integer(0))));
+    }
+
+    #[test]
     fn nested_record_field_paths_reject_scalar_intermediates() {
         let invalid="MODULE Bad;
             TYPE R = RECORD a: INTEGER END;
@@ -710,6 +800,28 @@ mod tests {
             TYPE R = RECORD a: ARRAY 3 OF INTEGER END;
             VAR r: R; END Bad.";
         assert!(lower_module(unsupported).is_err());
+    }
+
+    #[test]
+    fn shadowed_inherited_record_fields_fail_closed() {
+        // Source Oberon may accept a shadowed inherited field with a
+        // warning, but the native flattened offsets must never pick an
+        // arbitrary old or new field declaration.
+        let hidden="MODULE Hidden;
+            TYPE Base = RECORD x: INTEGER END;
+                 Child = RECORD (Base) x: INTEGER END;
+            VAR child: Child;
+            PROCEDURE F*(): INTEGER;
+            BEGIN child.x:=7; RETURN child.x END F;
+            END Hidden.";
+        assert!(lower_module(hidden).is_err());
+        let nested="MODULE HiddenNested;
+            TYPE Inner = RECORD x: INTEGER END;
+                 Base = RECORD member: Inner END;
+                 Child = RECORD (Base) member: Inner END;
+            VAR child: Child;
+            END HiddenNested.";
+        assert!(lower_module(nested).is_err());
     }
 
     #[test]
