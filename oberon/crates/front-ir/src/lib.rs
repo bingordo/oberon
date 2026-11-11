@@ -765,8 +765,13 @@ mod tests {
             array:0,index:Expr::Integer(0),
             value:Expr::ArrayElement{array:1,index,..}
         } if matches!(index.as_ref(),Expr::Integer(0))));
-        // Same-object right := left copies offset 0 to offset 2.
+        // For a same-object copy to a higher address the memmove-safe
+        // direction is right[1] := left[1], then right[0] := left[0].
         assert!(matches!(&f.body[4],Stmt::AssignArray {
+            array:0,index:Expr::Integer(3),
+            value:Expr::ArrayElement{array:0,index,..}
+        } if matches!(index.as_ref(),Expr::Integer(1))));
+        assert!(matches!(&f.body[5],Stmt::AssignArray {
             array:0,index:Expr::Integer(2),
             value:Expr::ArrayElement{array:0,index,..}
         } if matches!(index.as_ref(),Expr::Integer(0))));
