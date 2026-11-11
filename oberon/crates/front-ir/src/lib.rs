@@ -85,9 +85,9 @@ pub enum Stmt {
     While { condition: Expr, body: Vec<Stmt> },
 }
 
-// Private INTEGER-only records are represented as independent scalar slots.
-// The synthesized separator cannot collide with an Oberon identifier (which
-// cannot contain underscores). No record address, layout, or ABI is exposed.
+// Private homogeneous INTEGER records now use contiguous checked memory,
+// with 4-byte fields and an addressable allocation root. No record ABI,
+// pointer exposure, record extension or heterogeneous fields are inferred.
 fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
     -> Result<Option<Vec<String>>, String>
 {
@@ -106,19 +106,28 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
                     result.push(name.clone());
                 }
             }
+            if result.is_empty() || result.len() > 1024 {
+                return Err("native INTEGER record needs 1..=1024 fields".into());
+            }
             Ok(Some(result))
         }
         _ => Ok(None),
     }
 }
 
-fn field_slot(base: &str, field: &str) -> String {
-    format!("{base}__{field}")
+type RecordObjects = HashMap<String,(usize,Vec<String>)>;
+fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<(usize,Expr),String> {
+    let (object,fields)=records.get(base)
+        .ok_or_else(||format!("unsupported record object {base}"))?;
+    let offset=fields.iter().position(|f|f==field)
+        .ok_or_else(||format!("unsupported record field {base}.{field}"))?;
+    Ok((*object,Expr::Integer(offset as i32)))
 }
 
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
               arrays:&HashMap<&str,usize>,
+              records:&RecordObjects,
               functions:&HashMap<String,usize>)->Result<Expr,String> {
     if d.base.len()!=1 || d.sels.len()!=1 {
         return Err("unsupported qualified or selected function call".into());
@@ -136,19 +145,20 @@ fn lower_call(d:&syntax::ast::Designator,
     }
     let mut args=Vec::with_capacity(raw_args.len());
     for arg in raw_args {
-        args.push(lower_expr(arg,names,arrays,functions)?);
+        args.push(lower_expr(arg,names,arrays,records,functions)?);
     }
     Ok(Expr::Call{name:symbol.clone(),args})
 }
 
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               arrays: &HashMap<&str, usize>,
+              records: &RecordObjects,
               functions:&HashMap<String,usize>) -> Result<Expr, String> {
     match &expr.kind {
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
                         syntax::ast::Selector::Args(_)) => {
-            lower_call(d,names,arrays,functions)
+            lower_call(d,names,arrays,records,functions)
         }
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
@@ -159,15 +169,14 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1 => {
             match &d.sels[0] {
                 syntax::ast::Selector::Field(field) => {
-                    let slot = field_slot(&d.base[0], field);
-                    names.get(slot.as_str()).copied().map(Expr::Variable)
-                        .ok_or_else(|| format!("unsupported record field at {}", d.span.lo))
+                    let (array,index)=record_field(records,&d.base[0],field)?;
+                    Ok(Expr::ArrayElement {array,index:Box::new(index)})
                 }
                 syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                     let array=*arrays.get(d.base[0].as_str())
                         .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
                     Ok(Expr::ArrayElement {
-                        array,index:Box::new(lower_expr(&indices[0],names, arrays, functions)?),
+                        array,index:Box::new(lower_expr(&indices[0],names, arrays, records, functions)?),
                     })
                 }
                 _=>Err(format!("unsupported array selector at {}",d.span.lo)),
@@ -186,42 +195,69 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 BinOp::Ge => Op::Ge,
                 _ => return Err(format!("unsupported binary expression: {op:?}")),
             };
-            Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays, functions)?),
-                            Box::new(lower_expr(b, names, arrays, functions)?)))
+            Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays, records, functions)?),
+                            Box::new(lower_expr(b, names, arrays, records, functions)?)))
         }
-        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names, arrays, functions),
+        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names, arrays, records, functions),
         ExprKind::Unary(UnOp::Neg, a) =>
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
-                            Box::new(lower_expr(a, names, arrays, functions)?))),
+                            Box::new(lower_expr(a, names, arrays, records, functions)?))),
         _ => Err(format!("unsupported expression at {}", expr.span.lo)),
     }
 }
 
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &HashMap<&str, usize>,
+              records: &RecordObjects,
               functions:&HashMap<String,usize>) -> Result<Vec<Stmt>, String>
 {
     let mut out = Vec::new();
     for s in stmts {
         match &s.kind {
             StmtKind::Call(d)=>out.push(Stmt::Call(
-                lower_call(d,names,arrays,functions)?)),
+                lower_call(d,names,arrays,records,functions)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
-                let variable = names.get(target.base[0].as_str()).copied()
-                    .ok_or_else(|| format!("unknown local or parameter: {}", target.base[0]))?;
-                out.push(Stmt::Assign { variable, value: lower_expr(value, names, arrays, functions)? });
+                if let Some((dest,fields))=records.get(&target.base[0]) {
+                    // Source checker already validated nominal record equality.
+                    // A direct variable-to-variable copy is lowered fieldwise
+                    // through the same contiguous memory objects; other shapes
+                    // continue to reject until aggregate operations exist.
+                    let ExprKind::Designator(src)=&value.kind else {
+                        return Err("unsupported aggregate source expression".into());
+                    };
+                    if src.base.len()!=1 || !src.sels.is_empty() {
+                        return Err("record assignment requires direct source variable".into());
+                    }
+                    let (source,source_fields)=records.get(&src.base[0])
+                        .ok_or("record assignment requires record variable")?;
+                    if fields!=source_fields {
+                        return Err("record projection layout mismatch".into());
+                    }
+                    for offset in 0..fields.len() {
+                        let index=Expr::Integer(offset as i32);
+                        out.push(Stmt::AssignArray {
+                            array:*dest,index:index.clone(),
+                            value:Expr::ArrayElement {
+                                array:*source,index:Box::new(index),
+                            },
+                        });
+                    }
+                } else {
+                    let variable=names.get(target.base[0].as_str()).copied()
+                        .ok_or_else(||format!("unknown local or parameter: {}",target.base[0]))?;
+                    out.push(Stmt::Assign {variable,value:
+                        lower_expr(value,names,arrays,records,functions)?});
+                }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
                 match &target.sels[0] {
                     syntax::ast::Selector::Field(field) => {
-                        let slot = field_slot(&target.base[0], field);
-                        let variable = names.get(slot.as_str()).copied()
-                            .ok_or_else(|| format!("unsupported record assignment at {}", s.span.lo))?;
-                        out.push(Stmt::Assign {
-                            variable,
-                            value: lower_expr(value, names, arrays, functions)?,
+                        let (array,index)=record_field(records,&target.base[0],field)?;
+                        out.push(Stmt::AssignArray {
+                            array,index,
+                            value:lower_expr(value,names,arrays,records,functions)?,
                         });
                     }
                     syntax::ast::Selector::Index(indices) if indices.len()==1 => {
@@ -229,26 +265,26 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                             .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
                         out.push(Stmt::AssignArray {
                             array,
-                            index:lower_expr(&indices[0],names, arrays, functions)?,
-                            value:lower_expr(value,names, arrays, functions)?,
+                            index:lower_expr(&indices[0],names, arrays, records, functions)?,
+                            value:lower_expr(value,names, arrays, records, functions)?,
                         });
                     }
                     _=>return Err(format!("unsupported array assignment at {}",s.span.lo)),
                 }
             }
             StmtKind::Return(Some(e)) =>
-                out.push(Stmt::Return(lower_expr(e, names, arrays, functions)?)),
+                out.push(Stmt::Return(lower_expr(e, names, arrays, records, functions)?)),
             StmtKind::If { arms, els } => {
                 if arms.is_empty() { return Err("IF with no arm".into()); }
                 let mut tail = match els {
-                    Some(stmts) => lower_stmts(stmts, names, arrays, functions)?,
+                    Some(stmts) => lower_stmts(stmts, names, arrays, records, functions)?,
                     None => Vec::new(),
                 };
                 // ELSIF is lowered into a nested IF in the previous else arm.
                 for (condition, body) in arms.iter().rev() {
                     tail = vec![Stmt::If {
-                        condition: lower_expr(condition, names, arrays, functions)?,
-                        then_body: lower_stmts(body, names, arrays, functions)?,
+                        condition: lower_expr(condition, names, arrays, records, functions)?,
+                        then_body: lower_stmts(body, names, arrays, records, functions)?,
                         else_body: tail,
                     }];
                 }
@@ -257,8 +293,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
             StmtKind::While { arms } if arms.len() == 1 => {
                 let (condition, body) = &arms[0];
                 out.push(Stmt::While {
-                    condition: lower_expr(condition, names, arrays, functions)?,
-                    body: lower_stmts(body, names, arrays, functions)?,
+                    condition: lower_expr(condition, names, arrays, records, functions)?,
+                    body: lower_stmts(body, names, arrays, records, functions)?,
                 });
             }
             _ => return Err(format!("unsupported Oberon statement at {}", s.span.lo)),
@@ -292,17 +328,17 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
+    let mut module_record_fields=HashMap::<String,Vec<String>>::new();
     for decl in &module.decls.vars {
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
             for (name, exported) in &decl.names {
                 if *exported {
                     return Err("exported record objects require a native ABI layout".into());
                 }
-                for field in &fields {
-                    globals.push(Global {
-                        name: field_slot(name, field), exported: false,
-                    });
-                }
+                global_arrays.push(ArrayGlobal {
+                    name:name.clone(),length:fields.len() as u32,exported:false,
+                });
+                module_record_fields.insert(name.clone(),fields.clone());
             }
             continue;
         }
@@ -359,12 +395,14 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
+        let mut local_record_fields=HashMap::<String,Vec<String>>::new();
         for decl in &proc.decls.vars {
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
                 for (name, _) in &decl.names {
-                    for field in &fields {
-                        locals.push(field_slot(name, field));
-                    }
+                    fixed_arrays.push(ArrayLocal {
+                        name:name.clone(),length:fields.len() as u32,
+                    });
+                    local_record_fields.insert(name.clone(),fields.clone());
                 }
                 continue;
             }
@@ -405,7 +443,19 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         for (i, array) in fixed_arrays.iter().enumerate() {
             arrays.insert(array.name.as_str(), i);
         }
-        let body = lower_stmts(&proc.body, &names, &arrays, &signatures)?;
+        let mut records:RecordObjects=global_arrays.iter().enumerate()
+            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|fields|
+                (a.name.clone(),(fixed_arrays.len()+i,fields.clone()))))
+            .collect();
+        // Locals and parameters shadow module record names.
+        for name in parameters.iter().chain(locals.iter())
+            .chain(fixed_arrays.iter().map(|a|&a.name)) { records.remove(name); }
+        for (i,a) in fixed_arrays.iter().enumerate() {
+            if let Some(fields)=local_record_fields.get(&a.name) {
+                records.insert(a.name.clone(),(i,fields.clone()));
+            }
+        }
+        let body=lower_stmts(&proc.body,&names,&arrays,&records,&signatures)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
         if !contains_return(&body) {
@@ -426,7 +476,11 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
             .map(|(i, item)| (item.name.as_str(), i)).collect();
         let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
             .map(|(i, item)| (item.name.as_str(), i)).collect();
-        let body = lower_stmts(&module.body, &names, &arrays, &signatures)?;
+        let records:RecordObjects=global_arrays.iter().enumerate()
+            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|fields|
+                (a.name.clone(),(i,fields.clone()))))
+            .collect();
+        let body=lower_stmts(&module.body,&names,&arrays,&records,&signatures)?;
         if contains_return(&body) {
             return Err("module initialization cannot return a value".into());
         }
@@ -478,18 +532,47 @@ mod tests {
             END Records.";
         let module = lower_module(source).unwrap();
         assert_eq!(module.globals.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
-                   ["pair__left", "pair__right", "tally"]);
-        assert!(module.globals.iter().all(|g| !g.exported));
+                   ["tally"]);
+        assert_eq!(module.global_arrays,
+                   [ArrayGlobal{name:"pair".into(),length:2,exported:false}]);
         let f = &module.functions[0];
-        assert_eq!(f.locals, ["tmp__left", "tmp__right", "sum"]);
-        assert!(matches!(&f.body[0], Stmt::Assign {
-            variable: 1, value: Expr::Variable(0)
+        assert_eq!(f.locals, ["sum"]);
+        assert_eq!(f.arrays, [ArrayLocal{name:"tmp".into(),length:2}]);
+        assert!(matches!(&f.body[0], Stmt::AssignArray {
+            array:0,index:Expr::Integer(0),value:Expr::Variable(0),
         }));
-        assert!(matches!(&f.body[1], Stmt::Assign {
-            variable: 2, value: Expr::Variable(4)
-        }));
+        assert!(matches!(&f.body[1], Stmt::AssignArray {
+            array:0,index:Expr::Integer(1),
+            value:Expr::ArrayElement {array:1,index,..}
+        } if matches!(index.as_ref(), Expr::Integer(0))));
         assert!(matches!(&module.initializer.as_ref().unwrap().body[0],
-                         Stmt::Assign { variable: 0, value: Expr::Integer(7) }));
+                         Stmt::AssignArray {array:0,index:Expr::Integer(0),
+                             value:Expr::Integer(7)}));
+    }
+
+    #[test]
+    fn contiguous_record_assignment_copies_all_fields() {
+        let src="MODULE Copy;
+            TYPE Triple = RECORD a,b,c: INTEGER END;
+            VAR x,y: Triple;
+            PROCEDURE F*(n: INTEGER): INTEGER;
+            VAR p,q: Triple;
+            BEGIN
+                p.a:=n; p.b:=n+1; p.c:=n+2;
+                q:=p;
+                x:=q;
+                y:=x;
+                RETURN y.a+y.b+y.c
+            END F;
+            END Copy.";
+        let m=lower_module(src).unwrap();
+        assert_eq!(m.global_arrays.len(),2);
+        assert!(m.globals.is_empty());
+        let f=&m.functions[0];
+        assert_eq!(f.arrays.len(),2);
+        assert_eq!(f.arrays[0].length,3);
+        assert_eq!(f.body.iter().filter(|s|matches!(s,Stmt::AssignArray{..})).count(),12);
+        assert!(matches!(f.body.last(),Some(Stmt::Return(_))));
     }
 
     #[test]
@@ -505,10 +588,10 @@ mod tests {
                  Derived = RECORD (Base) y: INTEGER END;
             VAR r: Derived; END M.";
         assert!(lower_module(extension).is_err());
-        let whole_record = "MODULE M;
-            VAR a,b: RECORD x: INTEGER END;
+        let unsupported_array_copy = "MODULE M;
+            VAR a,b: ARRAY 2 OF INTEGER;
             BEGIN a := b END M.";
-        assert!(lower_module(whole_record).is_err());
+        assert!(lower_module(unsupported_array_copy).is_err());
     }
 
     #[test]
