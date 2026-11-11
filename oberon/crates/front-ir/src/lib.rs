@@ -146,6 +146,99 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
     }
 }
 
+/// Source-checked record layout metadata, independent of any compiler IR.
+/// This first producer covers the bridge's existing INTEGER-only records.
+/// Names are for diagnostics; declaration IDs are used for field selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedRecordLayout {
+    pub declaration: String,
+    pub base: Option<String>,
+    pub fields: Vec<CheckedRecordField>,
+    pub size_bytes: u32,
+    pub alignment_bytes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedRecordField {
+    pub declaration: String,
+    pub name: String,
+    pub ty: CheckedRecordFieldType,
+    pub offset_bytes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckedRecordFieldType {
+    Integer,
+    Record(String),
+}
+
+/// Build metadata only from the already semantically checked module AST.
+/// Each source record declaration is emitted exactly once; nested inline
+/// records receive stable path-scoped identities and named aliases retain
+/// their original nominal identity. This does not admit exported ABI/VAR/FP.
+fn checked_record_layout(
+    ty: &TypeExpr,
+    identity: &str,
+    named: &HashMap<String, String>,
+    layouts: &mut Vec<CheckedRecordLayout>,
+) -> Result<Option<String>, String> {
+    match ty {
+        TypeExpr::Named(q, _) if q.len() == 1 => Ok(named.get(&q[0]).cloned()),
+        TypeExpr::Record { base, fields, .. } => {
+            let parent = if let Some(q) = base {
+                if q.len() != 1 {
+                    return Err("qualified record base needs import support".into());
+                }
+                Some(named.get(&q[0])
+                    .ok_or("undefined checked base record identity")?.clone())
+            } else { None };
+            let mut extent = if let Some(base) = &parent {
+                layouts.iter().find(|r| &r.declaration == base)
+                    .ok_or("checked base record layout missing")?.size_bytes
+            } else { 0 };
+            let mut out = Vec::new();
+            for field in fields {
+                for (name, _) in &field.names {
+                    let child_id = format!("{identity}.{name}");
+                    let child = checked_record_layout(&field.ty, &child_id, named, layouts)?;
+                    let kind = match (&field.ty, child) {
+                        (TypeExpr::Named(q, _), None) if q.as_slice() == ["INTEGER"] =>
+                            CheckedRecordFieldType::Integer,
+                        (_, Some(id)) => CheckedRecordFieldType::Record(id),
+                        _ => return Err("checked record metadata needs INTEGER or record field".into()),
+                    };
+                    let bytes = match &kind {
+                        CheckedRecordFieldType::Integer => 4,
+                        CheckedRecordFieldType::Record(id) =>
+                            layouts.iter().find(|r| &r.declaration == id)
+                                .ok_or("checked nested record layout missing")?.size_bytes,
+                    };
+                    // Field declaration identities are never derived from
+                    // field *names* alone: source spans disambiguate declarations.
+                    let declaration = format!("{}:{}:{}", field.span.lo, field.span.hi, name);
+                    out.push(CheckedRecordField {
+                        declaration, name: name.clone(), ty: kind, offset_bytes: extent,
+                    });
+                    extent = extent.checked_add(bytes)
+                        .ok_or("checked record layout size overflow")?;
+                    if extent > 4096 {
+                        return Err("native INTEGER record exceeds 1024 words".into());
+                    }
+                }
+            }
+            if extent == 0 {
+                return Err("empty checked record layout unsupported".into());
+            }
+            layouts.push(CheckedRecordLayout {
+                declaration: identity.into(), base: parent,
+                fields: out, size_bytes: extent, alignment_bytes: 4,
+            });
+            Ok(Some(identity.into()))
+        }
+        _ => Ok(None),
+    }
+}
+
 type RecordObjects = HashMap<String,(usize,Vec<String>)>;
 fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<(usize,Expr),String> {
     let (object,fields)=records.get(base)
@@ -409,6 +502,13 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
 /// Exported Oberon procedures carry `*`; omitted `*` means module-private.
 /// The older `lower_module` API remains unchanged for existing consumers.
 pub fn lower_module_with_exports(source: &str) -> Result<(Module, Vec<String>), String> {
+    lower_module_with_metadata(source).map(|(module, exports, _)| (module, exports))
+}
+
+/// One semantic-check/parse pass for native consumers that also need checked
+/// nominal record/field identity and byte layouts. No raw AST is exposed.
+pub fn lower_module_with_metadata(source: &str)
+    -> Result<(Module, Vec<String>, Vec<CheckedRecordLayout>), String> {
     let (checked, diagnostics) = sema::check_module_recovering(source, &[]);
     if let Some(d) = diagnostics.iter().find(|d| d.is_error()) {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
@@ -422,12 +522,19 @@ pub fn lower_module_with_exports(source: &str) -> Result<(Module, Vec<String>), 
         return Err("module imports or constants are not yet supported".into());
     }
     let mut record_types = HashMap::<String, Vec<String>>::new();
+    let mut record_nominals = HashMap::<String, String>::new();
+    let mut checked_layouts = Vec::<CheckedRecordLayout>::new();
     for decl in &module.decls.types {
         if decl.export {
             return Err("exported record types require a native ABI layout".into());
         }
         let fields = record_fields(&decl.ty, &record_types)?
             .ok_or_else(|| format!("unsupported type declaration: {}", decl.name))?;
+        let declaration = format!("{}.{}", module.name, decl.name);
+        let nominal = checked_record_layout(
+            &decl.ty, &declaration, &record_nominals, &mut checked_layouts,
+        )?.ok_or("unsupported source-checked record type")?;
+        record_nominals.insert(decl.name.clone(), nominal);
         record_types.insert(decl.name.clone(), fields);
     }
     let mut globals = Vec::<Global>::new();
@@ -603,6 +710,7 @@ pub fn lower_module_with_exports(source: &str) -> Result<(Module, Vec<String>), 
     Ok((
         Module { name: module.name, globals, global_arrays, functions, initializer },
         exported_procedures,
+        checked_layouts,
     ))
 }
 
