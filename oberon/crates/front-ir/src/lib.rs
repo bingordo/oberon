@@ -325,11 +325,12 @@ fn record_shape(
     }
     let layout=layouts.iter().find(|r|r.declaration==identity)
         .ok_or("record object layout missing")?;
-    // First executable mixed slice reuses the native 4-byte frame-array
-    // root, including its existing zeroing and checked provenance.
-    // Pure BYTE objects need exact-sized byte roots and stay fail-closed.
-    if layout.alignment_bytes!=4 || layout.size_bytes%4!=0 {
-        return Err("BYTE-only record storage requires native byte allocation".into());
+    // The frontend's array index is a *storage handle*, not a license
+    // to round object bounds up to machine words. Native lowering reserves
+    // ceil(bytes/4) frame words, but proves the original byte extent using
+    // LocalByteArrayAddr for partial-word objects.
+    if layout.size_bytes==0 || layout.alignment_bytes>4 {
+        return Err("unsupported private record byte extent or alignment".into());
     }
     let mut leaves=Vec::new();
     visit(identity,"",0,layouts,&mut leaves)?;
@@ -346,7 +347,7 @@ fn record_shape(
     Ok(RecordShape {
         fields:legacy_fields.to_vec(),
         bytes:leaves.iter().map(|x|(x.1,x.2)).collect(),
-        has_byte,words:size/4,
+        has_byte,words:size.div_ceil(4),
     })
 }
 

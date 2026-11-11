@@ -47,10 +47,19 @@ fn source_checked_mixed_byte_and_integer_has_padded_offsets_and_word_storage() {
 
 #[test]
 fn byte_only_objects_and_unverified_byte_range_copy_fail_closed() {
-    assert!(lower_module("MODULE Pure;
+    let (module,_,layouts,objects)=lower_module_with_record_objects("MODULE Pure;
         TYPE R=RECORD b: BYTE END;
         VAR r: R;
-        END Pure.").is_err());
+        PROCEDURE F*(n: INTEGER): INTEGER;
+        VAR l: R;
+        BEGIN l.b:=n; r.b:=l.b; RETURN r.b END F;
+        END Pure.").unwrap();
+    assert_eq!((layouts[0].size_bytes,layouts[0].alignment_bytes),(1,1));
+    assert_eq!(module.global_arrays[0].length,1);
+    assert_eq!(module.functions[0].arrays[0].length,1);
+    assert_eq!(objects.len(),2);
+    assert!(matches!(module.functions[0].body[0],
+        Stmt::AssignRecordField {array:0,byte_offset:0,bits:8,..}));
 
     assert!(lower_module("MODULE Copy;
         TYPE R=RECORD b: BYTE; n: INTEGER END;
@@ -84,4 +93,29 @@ fn nested_byte_fields_preserve_padding_and_absolute_offsets() {
         Stmt::AssignRecordField {array:0,byte_offset:4,bits:8,..}));
     assert!(matches!(&f.body[1],
         Stmt::AssignRecordField {array:0,byte_offset:8,bits:32,..}));
+}
+
+#[test]
+fn precise_byte_object_sizes_round_up_handles_without_forging_layout() {
+    let src="MODULE Tiny;
+        TYPE Three=RECORD a,b,c: BYTE END;
+             Five=RECORD a,b,c,d,e: BYTE END;
+        VAR g: Three;
+        PROCEDURE Test*(n: INTEGER): INTEGER;
+        VAR x: Five;
+        BEGIN
+            x.a:=n; x.e:=n+4; g.b:=x.e;
+            RETURN g.a+g.b+x.a
+        END Test;
+        END Tiny.";
+    let (module,_,layouts,objects)=lower_module_with_record_objects(src).unwrap();
+    assert_eq!(layouts[0].size_bytes,3);
+    assert_eq!(layouts[1].size_bytes,5);
+    assert_eq!(layouts[0].alignment_bytes,1);
+    assert_eq!(layouts[1].alignment_bytes,1);
+    assert_eq!(module.global_arrays[0].length,1);
+    assert_eq!(module.functions[0].arrays[0].length,2);
+    assert_eq!(objects.len(),2);
+    assert!(matches!(&module.functions[0].body[1],
+        Stmt::AssignRecordField {array:0,byte_offset:4,bits:8,..}));
 }
