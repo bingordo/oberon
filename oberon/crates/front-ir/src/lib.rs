@@ -113,6 +113,16 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
                         .ok_or("record fields must be INTEGER or supported private records")?)
                 };
                 for (name, _) in &field.names {
+                    // Oberon accepts an extension that hides a base field,
+                    // with a diagnostic. Our compact leaf-name projection
+                    // cannot distinguish the two nominal declarations:
+                    // silently picking the first offset would miscompile.
+                    // Reject until source field declaration IDs are retained.
+                    if result.iter().any(|path|
+                        path.split('.').next() == Some(name.as_str())) {
+                        return Err(format!(
+                            "record field {name} hides another field; native layout needs declaration identity"));
+                    }
                     if let Some(paths)=&nested {
                         for path in paths {
                             // Dots are not legal Oberon identifier characters.
@@ -790,6 +800,28 @@ mod tests {
             TYPE R = RECORD a: ARRAY 3 OF INTEGER END;
             VAR r: R; END Bad.";
         assert!(lower_module(unsupported).is_err());
+    }
+
+    #[test]
+    fn shadowed_inherited_record_fields_fail_closed() {
+        // Source Oberon may accept a shadowed inherited field with a
+        // warning, but the native flattened offsets must never pick an
+        // arbitrary old or new field declaration.
+        let hidden="MODULE Hidden;
+            TYPE Base = RECORD x: INTEGER END;
+                 Child = RECORD (Base) x: INTEGER END;
+            VAR child: Child;
+            PROCEDURE F*(): INTEGER;
+            BEGIN child.x:=7; RETURN child.x END F;
+            END Hidden.";
+        assert!(lower_module(hidden).is_err());
+        let nested="MODULE HiddenNested;
+            TYPE Inner = RECORD x: INTEGER END;
+                 Base = RECORD member: Inner END;
+                 Child = RECORD (Base) member: Inner END;
+            VAR child: Child;
+            END HiddenNested.";
+        assert!(lower_module(nested).is_err());
     }
 
     #[test]
