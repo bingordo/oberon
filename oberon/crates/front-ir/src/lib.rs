@@ -532,18 +532,47 @@ mod tests {
             END Records.";
         let module = lower_module(source).unwrap();
         assert_eq!(module.globals.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
-                   ["pair__left", "pair__right", "tally"]);
-        assert!(module.globals.iter().all(|g| !g.exported));
+                   ["tally"]);
+        assert_eq!(module.global_arrays,
+                   [ArrayGlobal{name:"pair".into(),length:2,exported:false}]);
         let f = &module.functions[0];
-        assert_eq!(f.locals, ["tmp__left", "tmp__right", "sum"]);
-        assert!(matches!(&f.body[0], Stmt::Assign {
-            variable: 1, value: Expr::Variable(0)
+        assert_eq!(f.locals, ["sum"]);
+        assert_eq!(f.arrays, [ArrayLocal{name:"tmp".into(),length:2}]);
+        assert!(matches!(&f.body[0], Stmt::AssignArray {
+            array:0,index:Expr::Integer(0),value:Expr::Variable(0),
         }));
-        assert!(matches!(&f.body[1], Stmt::Assign {
-            variable: 2, value: Expr::Variable(4)
-        }));
+        assert!(matches!(&f.body[1], Stmt::AssignArray {
+            array:0,index:Expr::Integer(1),
+            value:Expr::ArrayElement {array:1,index,..}
+        } if matches!(index.as_ref(), Expr::Integer(0))));
         assert!(matches!(&module.initializer.as_ref().unwrap().body[0],
-                         Stmt::Assign { variable: 0, value: Expr::Integer(7) }));
+                         Stmt::AssignArray {array:0,index:Expr::Integer(0),
+                             value:Expr::Integer(7)}));
+    }
+
+    #[test]
+    fn contiguous_record_assignment_copies_all_fields() {
+        let src="MODULE Copy;
+            TYPE Triple = RECORD a,b,c: INTEGER END;
+            VAR x,y: Triple;
+            PROCEDURE F*(n: INTEGER): INTEGER;
+            VAR p,q: Triple;
+            BEGIN
+                p.a:=n; p.b:=n+1; p.c:=n+2;
+                q:=p;
+                x:=q;
+                y:=x;
+                RETURN y.a+y.b+y.c
+            END F;
+            END Copy.";
+        let m=lower_module(src).unwrap();
+        assert_eq!(m.global_arrays.len(),2);
+        assert!(m.globals.is_empty());
+        let f=&m.functions[0];
+        assert_eq!(f.arrays.len(),2);
+        assert_eq!(f.arrays[0].length,3);
+        assert_eq!(f.body.iter().filter(|s|matches!(s,Stmt::AssignArray{..})).count(),12);
+        assert!(matches!(f.body.last(),Some(Stmt::Return(_))));
     }
 
     #[test]
@@ -559,10 +588,10 @@ mod tests {
                  Derived = RECORD (Base) y: INTEGER END;
             VAR r: Derived; END M.";
         assert!(lower_module(extension).is_err());
-        let whole_record = "MODULE M;
-            VAR a,b: RECORD x: INTEGER END;
+        let unsupported_array_copy = "MODULE M;
+            VAR a,b: ARRAY 2 OF INTEGER;
             BEGIN a := b END M.";
-        assert!(lower_module(whole_record).is_err());
+        assert!(lower_module(unsupported_array_copy).is_err());
     }
 
     #[test]
