@@ -682,7 +682,7 @@ pub fn lower_module_with_record_objects(source: &str)
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
-    let mut module_record_fields=HashMap::<String,Vec<String>>::new();
+    let mut module_record_fields=HashMap::<String,RecordShape>::new();
     for decl in &module.decls.vars {
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
             let first = decl.names.first().ok_or("record variable declaration has no names")?;
@@ -690,14 +690,15 @@ pub fn lower_module_with_record_objects(source: &str)
             let record = checked_record_layout(
                 &decl.ty, &identity, &record_nominals, &mut checked_layouts,
             )?.ok_or("checked global record identity is missing")?;
+            let shape=record_shape(&record,&checked_layouts,&fields)?;
             for (name, exported) in &decl.names {
                 if *exported {
                     return Err("exported record objects require a native ABI layout".into());
                 }
                 global_arrays.push(ArrayGlobal {
-                    name:name.clone(),length:fields.len() as u32,exported:false,
+                    name:name.clone(),length:shape.words,exported:false,
                 });
-                module_record_fields.insert(name.clone(),fields.clone());
+                module_record_fields.insert(name.clone(),shape.clone());
                 checked_objects.push(CheckedRecordObject {
                     function:None, name:name.clone(), record:record.clone(),
                 });
@@ -757,7 +758,7 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
-        let mut local_record_fields=HashMap::<String,Vec<String>>::new();
+        let mut local_record_fields=HashMap::<String,RecordShape>::new();
         for decl in &proc.decls.vars {
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
                 let first = decl.names.first().ok_or("local record declaration has no names")?;
@@ -765,11 +766,12 @@ pub fn lower_module_with_record_objects(source: &str)
                 let record = checked_record_layout(
                     &decl.ty, &identity, &record_nominals, &mut checked_layouts,
                 )?.ok_or("checked local record identity is missing")?;
+                let shape=record_shape(&record,&checked_layouts,&fields)?;
                 for (name, _) in &decl.names {
                     fixed_arrays.push(ArrayLocal {
-                        name:name.clone(),length:fields.len() as u32,
+                        name:name.clone(),length:shape.words,
                     });
-                    local_record_fields.insert(name.clone(),fields.clone());
+                    local_record_fields.insert(name.clone(),shape.clone());
                     checked_objects.push(CheckedRecordObject {
                         function:Some(proc.name.clone()), name:name.clone(),
                         record:record.clone(),
@@ -815,15 +817,15 @@ pub fn lower_module_with_record_objects(source: &str)
             arrays.insert(array.name.as_str(), i);
         }
         let mut records:RecordObjects=global_arrays.iter().enumerate()
-            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|fields|
-                (a.name.clone(),(fixed_arrays.len()+i,fields.clone()))))
+            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
+                (a.name.clone(),(fixed_arrays.len()+i,shape.clone()))))
             .collect();
         // Locals and parameters shadow module record names.
         for name in parameters.iter().chain(locals.iter())
             .chain(fixed_arrays.iter().map(|a|&a.name)) { records.remove(name); }
         for (i,a) in fixed_arrays.iter().enumerate() {
-            if let Some(fields)=local_record_fields.get(&a.name) {
-                records.insert(a.name.clone(),(i,fields.clone()));
+            if let Some(shape)=local_record_fields.get(&a.name) {
+                records.insert(a.name.clone(),(i,shape.clone()));
             }
         }
         let body=lower_stmts(&proc.body,&names,&arrays,&records,&signatures)?;
@@ -848,8 +850,8 @@ pub fn lower_module_with_record_objects(source: &str)
         let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
             .map(|(i, item)| (item.name.as_str(), i)).collect();
         let records:RecordObjects=global_arrays.iter().enumerate()
-            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|fields|
-                (a.name.clone(),(i,fields.clone()))))
+            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
+                (a.name.clone(),(i,shape.clone()))))
             .collect();
         let body=lower_stmts(&module.body,&names,&arrays,&records,&signatures)?;
         if contains_return(&body) {
