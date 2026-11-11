@@ -94,10 +94,16 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
     match ty {
         TypeExpr::Named(q, _) if q.len()==1 => Ok(types.get(&q[0]).cloned()),
         TypeExpr::Record { base, fields, .. } => {
-            if base.is_some() {
-                return Err("record extension needs a native layout".into());
-            }
-            let mut result = Vec::new();
+            // The full Oberon checker establishes extension legality.
+            // Prefix fields keep the base record's original byte offsets;
+            // every represented field is still exactly four bytes.
+            let mut result=if let Some(base)=base {
+                if base.len()!=1 {
+                    return Err("qualified base-record types need import support".into());
+                }
+                types.get(&base[0]).cloned()
+                    .ok_or("unsupported record extension base")?
+            } else { Vec::new() };
             for field in fields {
                 if !matches!(&field.ty, TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
                     return Err("only INTEGER record fields can be projected".into());
@@ -231,8 +237,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     }
                     let (source,source_fields)=records.get(&src.base[0])
                         .ok_or("record assignment requires record variable")?;
-                    if fields!=source_fields {
-                        return Err("record projection layout mismatch".into());
+                    if !source_fields.starts_with(fields) {
+                        return Err("record projection requires matching base prefix".into());
                     }
                     for offset in 0..fields.len() {
                         let index=Expr::Integer(offset as i32);
@@ -576,6 +582,47 @@ mod tests {
     }
 
     #[test]
+    fn inherited_integer_fields_keep_prefix_offsets_and_base_copies() {
+        let source="MODULE Ext;
+            TYPE Base = RECORD a,b: INTEGER END;
+                 Derived = RECORD (Base) c: INTEGER END;
+            VAR b: Base; d: Derived;
+            PROCEDURE F*(n: INTEGER): INTEGER;
+            VAR q: Derived;
+            BEGIN
+                q.a:=n; q.b:=n+1; q.c:=n+2;
+                d:=q;
+                b:=d;
+                RETURN b.a+b.b+d.c
+            END F;
+            END Ext.";
+        let m=lower_module(source).unwrap();
+        assert_eq!(m.global_arrays.len(),2);
+        assert_eq!(m.global_arrays[0].length,2);
+        assert_eq!(m.global_arrays[1].length,3);
+        let f=&m.functions[0];
+        assert_eq!(f.arrays,[ArrayLocal{name:"q".into(),length:3}]);
+        assert!(matches!(&f.body[0],Stmt::AssignArray {
+            array:0,index:Expr::Integer(0),..
+        }));
+        // Inherited field b keeps offset 1; derived-only c is at offset 2.
+        assert!(matches!(&f.body[1],Stmt::AssignArray {
+            array:0,index:Expr::Integer(1),..
+        }));
+        assert!(matches!(&f.body[2],Stmt::AssignArray {
+            array:0,index:Expr::Integer(2),..
+        }));
+        // 3 source stores + 3 derived copies + only 2 base-prefix copies.
+        assert_eq!(f.body.iter().filter(|stmt|matches!(stmt,Stmt::AssignArray{..})).count(),8);
+        let invalid="MODULE Bad;
+            TYPE Base = RECORD x: INTEGER END;
+                 Child = RECORD (Base) y: INTEGER END;
+            VAR base: Base; child: Child;
+            BEGIN child := base END Bad.";
+        assert!(lower_module(invalid).is_err(),"base-to-derived assignment must reject");
+    }
+
+    #[test]
     fn record_projection_rejects_unrepresentable_layouts_and_operations() {
         let exported = "MODULE M; TYPE Pair = RECORD x: INTEGER END;
             VAR p*: Pair; END M.";
@@ -583,11 +630,11 @@ mod tests {
         let pointer = "MODULE M; TYPE R = RECORD p: POINTER TO R END;
             VAR r: R; END M.";
         assert!(lower_module(pointer).is_err());
-        let extension = "MODULE M;
+        let bad_extension = "MODULE M;
             TYPE Base = RECORD x: INTEGER END;
-                 Derived = RECORD (Base) y: INTEGER END;
+                 Derived = RECORD (Base) y: REAL END;
             VAR r: Derived; END M.";
-        assert!(lower_module(extension).is_err());
+        assert!(lower_module(bad_extension).is_err());
         let unsupported_array_copy = "MODULE M;
             VAR a,b: ARRAY 2 OF INTEGER;
             BEGIN a := b END M.";
