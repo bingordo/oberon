@@ -401,11 +401,23 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
 /// INTEGER parameters). Module imports and external/runtime references are
 /// not implemented.
 pub fn lower_module(source: &str) -> Result<Module, String> {
+    lower_module_with_exports(source).map(|(module, _)| module)
+}
+
+/// Preserve checked source-level procedure visibility without exposing
+/// parser AST types or forcing downstream native backends to reparse source.
+/// Exported Oberon procedures carry `*`; omitted `*` means module-private.
+/// The older `lower_module` API remains unchanged for existing consumers.
+pub fn lower_module_with_exports(source: &str) -> Result<(Module, Vec<String>), String> {
     let (checked, diagnostics) = sema::check_module_recovering(source, &[]);
     if let Some(d) = diagnostics.iter().find(|d| d.is_error()) {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
     }
     let module = checked.ok_or("Oberon parser did not produce a module")?;
+    let exported_procedures = module.decls.procs.iter()
+        .filter(|proc| proc.export)
+        .map(|proc| proc.name.clone())
+        .collect::<Vec<_>>();
     if !module.imports.is_empty() || !module.decls.consts.is_empty() {
         return Err("module imports or constants are not yet supported".into());
     }
@@ -588,7 +600,10 @@ pub fn lower_module(source: &str) -> Result<Module, String> {
         && initializer.is_none() {
         return Err("module has no supported procedures, globals or initialization".into());
     }
-    Ok(Module { name: module.name, globals, global_arrays, functions, initializer })
+    Ok((
+        Module { name: module.name, globals, global_arrays, functions, initializer },
+        exported_procedures,
+    ))
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
@@ -1069,5 +1084,24 @@ mod tests {
         let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
             VAR z: REAL; BEGIN RETURN x END P; END M.");
         assert!(e.unwrap_err().contains("INTEGER local"));
+    }
+}
+
+#[cfg(test)]
+mod checked_procedure_exports_tests {
+    use super::*;
+
+    #[test]
+    fn source_checked_exports_preserve_public_private_and_old_api() {
+        let source = "MODULE M;
+            PROCEDURE Private(x: INTEGER): INTEGER;
+            BEGIN RETURN x + 1 END Private;
+            PROCEDURE Public*(x: INTEGER): INTEGER;
+            BEGIN RETURN Private(x) END Public;
+            END M.";
+        let (module, exports) = lower_module_with_exports(source).unwrap();
+        assert_eq!(exports, vec!["Public".to_string()]);
+        assert_eq!(module.functions.len(), 2);
+        assert_eq!(lower_module(source).unwrap(), module);
     }
 }
