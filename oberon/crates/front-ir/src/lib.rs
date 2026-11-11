@@ -61,6 +61,10 @@ pub enum Expr {
     Variable(usize),
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
+    /// Source-checked private record leaf: exact byte offset from its
+    /// existing declared local/global storage root, with width 8 or 32.
+    /// No free pointer, by-value record ABI or arbitrary byte access.
+    RecordField { array: usize, byte_offset: u32, bits: u8 },
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
@@ -78,6 +82,8 @@ pub enum Op {
 pub enum Stmt {
     Assign { variable: usize, value: Expr },
     AssignArray { array: usize, index: Expr, value: Expr },
+    /// Ordered byte-exact private record leaf write; widths 8/32 only.
+    AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
     Return(Expr),
     /// Evaluate a procedure call for its effect, ignoring its result.
     Call(Expr),
@@ -106,11 +112,11 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
             } else { Vec::new() };
             for field in fields {
                 let nested=if matches!(&field.ty,
-                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
+                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] || q.as_slice()==["BYTE"]) {
                     None
                 } else {
                     Some(record_fields(&field.ty, types)?
-                        .ok_or("record fields must be INTEGER or supported private records")?)
+                        .ok_or("record fields must be INTEGER, BYTE or supported private records")?)
                 };
                 for (name, _) in &field.names {
                     // Oberon accepts an extension that hides a base field,
@@ -169,6 +175,7 @@ pub struct CheckedRecordField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckedRecordFieldType {
     Integer,
+    Byte,
     Record(String),
 }
 
@@ -187,6 +194,16 @@ pub struct CheckedRecordObject {
 pub type CheckedRecordProjection = (
     Module, Vec<String>, Vec<CheckedRecordLayout>, Vec<CheckedRecordObject>,
 );
+
+/// Natural byte layout of the checked private INTEGER/BYTE subset.
+fn align_checked_record(bytes:u32,alignment:u32)->Result<u32,String> {
+    if !matches!(alignment,1|4) {
+        return Err("unsupported private record scalar alignment".into());
+    }
+    bytes.checked_add(alignment-1)
+        .map(|n|n&!(alignment-1))
+        .ok_or_else(||"checked record byte layout overflow".into())
+}
 
 /// Build metadata only from the already semantically checked module AST.
 /// Each source record declaration is emitted exactly once; nested inline
@@ -208,10 +225,11 @@ fn checked_record_layout(
                 Some(named.get(&q[0])
                     .ok_or("undefined checked base record identity")?.clone())
             } else { None };
-            let mut extent = if let Some(base) = &parent {
-                layouts.iter().find(|r| &r.declaration == base)
-                    .ok_or("checked base record layout missing")?.size_bytes
-            } else { 0 };
+            let (mut extent,mut alignment)=if let Some(base)=&parent {
+                let b=layouts.iter().find(|r|&r.declaration==base)
+                    .ok_or("checked base record layout missing")?;
+                (b.size_bytes,b.alignment_bytes)
+            } else {(0,1)};
             let mut out = Vec::new();
             for field in fields {
                 for (name, _) in &field.names {
@@ -220,15 +238,24 @@ fn checked_record_layout(
                     let kind = match (&field.ty, child) {
                         (TypeExpr::Named(q, _), None) if q.as_slice() == ["INTEGER"] =>
                             CheckedRecordFieldType::Integer,
+                        (TypeExpr::Named(q, _), None) if q.as_slice() == ["BYTE"] =>
+                            CheckedRecordFieldType::Byte,
                         (_, Some(id)) => CheckedRecordFieldType::Record(id),
                         _ => return Err("checked record metadata needs INTEGER or record field".into()),
                     };
-                    let bytes = match &kind {
-                        CheckedRecordFieldType::Integer => 4,
-                        CheckedRecordFieldType::Record(id) =>
-                            layouts.iter().find(|r| &r.declaration == id)
-                                .ok_or("checked nested record layout missing")?.size_bytes,
+                    let (bytes,align) = match &kind {
+                        CheckedRecordFieldType::Integer => (4,4),
+                        CheckedRecordFieldType::Byte => (1,1),
+                        CheckedRecordFieldType::Record(id) => {
+                            let nested=layouts.iter().find(|r|&r.declaration==id)
+                                .ok_or("checked nested record layout missing")?;
+                            (nested.size_bytes,nested.alignment_bytes)
+                        },
                     };
+                    // All recorded byte offsets come from the semantically
+                    // checked field sequence and natural target alignment.
+                    extent=align_checked_record(extent,align)?;
+                    alignment=alignment.max(align);
                     // Field declaration identities are never derived from
                     // field *names* alone: source spans disambiguate declarations.
                     let declaration = format!("{}:{}:{}", field.span.lo, field.span.hi, name);
@@ -245,9 +272,13 @@ fn checked_record_layout(
             if extent == 0 {
                 return Err("empty checked record layout unsupported".into());
             }
+            let total=align_checked_record(extent,alignment)?;
+            if total>4096 {
+                return Err("checked record object exceeds maximum byte size".into());
+            }
             layouts.push(CheckedRecordLayout {
                 declaration: identity.into(), base: parent,
-                fields: out, size_bytes: extent, alignment_bytes: 4,
+                fields: out, size_bytes: total, alignment_bytes: alignment,
             });
             Ok(Some(identity.into()))
         }
