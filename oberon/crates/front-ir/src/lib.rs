@@ -61,6 +61,10 @@ pub enum Expr {
     Variable(usize),
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
+    /// Source-checked private record leaf: exact byte offset from its
+    /// existing declared local/global storage root, with width 8 or 32.
+    /// No free pointer, by-value record ABI or arbitrary byte access.
+    RecordField { array: usize, byte_offset: u32, bits: u8 },
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
@@ -78,6 +82,8 @@ pub enum Op {
 pub enum Stmt {
     Assign { variable: usize, value: Expr },
     AssignArray { array: usize, index: Expr, value: Expr },
+    /// Ordered byte-exact private record leaf write; widths 8/32 only.
+    AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
     Return(Expr),
     /// Evaluate a procedure call for its effect, ignoring its result.
     Call(Expr),
@@ -106,11 +112,11 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
             } else { Vec::new() };
             for field in fields {
                 let nested=if matches!(&field.ty,
-                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"]) {
+                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] || q.as_slice()==["BYTE"]) {
                     None
                 } else {
                     Some(record_fields(&field.ty, types)?
-                        .ok_or("record fields must be INTEGER or supported private records")?)
+                        .ok_or("record fields must be INTEGER, BYTE or supported private records")?)
                 };
                 for (name, _) in &field.names {
                     // Oberon accepts an extension that hides a base field,
@@ -169,6 +175,7 @@ pub struct CheckedRecordField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckedRecordFieldType {
     Integer,
+    Byte,
     Record(String),
 }
 
@@ -187,6 +194,16 @@ pub struct CheckedRecordObject {
 pub type CheckedRecordProjection = (
     Module, Vec<String>, Vec<CheckedRecordLayout>, Vec<CheckedRecordObject>,
 );
+
+/// Natural byte layout of the checked private INTEGER/BYTE subset.
+fn align_checked_record(bytes:u32,alignment:u32)->Result<u32,String> {
+    if !matches!(alignment,1|4) {
+        return Err("unsupported private record scalar alignment".into());
+    }
+    bytes.checked_add(alignment-1)
+        .map(|n|n&!(alignment-1))
+        .ok_or_else(||"checked record byte layout overflow".into())
+}
 
 /// Build metadata only from the already semantically checked module AST.
 /// Each source record declaration is emitted exactly once; nested inline
@@ -208,10 +225,11 @@ fn checked_record_layout(
                 Some(named.get(&q[0])
                     .ok_or("undefined checked base record identity")?.clone())
             } else { None };
-            let mut extent = if let Some(base) = &parent {
-                layouts.iter().find(|r| &r.declaration == base)
-                    .ok_or("checked base record layout missing")?.size_bytes
-            } else { 0 };
+            let (mut extent,mut alignment)=if let Some(base)=&parent {
+                let b=layouts.iter().find(|r|&r.declaration==base)
+                    .ok_or("checked base record layout missing")?;
+                (b.size_bytes,b.alignment_bytes)
+            } else {(0,1)};
             let mut out = Vec::new();
             for field in fields {
                 for (name, _) in &field.names {
@@ -220,15 +238,24 @@ fn checked_record_layout(
                     let kind = match (&field.ty, child) {
                         (TypeExpr::Named(q, _), None) if q.as_slice() == ["INTEGER"] =>
                             CheckedRecordFieldType::Integer,
+                        (TypeExpr::Named(q, _), None) if q.as_slice() == ["BYTE"] =>
+                            CheckedRecordFieldType::Byte,
                         (_, Some(id)) => CheckedRecordFieldType::Record(id),
                         _ => return Err("checked record metadata needs INTEGER or record field".into()),
                     };
-                    let bytes = match &kind {
-                        CheckedRecordFieldType::Integer => 4,
-                        CheckedRecordFieldType::Record(id) =>
-                            layouts.iter().find(|r| &r.declaration == id)
-                                .ok_or("checked nested record layout missing")?.size_bytes,
+                    let (bytes,align) = match &kind {
+                        CheckedRecordFieldType::Integer => (4,4),
+                        CheckedRecordFieldType::Byte => (1,1),
+                        CheckedRecordFieldType::Record(id) => {
+                            let nested=layouts.iter().find(|r|&r.declaration==id)
+                                .ok_or("checked nested record layout missing")?;
+                            (nested.size_bytes,nested.alignment_bytes)
+                        },
                     };
+                    // All recorded byte offsets come from the semantically
+                    // checked field sequence and natural target alignment.
+                    extent=align_checked_record(extent,align)?;
+                    alignment=alignment.max(align);
                     // Field declaration identities are never derived from
                     // field *names* alone: source spans disambiguate declarations.
                     let declaration = format!("{}:{}:{}", field.span.lo, field.span.hi, name);
@@ -245,9 +272,13 @@ fn checked_record_layout(
             if extent == 0 {
                 return Err("empty checked record layout unsupported".into());
             }
+            let total=align_checked_record(extent,alignment)?;
+            if total>4096 {
+                return Err("checked record object exceeds maximum byte size".into());
+            }
             layouts.push(CheckedRecordLayout {
                 declaration: identity.into(), base: parent,
-                fields: out, size_bytes: extent, alignment_bytes: 4,
+                fields: out, size_bytes: total, alignment_bytes: alignment,
             });
             Ok(Some(identity.into()))
         }
@@ -255,13 +286,100 @@ fn checked_record_layout(
     }
 }
 
-type RecordObjects = HashMap<String,(usize,Vec<String>)>;
-fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<(usize,Expr),String> {
-    let (object,fields)=records.get(base)
+/// The source record owns exact byte offsets; an INTEGER-only source
+/// retains the old word-index bridge for differential tests. Mixed records
+/// use explicit byte-addressable leaf operations, never name-guessed slots.
+#[derive(Clone,Debug)]
+struct RecordShape {
+    fields: Vec<String>,
+    bytes: Vec<(u32,u8)>,
+    has_byte: bool,
+    words: u32,
+}
+
+fn record_shape(
+    identity:&str, layouts:&[CheckedRecordLayout], legacy_fields:&[String],
+) -> Result<RecordShape,String> {
+    fn visit(
+        id:&str,prefix:&str,offset:u32,layouts:&[CheckedRecordLayout],
+        out:&mut Vec<(String,u32,u8)>,
+    )->Result<(),String> {
+        let record=layouts.iter().find(|r|r.declaration==id)
+            .ok_or("checked record object refers to missing record declaration")?;
+        if let Some(base)=&record.base {
+            visit(base,prefix,offset,layouts,out)?;
+        }
+        for field in &record.fields {
+            let field_offset=offset.checked_add(field.offset_bytes)
+                .ok_or("record field byte offset overflow")?;
+            let path=format!("{prefix}{}",field.name);
+            match &field.ty {
+                CheckedRecordFieldType::Integer=>out.push((path,field_offset,32)),
+                CheckedRecordFieldType::Byte=>out.push((path,field_offset,8)),
+                CheckedRecordFieldType::Record(child)=>{
+                    visit(child,&format!("{path}."),field_offset,layouts,out)?;
+                },
+            }
+        }
+        Ok(())
+    }
+    let layout=layouts.iter().find(|r|r.declaration==identity)
+        .ok_or("record object layout missing")?;
+    // First executable mixed slice reuses the native 4-byte frame-array
+    // root, including its existing zeroing and checked provenance.
+    // Pure BYTE objects need exact-sized byte roots and stay fail-closed.
+    if layout.alignment_bytes!=4 || layout.size_bytes%4!=0 {
+        return Err("BYTE-only record storage requires native byte allocation".into());
+    }
+    let mut leaves=Vec::new();
+    visit(identity,"",0,layouts,&mut leaves)?;
+    if leaves.iter().map(|x|x.0.as_str()).ne(legacy_fields.iter().map(String::as_str)) {
+        return Err("record layout leaf order disagrees with checked field projection".into());
+    }
+    let size=layout.size_bytes;
+    for (_,offset,bits) in &leaves {
+        if offset.checked_add(u32::from(*bits)/8).is_none_or(|end|end>size) {
+            return Err("record leaf exceeds verified byte object extent".into());
+        }
+    }
+    let has_byte=leaves.iter().any(|x|x.2==8);
+    Ok(RecordShape {
+        fields:legacy_fields.to_vec(),
+        bytes:leaves.iter().map(|x|(x.1,x.2)).collect(),
+        has_byte,words:size/4,
+    })
+}
+
+type RecordObjects = HashMap<String,(usize,RecordShape)>;
+fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<Expr,String> {
+    let (object,shape)=records.get(base)
         .ok_or_else(||format!("unsupported record object {base}"))?;
-    let offset=fields.iter().position(|f|f==field)
+    let offset=shape.fields.iter().position(|f|f==field)
         .ok_or_else(||format!("unsupported record field {base}.{field}"))?;
-    Ok((*object,Expr::Integer(offset as i32)))
+    if shape.has_byte {
+        let (byte_offset,bits)=shape.bytes[offset];
+        Ok(Expr::RecordField {
+            array:*object,byte_offset,bits,
+        })
+    } else {
+        Ok(Expr::ArrayElement {
+            array:*object,index:Box::new(Expr::Integer(offset as i32)),
+        })
+    }
+}
+
+fn record_store(
+    records:&RecordObjects, base:&str,field:&str,value:Expr,
+)->Result<Stmt,String> {
+    Ok(match record_field(records,base,field)? {
+        Expr::ArrayElement {array,index}=>Stmt::AssignArray {
+            array,index:*index,value,
+        },
+        Expr::RecordField {array,byte_offset,bits}=>Stmt::AssignRecordField {
+            array,byte_offset,bits,value,
+        },
+        _=>return Err("checked record selector must refer to a scalar field".into()),
+    })
 }
 
 /// Only direct checked record objects and field chains are supported:
@@ -282,13 +400,13 @@ fn record_selector_path(d:&syntax::ast::Designator)->Option<String> {
 fn record_region(records:&RecordObjects, root:&str, path:&str)
     -> Option<(usize,Vec<(usize,String)>)>
 {
-    let (array,fields)=records.get(root)?;
+    let (array,shape)=records.get(root)?;
     if path.is_empty() {
-        return Some((*array,fields.iter().enumerate().map(|(i,name)|
+        return Some((*array,shape.fields.iter().enumerate().map(|(i,name)|
             (i,name.clone())).collect()));
     }
     let prefix=format!("{path}.");
-    let words=fields.iter().enumerate().filter_map(|(offset,name)|
+    let words=shape.fields.iter().enumerate().filter_map(|(offset,name)|
         name.strip_prefix(&prefix).map(|suffix|(offset,suffix.to_owned())))
         .collect::<Vec<_>>();
     (!words.is_empty()).then_some((*array,words))
@@ -310,6 +428,12 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
         .ok_or("unsupported selected record assignment source")?;
     let (source,src_words)=record_region(records,&src.base[0],&src_path)
         .ok_or("record assignment source must be a supported record object")?;
+    // A mixed-width copy must include every source byte/padding and alias
+    // effect. The old leaf-word copy is not an acceptable substitute.
+    if records.get(&target.base[0]).is_some_and(|(_,s)|s.has_byte) ||
+       records.get(&src.base[0]).is_some_and(|(_,s)|s.has_byte) {
+        return Err("mixed-width record copy requires byte-range legalization".into());
+    }
     if src_words.len()<dst_words.len() ||
        !src_words.iter().zip(&dst_words).all(|(from,to)|from.1==to.1) {
         return Err("record assignment requires compatible source prefix".into())
@@ -373,14 +497,12 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 syntax::ast::Selector::Field(name)=>name.as_str(),
                 _=>unreachable!("guarded field selectors"),
             }).collect::<Vec<_>>().join(".");
-            let (array,index)=record_field(records,&d.base[0],&fields)?;
-            Ok(Expr::ArrayElement {array,index:Box::new(index)})
+            record_field(records,&d.base[0],&fields)
         }
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1 => {
             match &d.sels[0] {
                 syntax::ast::Selector::Field(field) => {
-                    let (array,index)=record_field(records,&d.base[0],field)?;
-                    Ok(Expr::ArrayElement {array,index:Box::new(index)})
+                    record_field(records,&d.base[0],field)
                 }
                 syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                     let array=*arrays.get(d.base[0].as_str())
@@ -445,21 +567,16 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 } else {
                     let fields=record_selector_path(target)
                         .ok_or("unsupported record selector")?;
-                    let (array,index)=record_field(records,&target.base[0],&fields)?;
-                    out.push(Stmt::AssignArray {
-                        array,index,value:lower_expr(value,names,arrays,records,functions)?,
-                    });
+                    out.push(record_store(records,&target.base[0],&fields,
+                        lower_expr(value,names,arrays,records,functions)?)?);
                 }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                                                     target.sels.len()==1 => {
                 match &target.sels[0] {
                     syntax::ast::Selector::Field(field) => {
-                        let (array,index)=record_field(records,&target.base[0],field)?;
-                        out.push(Stmt::AssignArray {
-                            array,index,
-                            value:lower_expr(value,names,arrays,records,functions)?,
-                        });
+                        out.push(record_store(records,&target.base[0],field,
+                            lower_expr(value,names,arrays,records,functions)?)?);
                     }
                     syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                         let array=*arrays.get(target.base[0].as_str())
@@ -565,7 +682,7 @@ pub fn lower_module_with_record_objects(source: &str)
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
-    let mut module_record_fields=HashMap::<String,Vec<String>>::new();
+    let mut module_record_fields=HashMap::<String,RecordShape>::new();
     for decl in &module.decls.vars {
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
             let first = decl.names.first().ok_or("record variable declaration has no names")?;
@@ -573,14 +690,15 @@ pub fn lower_module_with_record_objects(source: &str)
             let record = checked_record_layout(
                 &decl.ty, &identity, &record_nominals, &mut checked_layouts,
             )?.ok_or("checked global record identity is missing")?;
+            let shape=record_shape(&record,&checked_layouts,&fields)?;
             for (name, exported) in &decl.names {
                 if *exported {
                     return Err("exported record objects require a native ABI layout".into());
                 }
                 global_arrays.push(ArrayGlobal {
-                    name:name.clone(),length:fields.len() as u32,exported:false,
+                    name:name.clone(),length:shape.words,exported:false,
                 });
-                module_record_fields.insert(name.clone(),fields.clone());
+                module_record_fields.insert(name.clone(),shape.clone());
                 checked_objects.push(CheckedRecordObject {
                     function:None, name:name.clone(), record:record.clone(),
                 });
@@ -640,7 +758,7 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
-        let mut local_record_fields=HashMap::<String,Vec<String>>::new();
+        let mut local_record_fields=HashMap::<String,RecordShape>::new();
         for decl in &proc.decls.vars {
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
                 let first = decl.names.first().ok_or("local record declaration has no names")?;
@@ -648,11 +766,12 @@ pub fn lower_module_with_record_objects(source: &str)
                 let record = checked_record_layout(
                     &decl.ty, &identity, &record_nominals, &mut checked_layouts,
                 )?.ok_or("checked local record identity is missing")?;
+                let shape=record_shape(&record,&checked_layouts,&fields)?;
                 for (name, _) in &decl.names {
                     fixed_arrays.push(ArrayLocal {
-                        name:name.clone(),length:fields.len() as u32,
+                        name:name.clone(),length:shape.words,
                     });
-                    local_record_fields.insert(name.clone(),fields.clone());
+                    local_record_fields.insert(name.clone(),shape.clone());
                     checked_objects.push(CheckedRecordObject {
                         function:Some(proc.name.clone()), name:name.clone(),
                         record:record.clone(),
@@ -698,15 +817,15 @@ pub fn lower_module_with_record_objects(source: &str)
             arrays.insert(array.name.as_str(), i);
         }
         let mut records:RecordObjects=global_arrays.iter().enumerate()
-            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|fields|
-                (a.name.clone(),(fixed_arrays.len()+i,fields.clone()))))
+            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
+                (a.name.clone(),(fixed_arrays.len()+i,shape.clone()))))
             .collect();
         // Locals and parameters shadow module record names.
         for name in parameters.iter().chain(locals.iter())
             .chain(fixed_arrays.iter().map(|a|&a.name)) { records.remove(name); }
         for (i,a) in fixed_arrays.iter().enumerate() {
-            if let Some(fields)=local_record_fields.get(&a.name) {
-                records.insert(a.name.clone(),(i,fields.clone()));
+            if let Some(shape)=local_record_fields.get(&a.name) {
+                records.insert(a.name.clone(),(i,shape.clone()));
             }
         }
         let body=lower_stmts(&proc.body,&names,&arrays,&records,&signatures)?;
@@ -731,8 +850,8 @@ pub fn lower_module_with_record_objects(source: &str)
         let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
             .map(|(i, item)| (item.name.as_str(), i)).collect();
         let records:RecordObjects=global_arrays.iter().enumerate()
-            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|fields|
-                (a.name.clone(),(i,fields.clone()))))
+            .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
+                (a.name.clone(),(i,shape.clone()))))
             .collect();
         let body=lower_stmts(&module.body,&names,&arrays,&records,&signatures)?;
         if contains_return(&body) {
