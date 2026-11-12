@@ -84,6 +84,14 @@ pub enum Stmt {
     AssignArray { array: usize, index: Expr, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
     AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
+    /// Checked record/subrecord byte range, including padding. The frontend
+    /// proves both nominal projections and range bounds; reverse memmove
+    /// ordering is required only when two ranges overlap within one object.
+    CopyRecordBytes {
+        dst_array: usize, dst_byte_offset: u32,
+        src_array: usize, src_byte_offset: u32,
+        byte_length: u32, reverse: bool,
+    },
     Return(Expr),
     /// Evaluate a procedure call for its effect, ignoring its result.
     Call(Expr),
@@ -290,9 +298,17 @@ fn checked_record_layout(
 /// retains the old word-index bridge for differential tests. Mixed records
 /// use explicit byte-addressable leaf operations, never name-guessed slots.
 #[derive(Clone,Debug)]
+struct RecordRegion {
+    path: String,
+    offset: u32,
+    size: u32,
+}
+#[derive(Clone,Debug)]
 struct RecordShape {
     fields: Vec<String>,
     bytes: Vec<(u32,u8)>,
+    /// Every named nested record and the root; record leaves are excluded.
+    regions: Vec<RecordRegion>,
     has_byte: bool,
     words: u32,
 }
@@ -303,11 +319,12 @@ fn record_shape(
     fn visit(
         id:&str,prefix:&str,offset:u32,layouts:&[CheckedRecordLayout],
         out:&mut Vec<(String,u32,u8)>,
+        regions:&mut Vec<RecordRegion>,
     )->Result<(),String> {
         let record=layouts.iter().find(|r|r.declaration==id)
             .ok_or("checked record object refers to missing record declaration")?;
         if let Some(base)=&record.base {
-            visit(base,prefix,offset,layouts,out)?;
+            visit(base,prefix,offset,layouts,out,regions)?;
         }
         for field in &record.fields {
             let field_offset=offset.checked_add(field.offset_bytes)
@@ -317,7 +334,12 @@ fn record_shape(
                 CheckedRecordFieldType::Integer=>out.push((path,field_offset,32)),
                 CheckedRecordFieldType::Byte=>out.push((path,field_offset,8)),
                 CheckedRecordFieldType::Record(child)=>{
-                    visit(child,&format!("{path}."),field_offset,layouts,out)?;
+                    let nested=layouts.iter().find(|r|&r.declaration==child)
+                        .ok_or("checked nested region layout missing")?;
+                    regions.push(RecordRegion {
+                        path:path.clone(),offset:field_offset,size:nested.size_bytes,
+                    });
+                    visit(child,&format!("{path}."),field_offset,layouts,out,regions)?;
                 },
             }
         }
@@ -333,7 +355,10 @@ fn record_shape(
         return Err("unsupported private record byte extent or alignment".into());
     }
     let mut leaves=Vec::new();
-    visit(identity,"",0,layouts,&mut leaves)?;
+    let mut regions=vec![RecordRegion {
+        path:String::new(),offset:0,size:layout.size_bytes,
+    }];
+    visit(identity,"",0,layouts,&mut leaves,&mut regions)?;
     if leaves.iter().map(|x|x.0.as_str()).ne(legacy_fields.iter().map(String::as_str)) {
         return Err("record layout leaf order disagrees with checked field projection".into());
     }
@@ -347,7 +372,7 @@ fn record_shape(
     Ok(RecordShape {
         fields:legacy_fields.to_vec(),
         bytes:leaves.iter().map(|x|(x.1,x.2)).collect(),
-        has_byte,words:size.div_ceil(4),
+        regions,has_byte,words:size.div_ceil(4),
     })
 }
 
@@ -413,6 +438,39 @@ fn record_region(records:&RecordObjects, root:&str, path:&str)
     (!words.is_empty()).then_some((*array,words))
 }
 
+/// Resolve only checked *record-valued* regions, never scalar field paths.
+/// For derived-to-base assignment, the source region may be larger but its
+/// field prefix must preserve names, widths and *relative byte offsets*.
+struct RecordByteRegion {
+    array: usize,
+    offset: u32,
+    size: u32,
+    leaves: Vec<(String,u32,u8)>,
+}
+fn record_byte_region(
+    records:&RecordObjects,root:&str,path:&str,
+)->Option<RecordByteRegion> {
+    let (array,shape)=records.get(root)?;
+    let region=shape.regions.iter().find(|r|r.path==path)?;
+    let prefix=if path.is_empty() {String::new()} else {format!("{path}.")};
+    let mut leaves=Vec::new();
+    for (name,(offset,width)) in shape.fields.iter().zip(&shape.bytes) {
+        if let Some(relative_name)=name.strip_prefix(&prefix) {
+            let relative_offset=offset.checked_sub(region.offset)?;
+            if relative_offset.checked_add(u32::from(*width)/8)?>region.size {
+                return None;
+            }
+            leaves.push((relative_name.to_string(),relative_offset,*width));
+        }
+    }
+    if leaves.is_empty() || region.offset.checked_add(region.size)?>shape.words*4 {
+        return None;
+    }
+    Some(RecordByteRegion {
+        array:*array,offset:region.offset,size:region.size,leaves,
+    })
+}
+
 /// A whole record or selected subrecord assignment uses only frontend-checked
 /// direct objects, with identical leaf paths or a derived-to-base prefix.
 /// Contiguous field copies are ordered like memmove for same-object aliasing.
@@ -429,11 +487,34 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
         .ok_or("unsupported selected record assignment source")?;
     let (source,src_words)=record_region(records,&src.base[0],&src_path)
         .ok_or("record assignment source must be a supported record object")?;
-    // A mixed-width copy must include every source byte/padding and alias
-    // effect. The old leaf-word copy is not an acceptable substitute.
+    // Byte-based copies retain *all* bytes of the selected destination
+    // region, including padding. The existing leaf-word scheme would be
+    // unsound when a BYTE field changes the memory stride.
     if records.get(&target.base[0]).is_some_and(|(_,s)|s.has_byte) ||
        records.get(&src.base[0]).is_some_and(|(_,s)|s.has_byte) {
-        return Err("mixed-width record copy requires byte-range legalization".into());
+        let dst=record_byte_region(records,&target.base[0],&dst_path)
+            .ok_or("selected destination is not a checked record byte region")?;
+        let src=record_byte_region(records,&src.base[0],&src_path)
+            .ok_or("selected source is not a checked record byte region")?;
+        let (da,doff,dlen,df)=(dst.array,dst.offset,dst.size,&dst.leaves);
+        let (sa,soff,slen,sf)=(src.array,src.offset,src.size,&src.leaves);
+        if slen<dlen || sf.len()<df.len() ||
+           !sf.iter().zip(df.iter()).all(|(a,b)|a==b) {
+            return Err("record byte copy requires a compatible source record prefix".into());
+        }
+        // Sema has already proven source-to-destination type assignability.
+        // The extra verified layout match above prevents partial leaf copies,
+        // stale field offsets and reinterpreting non-record designators.
+        if da==sa && doff==soff {
+            return Ok(Some(Vec::new()));
+        }
+        let src_end=soff.checked_add(dlen).ok_or("copy region byte overflow")?;
+        let reverse=da==sa && doff>soff && doff<src_end;
+        return Ok(Some(vec![Stmt::CopyRecordBytes {
+            dst_array:da,dst_byte_offset:doff,
+            src_array:sa,src_byte_offset:soff,
+            byte_length:dlen,reverse,
+        }]));
     }
     if src_words.len()<dst_words.len() ||
        !src_words.iter().zip(&dst_words).all(|(from,to)|from.1==to.1) {
