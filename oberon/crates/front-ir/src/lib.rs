@@ -3,6 +3,54 @@
 //! Only syntax and semantic-analysis crates are dependencies. Unsupported
 //! constructs fail closed; the consuming compiler owns SSA and code generation.
 use std::collections::HashMap;
+
+pub use sema::sym::{Interface,Item as InterfaceItem};
+pub fn parse_interface(text:&str)->Result<Interface,String>{
+    sema::sym::parse(text)
+}
+pub fn render_interface(interface:&Interface)->String {
+    sema::sym::render(interface)
+}
+
+/// Only the ABI we lower natively is advertised in this initial .sym writer:
+/// exported INTEGER-returning functions taking value/VAR INTEGER scalars.
+/// Other exports must not silently disappear from an interface file.
+pub fn checked_scalar_interface(source:&str)->Result<Interface,String> {
+    let (checked,diagnostics)=sema::check_module_recovering(source,&[]);
+    if let Some(diagnostic)=diagnostics.iter().find(|d|d.is_error()) {
+        return Err(format!("Oberon interface semantic or syntax error: {diagnostic:?}"));
+    }
+    let module=checked.ok_or("missing checked Oberon module")?;
+    if !module.imports.is_empty(){
+        return Err("native scalar interface writer does not re-export imports".into());
+    }
+    if module.decls.types.iter().any(|x|x.export) ||
+       module.decls.vars.iter().any(|x|x.names.iter().any(|(_,export)|*export)) ||
+       module.decls.consts.iter().any(|x|x.export) {
+        return Err("native scalar .sym writer cannot hide non-procedure exports".into());
+    }
+    let mut items=Vec::new();
+    for proc in &module.decls.procs {
+        if !proc.export {continue;}
+        if !matches!(proc.result.as_deref(),Some([ty]) if ty=="INTEGER") {
+            return Err("native scalar .sym requires INTEGER result".into());
+        }
+        let mut params=Vec::new();
+        for section in &proc.params {
+            if section.ty.open!=0 || section.ty.base.as_slice()!=["INTEGER"] {
+                return Err("native scalar .sym supports INTEGER and VAR INTEGER formals only".into());
+            }
+            for _ in &section.names {
+                params.push(if section.by_ref {"VAR INTEGER"} else {"INTEGER"}.into());
+            }
+        }
+        items.push(InterfaceItem::Proc {
+            name:proc.name.clone(),params,result:Some("INTEGER".into()),
+        });
+    }
+    Ok(Interface{module:module.name,imports:Vec::new(),items})
+}
+
 use syntax::ast::{BinOp, Expr as OberonExpr, ExprKind, Stmt as OberonStmt,
                   StmtKind, TypeExpr, UnOp};
 use sema::const_eval::{self, Const as CheckedConst};
@@ -16,6 +64,8 @@ pub struct Module {
     /// Private checked pointer-to-record storage; never an exported ABI type.
     pub pointer_globals: Vec<PointerObject>,
     pub functions: Vec<Function>,
+    /// Source-checked exported imported scalar function declarations.
+    pub imported_procedures: Vec<ImportedProcedure>,
     /// Checked module BEGIN body; emitted as a private constructor.
     pub initializer: Option<Function>,
 }
@@ -34,6 +84,13 @@ pub struct ArrayGlobal {
     pub name: String,
     pub length: u32,
     pub exported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedProcedure {
+    pub module: String,
+    pub name: String,
+    pub parameter_by_ref: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +182,9 @@ pub enum Expr {
     Binary(Op, Box<Expr>, Box<Expr>),
     /// Checked same-module INTEGER function call, including recursion.
     Call { name:String, args:Vec<Expr> },
+    /// Direct call to an imported source-checked scalar function; the defining
+    /// module name is authoritative, and the alias is not part of its symbol.
+    ImportedCall {module:String,name:String,args:Vec<Expr>},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
