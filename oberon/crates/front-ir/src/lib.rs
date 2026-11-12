@@ -956,7 +956,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 })
             }
         }
-        ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
+        ExprKind::Designator(d) if (1..=2).contains(&d.base.len()) && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
                         syntax::ast::Selector::Args(_)) => {
             lower_call(d,names,arrays,records,pointers,functions,constants)
