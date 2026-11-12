@@ -989,7 +989,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     let access=resolve_pointer_access(actual,pointers.objects,pointers.targets)?;
                     let record=access.target
                         .ok_or("NEW target field must have pointer-to-record type")?;
-                    let shape=targets.get(&record)
+                    let shape=pointers.targets.get(&record)
                         .ok_or("NEW target record layout missing")?;
                     out.push(Stmt::NewPointerLink {
                         pointer:access.root,hops:access.hops,
