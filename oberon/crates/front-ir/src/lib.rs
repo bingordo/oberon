@@ -13,6 +13,8 @@ pub struct Module {
     /// Module-level INTEGER objects, in source order.
     pub globals: Vec<Global>,
     pub global_arrays: Vec<ArrayGlobal>,
+    /// Private checked pointer-to-record storage; never an exported ABI type.
+    pub pointer_globals: Vec<PointerObject>,
     pub functions: Vec<Function>,
     /// Checked module BEGIN body; emitted as a private constructor.
     pub initializer: Option<Function>,
@@ -45,6 +47,8 @@ pub struct Function {
     pub arrays: Vec<ArrayLocal>,
     /// Module arrays follow locals in array-index numbering.
     pub global_arrays: Vec<ArrayGlobal>,
+    pub pointer_locals: Vec<PointerObject>,
+    pub pointer_globals: Vec<PointerObject>,
     /// Ordered module globals. Variable indexes after parameters and
     /// local scalar variables refer to this list (never to frame slots).
     pub globals: Vec<String>,
@@ -56,6 +60,23 @@ pub struct ArrayLocal {
     pub name: String,
     pub length: u32,
 }
+
+/// Nominally checked pointer-to-private-record declaration. Field offsets,
+/// types and byte length come exclusively from source-checked record layouts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointerField {
+    pub path: String,
+    pub offset_bytes: u32,
+    pub bits: u8,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointerObject {
+    pub name: String,
+    pub record: String,
+    pub bytes: u32,
+    pub fields: Vec<PointerField>,
+}
+type PointerBindings = HashMap<String,(usize,PointerObject)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
@@ -70,6 +91,8 @@ pub enum Expr {
     /// existing declared local/global storage root, with width 8 or 32.
     /// No free pointer, by-value record ABI or arbitrary byte access.
     RecordField { array: usize, byte_offset: u32, bits: u8 },
+    /// Checked dereference of a private pointer to a source-checked record.
+    PointerField { pointer: usize, byte_offset: u32, bits: u8 },
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
@@ -90,6 +113,9 @@ pub enum Stmt {
     AssignMultiArray { array: usize, indices: Vec<Expr>, dims: Vec<u32>, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
     AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
+    AssignPointerField {pointer:usize,byte_offset:u32,bits:u8,value:Expr},
+    NewPointer {pointer:usize,bytes:u32},
+    AssignPointer {pointer:usize,source:Option<usize>},
     /// Checked record/subrecord byte range, including padding. The frontend
     /// proves both nominal projections and range bounds; reverse memmove
     /// ordering is required only when two ranges overlap within one object.
@@ -380,6 +406,64 @@ fn record_shape(
         bytes:leaves.iter().map(|x|(x.1,x.2)).collect(),
         regions,has_byte,words:size.div_ceil(4),
     })
+}
+
+/// This vertical slice admits only pointer variables whose target is a
+/// previously source-checked named private record. No pointer parameters,
+/// imported targets, recursive inline declarations or pointer arithmetic.
+fn pointer_record_target(
+    ty:&TypeExpr, pointers:&HashMap<String,String>,
+    records:&HashMap<String,String>,
+)->Result<Option<String>,String> {
+    match ty {
+        TypeExpr::Named(q,_) if q.len()==1 => Ok(pointers.get(&q[0]).cloned()),
+        TypeExpr::Pointer(inner,_) => match inner.as_ref() {
+            TypeExpr::Named(q,_) if q.len()==1 => records.get(&q[0])
+                .cloned().map(Some)
+                .ok_or_else(||"native pointer target must be a checked named record".into()),
+            _=>Err("native pointer target must be a named private record".into()),
+        },
+        _=>Ok(None),
+    }
+}
+fn checked_pointer_object(
+    name:&str,record:&str, layouts:&[CheckedRecordLayout],
+    types:&HashMap<String,Vec<String>>,
+)->Result<PointerObject,String> {
+    let record_name=record.rsplit('.').next()
+        .ok_or("pointer record identity is empty")?;
+    let leaves=types.get(record_name)
+        .ok_or("pointer target has no checked record fields")?;
+    let shape=record_shape(record,layouts,leaves)?;
+    let bytes=layouts.iter().find(|r|r.declaration==record)
+        .ok_or("pointer target layout missing")?.size_bytes;
+    let fields=shape.fields.iter().zip(&shape.bytes)
+        .map(|(name,&(offset,bits))|PointerField {
+            path:name.clone(),offset_bytes:offset,bits,
+        }).collect();
+    Ok(PointerObject{name:name.into(),record:record.into(),bytes,fields})
+}
+fn checked_pointer_field(
+    pointers:&PointerBindings,root:&str,fields:&str,
+)->Result<(usize,u32,u8),String> {
+    let (index,object)=pointers.get(root)
+        .ok_or("field dereference requires a checked private record pointer")?;
+    let field=object.fields.iter().find(|f|f.path==fields)
+        .ok_or("selected pointer field is absent from checked target record")?;
+    Ok((*index,field.offset_bytes,field.bits))
+}
+fn pointer_deref_fields(d:&syntax::ast::Designator)->Option<String> {
+    if d.base.len()!=1 || d.sels.len()<2 ||
+       !matches!(d.sels.first(),Some(syntax::ast::Selector::Deref)) {
+        return None;
+    }
+    let mut names=Vec::new();
+    for selector in &d.sels[1..] {
+        if let syntax::ast::Selector::Field(name)=selector {
+            names.push(name.as_str());
+        } else {return None;}
+    }
+    Some(names.join("."))
 }
 
 type RecordObjects = HashMap<String,(usize,RecordShape)>;
