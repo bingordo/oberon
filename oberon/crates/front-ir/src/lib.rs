@@ -84,6 +84,14 @@ pub enum Stmt {
     AssignArray { array: usize, index: Expr, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
     AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
+    /// Checked record/subrecord byte range, including padding. The frontend
+    /// proves both nominal projections and range bounds; reverse memmove
+    /// ordering is required only when two ranges overlap within one object.
+    CopyRecordBytes {
+        dst_array: usize, dst_byte_offset: u32,
+        src_array: usize, src_byte_offset: u32,
+        byte_length: u32, reverse: bool,
+    },
     Return(Expr),
     /// Evaluate a procedure call for its effect, ignoring its result.
     Call(Expr),
@@ -290,9 +298,17 @@ fn checked_record_layout(
 /// retains the old word-index bridge for differential tests. Mixed records
 /// use explicit byte-addressable leaf operations, never name-guessed slots.
 #[derive(Clone,Debug)]
+struct RecordRegion {
+    path: String,
+    offset: u32,
+    size: u32,
+}
+#[derive(Clone,Debug)]
 struct RecordShape {
     fields: Vec<String>,
     bytes: Vec<(u32,u8)>,
+    /// Every named nested record and the root; record leaves are excluded.
+    regions: Vec<RecordRegion>,
     has_byte: bool,
     words: u32,
 }
@@ -303,11 +319,12 @@ fn record_shape(
     fn visit(
         id:&str,prefix:&str,offset:u32,layouts:&[CheckedRecordLayout],
         out:&mut Vec<(String,u32,u8)>,
+        regions:&mut Vec<RecordRegion>,
     )->Result<(),String> {
         let record=layouts.iter().find(|r|r.declaration==id)
             .ok_or("checked record object refers to missing record declaration")?;
         if let Some(base)=&record.base {
-            visit(base,prefix,offset,layouts,out)?;
+            visit(base,prefix,offset,layouts,out,regions)?;
         }
         for field in &record.fields {
             let field_offset=offset.checked_add(field.offset_bytes)
@@ -317,7 +334,12 @@ fn record_shape(
                 CheckedRecordFieldType::Integer=>out.push((path,field_offset,32)),
                 CheckedRecordFieldType::Byte=>out.push((path,field_offset,8)),
                 CheckedRecordFieldType::Record(child)=>{
-                    visit(child,&format!("{path}."),field_offset,layouts,out)?;
+                    let nested=layouts.iter().find(|r|&r.declaration==child)
+                        .ok_or("checked nested region layout missing")?;
+                    regions.push(RecordRegion {
+                        path:path.clone(),offset:field_offset,size:nested.size_bytes,
+                    });
+                    visit(child,&format!("{path}."),field_offset,layouts,out,regions)?;
                 },
             }
         }
@@ -333,7 +355,10 @@ fn record_shape(
         return Err("unsupported private record byte extent or alignment".into());
     }
     let mut leaves=Vec::new();
-    visit(identity,"",0,layouts,&mut leaves)?;
+    let mut regions=vec![RecordRegion {
+        path:String::new(),offset:0,size:layout.size_bytes,
+    }];
+    visit(identity,"",0,layouts,&mut leaves,&mut regions)?;
     if leaves.iter().map(|x|x.0.as_str()).ne(legacy_fields.iter().map(String::as_str)) {
         return Err("record layout leaf order disagrees with checked field projection".into());
     }
@@ -347,7 +372,7 @@ fn record_shape(
     Ok(RecordShape {
         fields:legacy_fields.to_vec(),
         bytes:leaves.iter().map(|x|(x.1,x.2)).collect(),
-        has_byte,words:size.div_ceil(4),
+        regions,has_byte,words:size.div_ceil(4),
     })
 }
 
