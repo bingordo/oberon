@@ -63,7 +63,7 @@ fn import_fails_closed_for_missing_interface_private_proc_and_invalid_var_actual
     assert!(lower_module_with_record_objects_and_interfaces(CONSUMER,&[]).is_err());
     let private=CONSUMER.replace("A.Add(n,2)","A.Hidden(n)");
     assert!(lower_module_with_record_objects_and_interfaces(
-        &private,&[interface.clone()]).is_err());
+        &private,std::slice::from_ref(&interface)).is_err());
     let wrong=CONSUMER.replace("A.Bump(x,3)","A.Bump(n+1,3)");
     assert!(lower_module_with_record_objects_and_interfaces(&wrong,&[interface]).is_err());
 }
