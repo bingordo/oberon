@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use syntax::ast::{BinOp, Expr as OberonExpr, ExprKind, Stmt as OberonStmt,
                   StmtKind, TypeExpr, UnOp};
+use sema::const_eval::{self, Const as CheckedConst};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Module {
@@ -531,11 +532,52 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
     }).collect()))
 }
 
+/// Use the existing Oberon semantic constant folder for both declarations
+/// and array bounds. Native lowering only admits values it can represent;
+/// it never reimplements DIV/MOD, overflow or predeclared-function rules.
+type CheckedConstants = HashMap<String,CheckedConst>;
+
+fn lookup_constant(expr:&OberonExpr, constants:&CheckedConstants)->Option<CheckedConst> {
+    let ExprKind::Designator(d)=&expr.kind else {return None};
+    if d.base.len()!=1 || !d.sels.is_empty() {return None}
+    constants.get(&d.base[0]).cloned()
+}
+
+fn checked_constants(
+    declarations:&[syntax::ast::ConstDecl],
+    outer:&CheckedConstants,
+)->Result<CheckedConstants,String> {
+    let mut constants=outer.clone();
+    for declaration in declarations {
+        let value=const_eval::eval_with(&declaration.value,&|expr|
+            lookup_constant(expr,&constants))
+            .map_err(|err|format!("constant {}: {err}",declaration.name))?;
+        if !matches!(value,CheckedConst::Int(_) | CheckedConst::Bool(_)) {
+            return Err(format!(
+                "constant {}: native bridge supports only INTEGER and BOOLEAN values",
+                declaration.name));
+        }
+        constants.insert(declaration.name.clone(),value);
+    }
+    Ok(constants)
+}
+
+fn checked_array_length(
+    dim:&OberonExpr,constants:&CheckedConstants,
+)->Result<u32,String> {
+    match const_eval::eval_with(dim,&|expr|lookup_constant(expr,constants)) {
+        Ok(CheckedConst::Int(n)) if (1..=1024).contains(&n) => Ok(n as u32),
+        Ok(_) => Err("native INTEGER array extent must be a constant in 1..=1024".into()),
+        Err(err) => Err(format!("native INTEGER array extent: {err}")),
+    }
+}
+
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
               arrays:&HashMap<&str,usize>,
               records:&RecordObjects,
-              functions:&HashMap<String,usize>)->Result<Expr,String> {
+              functions:&HashMap<String,usize>,
+              constants:&CheckedConstants)->Result<Expr,String> {
     if d.base.len()!=1 || d.sels.len()!=1 {
         return Err("unsupported qualified or selected function call".into());
     }
@@ -552,7 +594,7 @@ fn lower_call(d:&syntax::ast::Designator,
     }
     let mut args=Vec::with_capacity(raw_args.len());
     for arg in raw_args {
-        args.push(lower_expr(arg,names,arrays,records,functions)?);
+        args.push(lower_expr(arg,names,arrays,records,functions,constants)?);
     }
     Ok(Expr::Call{name:symbol.clone(),args})
 }
@@ -560,18 +602,26 @@ fn lower_call(d:&syntax::ast::Designator,
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               arrays: &HashMap<&str, usize>,
               records: &RecordObjects,
-              functions:&HashMap<String,usize>) -> Result<Expr, String> {
+              functions:&HashMap<String,usize>,
+              constants:&CheckedConstants) -> Result<Expr, String> {
     match &expr.kind {
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
                         syntax::ast::Selector::Args(_)) => {
-            lower_call(d,names,arrays,records,functions)
+            lower_call(d,names,arrays,records,functions,constants)
         }
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
         ExprKind::Designator(d) if d.sels.is_empty() && d.base.len() == 1 => {
-            names.get(d.base[0].as_str()).copied().map(Expr::Variable)
-                .ok_or_else(|| format!("unsupported variable or constant: {}", d.base[0]))
+            if let Some(index)=names.get(d.base[0].as_str()) {
+                Ok(Expr::Variable(*index))
+            } else {
+                match constants.get(&d.base[0]) {
+                    Some(CheckedConst::Int(n))=>Ok(Expr::Integer(*n)),
+                    Some(CheckedConst::Bool(b))=>Ok(Expr::Boolean(*b)),
+                    _=>Err(format!("unsupported variable or constant: {}",d.base[0])),
+                }
+            }
         }
         ExprKind::Designator(d) if d.base.len()==1 && !d.sels.is_empty() &&
             d.sels.iter().all(|sel|matches!(sel,syntax::ast::Selector::Field(_))) => {
@@ -590,7 +640,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                     let array=*arrays.get(d.base[0].as_str())
                         .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
                     Ok(Expr::ArrayElement {
-                        array,index:Box::new(lower_expr(&indices[0],names, arrays, records, functions)?),
+                        array,index:Box::new(lower_expr(&indices[0],names,arrays,records,functions,constants)?),
                     })
                 }
                 _=>Err(format!("unsupported array selector at {}",d.span.lo)),
@@ -609,13 +659,13 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 BinOp::Ge => Op::Ge,
                 _ => return Err(format!("unsupported binary expression: {op:?}")),
             };
-            Ok(Expr::Binary(op, Box::new(lower_expr(a, names, arrays, records, functions)?),
-                            Box::new(lower_expr(b, names, arrays, records, functions)?)))
+            Ok(Expr::Binary(op, Box::new(lower_expr(a,names,arrays,records,functions,constants)?),
+                            Box::new(lower_expr(b,names,arrays,records,functions,constants)?)))
         }
-        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a, names, arrays, records, functions),
+        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a,names,arrays,records,functions,constants),
         ExprKind::Unary(UnOp::Neg, a) =>
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
-                            Box::new(lower_expr(a, names, arrays, records, functions)?))),
+                            Box::new(lower_expr(a,names,arrays,records,functions,constants)?))),
         _ => Err(format!("unsupported expression at {}", expr.span.lo)),
     }
 }
@@ -623,13 +673,14 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &HashMap<&str, usize>,
               records: &RecordObjects,
-              functions:&HashMap<String,usize>) -> Result<Vec<Stmt>, String>
+              functions:&HashMap<String,usize>,
+              constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
 {
     let mut out = Vec::new();
     for s in stmts {
         match &s.kind {
             StmtKind::Call(d)=>out.push(Stmt::Call(
-                lower_call(d,names,arrays,records,functions)?)),
+                lower_call(d,names,arrays,records,functions,constants)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
                 if let Some(copies)=lower_record_copy(target,value,records)? {
@@ -638,7 +689,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     let variable=names.get(target.base[0].as_str()).copied()
                         .ok_or_else(||format!("unknown local or parameter: {}",target.base[0]))?;
                     out.push(Stmt::Assign {variable,value:
-                        lower_expr(value,names,arrays,records,functions)?});
+                        lower_expr(value,names,arrays,records,functions,constants)?});
                 }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
@@ -650,7 +701,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     let fields=record_selector_path(target)
                         .ok_or("unsupported record selector")?;
                     out.push(record_store(records,&target.base[0],&fields,
-                        lower_expr(value,names,arrays,records,functions)?)?);
+                        lower_expr(value,names,arrays,records,functions,constants)?)?);
                 }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
@@ -658,33 +709,33 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 match &target.sels[0] {
                     syntax::ast::Selector::Field(field) => {
                         out.push(record_store(records,&target.base[0],field,
-                            lower_expr(value,names,arrays,records,functions)?)?);
+                            lower_expr(value,names,arrays,records,functions,constants)?)?);
                     }
                     syntax::ast::Selector::Index(indices) if indices.len()==1 => {
                         let array=*arrays.get(target.base[0].as_str())
                             .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
                         out.push(Stmt::AssignArray {
                             array,
-                            index:lower_expr(&indices[0],names, arrays, records, functions)?,
-                            value:lower_expr(value,names, arrays, records, functions)?,
+                            index:lower_expr(&indices[0],names,arrays,records,functions,constants)?,
+                            value:lower_expr(value,names,arrays,records,functions,constants)?,
                         });
                     }
                     _=>return Err(format!("unsupported array assignment at {}",s.span.lo)),
                 }
             }
             StmtKind::Return(Some(e)) =>
-                out.push(Stmt::Return(lower_expr(e, names, arrays, records, functions)?)),
+                out.push(Stmt::Return(lower_expr(e,names,arrays,records,functions,constants)?)),
             StmtKind::If { arms, els } => {
                 if arms.is_empty() { return Err("IF with no arm".into()); }
                 let mut tail = match els {
-                    Some(stmts) => lower_stmts(stmts, names, arrays, records, functions)?,
+                    Some(stmts) => lower_stmts(stmts,names,arrays,records,functions,constants)?,
                     None => Vec::new(),
                 };
                 // ELSIF is lowered into a nested IF in the previous else arm.
                 for (condition, body) in arms.iter().rev() {
                     tail = vec![Stmt::If {
-                        condition: lower_expr(condition, names, arrays, records, functions)?,
-                        then_body: lower_stmts(body, names, arrays, records, functions)?,
+                        condition: lower_expr(condition,names,arrays,records,functions,constants)?,
+                        then_body: lower_stmts(body,names,arrays,records,functions,constants)?,
                         else_body: tail,
                     }];
                 }
@@ -693,8 +744,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
             StmtKind::While { arms } if arms.len() == 1 => {
                 let (condition, body) = &arms[0];
                 out.push(Stmt::While {
-                    condition: lower_expr(condition, names, arrays, records, functions)?,
-                    body: lower_stmts(body, names, arrays, records, functions)?,
+                    condition: lower_expr(condition,names,arrays,records,functions,constants)?,
+                    body: lower_stmts(body,names,arrays,records,functions,constants)?,
                 });
             }
             _ => return Err(format!("unsupported Oberon statement at {}", s.span.lo)),
@@ -742,9 +793,11 @@ pub fn lower_module_with_record_objects(source: &str)
         .filter(|proc| proc.export)
         .map(|proc| proc.name.clone())
         .collect::<Vec<_>>();
-    if !module.imports.is_empty() || !module.decls.consts.is_empty() {
-        return Err("module imports or constants are not yet supported".into());
+    if !module.imports.is_empty() {
+        return Err("module imports are not yet supported".into());
     }
+    let module_constants=checked_constants(
+        &module.decls.consts,&CheckedConstants::new())?;
     let mut record_types = HashMap::<String, Vec<String>>::new();
     let mut record_nominals = HashMap::<String, String>::new();
     let mut checked_layouts = Vec::<CheckedRecordLayout>::new();
@@ -795,15 +848,10 @@ pub fn lower_module_with_record_objects(source: &str)
             }
             TypeExpr::Array { dims, elem, .. } if dims.len()==1 &&
                 matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
-                let ExprKind::Int(length)=&dims[0].kind else {
-                    return Err("module array length must be an INTEGER literal".into());
-                };
-                if *length == 0 || *length > 1024 {
-                    return Err("module array length must be within 1..=1024".into());
-                }
+                let length=checked_array_length(&dims[0],&module_constants)?;
                 for (name, exported) in &decl.names {
                     global_arrays.push(ArrayGlobal {
-                        name: name.clone(), length: *length, exported: *exported,
+                        name: name.clone(), length, exported: *exported,
                     });
                 }
             }
@@ -826,10 +874,10 @@ pub fn lower_module_with_record_objects(source: &str)
         if !matches!(proc.result.as_deref(), Some([t]) if t == "INTEGER") {
             return Err(format!("{}: only INTEGER-returning functions are supported", proc.name));
         }
-        if !proc.decls.procs.is_empty() || !proc.decls.consts.is_empty() ||
-           !proc.decls.types.is_empty() {
-            return Err(format!("{}: nested procedures, constants or types unsupported", proc.name));
+        if !proc.decls.procs.is_empty() || !proc.decls.types.is_empty() {
+            return Err(format!("{}: nested procedures or types unsupported",proc.name));
         }
+        let proc_constants=checked_constants(&proc.decls.consts,&module_constants)?;
         let mut parameters = Vec::new();
         for section in &proc.params {
             if section.by_ref || section.ty.open != 0 ||
@@ -869,14 +917,10 @@ pub fn lower_module_with_record_objects(source: &str)
                     matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
                     // Do not invent a constant evaluator or assume a stride
                     // for a non-integer/multidimensional element type.
-                    let ExprKind::Int(length)=&dims[0].kind else {
-                        return Err(format!("{}: array length must be an INTEGER literal",proc.name));
-                    };
-                    if *length==0 || *length>1024 {
-                        return Err(format!("{}: array length must be within 1..=1024",proc.name));
-                    }
+                    let length=checked_array_length(&dims[0],&proc_constants)
+                        .map_err(|err|format!("{}: {err}",proc.name))?;
                     for (name,_) in &decl.names {
-                        fixed_arrays.push(ArrayLocal{name:name.clone(),length:*length});
+                        fixed_arrays.push(ArrayLocal{name:name.clone(),length});
                     }
                 }
                 _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
@@ -910,7 +954,8 @@ pub fn lower_module_with_record_objects(source: &str)
                 records.insert(a.name.clone(),(i,shape.clone()));
             }
         }
-        let body=lower_stmts(&proc.body,&names,&arrays,&records,&signatures)?;
+        let body=lower_stmts(&proc.body,&names,&arrays,&records,&signatures,
+            &proc_constants)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
         if !contains_return(&body) {
@@ -935,7 +980,8 @@ pub fn lower_module_with_record_objects(source: &str)
             .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
                 (a.name.clone(),(i,shape.clone()))))
             .collect();
-        let body=lower_stmts(&module.body,&names,&arrays,&records,&signatures)?;
+        let body=lower_stmts(&module.body,&names,&arrays,&records,&signatures,
+            &module_constants)?;
         if contains_return(&body) {
             return Err("module initialization cannot return a value".into());
         }
