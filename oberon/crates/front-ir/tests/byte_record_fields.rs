@@ -46,7 +46,7 @@ fn source_checked_mixed_byte_and_integer_has_padded_offsets_and_word_storage() {
 }
 
 #[test]
-fn byte_only_objects_and_unverified_byte_range_copy_fail_closed() {
+fn byte_only_objects_and_mixed_copy_project_exact_bytes() {
     let (module,_,layouts,objects)=lower_module_with_record_objects("MODULE Pure;
         TYPE R=RECORD b: BYTE END;
         VAR r: R;
@@ -61,12 +61,17 @@ fn byte_only_objects_and_unverified_byte_range_copy_fail_closed() {
     assert!(matches!(module.functions[0].body[0],
         Stmt::AssignRecordField {array:0,byte_offset:0,bits:8,..}));
 
-    assert!(lower_module("MODULE Copy;
+    let copy=lower_module("MODULE Copy;
         TYPE R=RECORD b: BYTE; n: INTEGER END;
         VAR x,y: R;
         PROCEDURE F*(n: INTEGER): INTEGER;
-        BEGIN x.b:=n; y:=x; RETURN y.b END F;
-        END Copy.").is_err());
+        BEGIN x.b:=n; x.n:=n+1; y:=x; RETURN y.b+y.n END F;
+        END Copy.").unwrap();
+    assert!(matches!(copy.functions[0].body[2],
+        Stmt::CopyRecordBytes {
+            dst_array:1,dst_byte_offset:0,src_array:0,
+            src_byte_offset:0,byte_length:8,reverse:false,
+        }));
 }
 
 #[test]
@@ -118,4 +123,67 @@ fn precise_byte_object_sizes_round_up_handles_without_forging_layout() {
     assert_eq!(objects.len(),2);
     assert!(matches!(&module.functions[0].body[1],
         Stmt::AssignRecordField {array:0,byte_offset:4,bits:8,..}));
+}
+
+#[test]
+fn byte_subrecord_copies_carry_complete_regions_including_padding() {
+    let source="MODULE Mem;
+        TYPE Byte3=RECORD a,b,c: BYTE END;
+        Pair=RECORD left,right: Byte3; count: INTEGER END;
+        VAR global: Pair;
+        PROCEDURE Go*(n: INTEGER): INTEGER;
+        VAR local: Pair; child: Byte3;
+        BEGIN
+            child.a:=n; child.b:=n+1; child.c:=n+2;
+            local.left:=child;
+            local.right:=local.left;
+            local.left:=local.right;
+            local.count:=n;
+            global:=local;
+            RETURN global.left.a+global.right.c+global.count
+        END Go;
+        END Mem.";
+    let (mod_,_,layouts,_)=lower_module_with_record_objects(source).unwrap();
+    let pair=layouts.iter().find(|r|r.declaration=="Mem.Pair").unwrap();
+    assert_eq!((pair.size_bytes,pair.alignment_bytes),(12,4));
+    assert_eq!(pair.fields.iter().map(|f|f.offset_bytes).collect::<Vec<_>>(),
+        [0,3,8]);
+    let instructions=&mod_.functions[0].body;
+    assert!(matches!(instructions[3],Stmt::CopyRecordBytes {
+        dst_array:0,dst_byte_offset:0,src_array:1,
+        src_byte_offset:0,byte_length:3,reverse:false,
+    }));
+    assert!(matches!(instructions[4],Stmt::CopyRecordBytes {
+        dst_array:0,dst_byte_offset:3,src_array:0,
+        src_byte_offset:0,byte_length:3,reverse:false,
+    }));
+    assert!(matches!(instructions[5],Stmt::CopyRecordBytes {
+        dst_array:0,dst_byte_offset:0,src_array:0,
+        src_byte_offset:3,byte_length:3,reverse:false,
+    }));
+    assert!(matches!(instructions[7],Stmt::CopyRecordBytes {
+        dst_array:2,dst_byte_offset:0,src_array:0,
+        src_byte_offset:0,byte_length:12,reverse:false,
+    }));
+}
+
+#[test]
+fn derived_to_base_byte_prefix_copies_only_base_extent() {
+    let source="MODULE Prefix;
+        TYPE Base=RECORD tag: BYTE END;
+             Derived=RECORD (Base) value: INTEGER END;
+        VAR b: Base; d: Derived;
+        PROCEDURE Go*(n: INTEGER): INTEGER;
+        BEGIN
+            d.tag:=n; d.value:=n+1; b:=d;
+            RETURN b.tag+d.value
+        END Go;
+        END Prefix.";
+    let (module,_,layouts,_)=lower_module_with_record_objects(source).unwrap();
+    assert_eq!(layouts.iter().find(|r|r.declaration=="Prefix.Base").unwrap().size_bytes,1);
+    assert_eq!(layouts.iter().find(|r|r.declaration=="Prefix.Derived").unwrap().size_bytes,8);
+    assert!(matches!(module.functions[0].body[2],Stmt::CopyRecordBytes {
+        dst_array:0,dst_byte_offset:0,src_array:1,
+        src_byte_offset:0,byte_length:1,reverse:false,
+    }));
 }
