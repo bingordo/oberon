@@ -73,3 +73,46 @@ fn interface_writer_rejects_incomplete_non_procedure_exports() {
     assert!(checked_scalar_interface(
         "MODULE Bad; VAR x*:INTEGER; END Bad.").is_err());
 }
+
+#[test]
+fn transitive_dependency_scan_and_checked_interface_roundtrip() {
+    let math="MODULE Math;
+        PROCEDURE Add*(a,b:INTEGER):INTEGER;
+        BEGIN RETURN a+b END Add;
+        END Math.";
+    let facade="MODULE Facade;
+        IMPORT M:=Math;
+        PROCEDURE Calc*(n:INTEGER):INTEGER;
+        BEGIN RETURN M.Add(n,5) END Calc;
+        END Facade.";
+    let main="MODULE App;
+        IMPORT F:=Facade, Math;
+        PROCEDURE Run*(n:INTEGER):INTEGER;
+        BEGIN RETURN F.Calc(n)+Math.Add(n,2) END Run;
+        END App.";
+    let parsed=oberon_front_ir::module_dependencies(facade).unwrap();
+    assert_eq!(parsed.module,"Facade");
+    assert_eq!(parsed.imports,["Math"]);
+    assert!(!parsed.has_initializer);
+    let m=checked_scalar_interface(math).unwrap();
+    let f=oberon_front_ir::checked_scalar_interface_with_imports(
+        facade,std::slice::from_ref(&m)).unwrap();
+    assert_eq!(f.imports,["Math"]);
+    assert_eq!(parse_interface(&render_interface(&f)).unwrap(),f);
+    let (app,_,_,_)=lower_module_with_record_objects_and_interfaces(main,&[m,f]).unwrap();
+    assert_eq!(app.imported_procedures.len(),2);
+    assert_eq!(app.imported_procedures[0].module,"Facade");
+    assert_eq!(app.imported_procedures[1].module,"Math");
+}
+
+#[test]
+fn dependency_scanner_detects_module_initializer_without_guessing() {
+    let source="MODULE Init;
+        VAR x:INTEGER;
+        BEGIN x:=2 END Init.";
+    let deps=oberon_front_ir::module_dependencies(source).unwrap();
+    assert!(deps.has_initializer);
+    assert!(deps.imports.is_empty());
+    assert!(oberon_front_ir::module_dependencies(
+        "MODULE Bad; IMPORT Oops").is_err());
+}
