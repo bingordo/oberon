@@ -68,6 +68,8 @@ pub struct PointerField {
     pub path: String,
     pub offset_bytes: u32,
     pub bits: u8,
+    /// Required for chained typed dereferences, never inferred from bits.
+    pub target_record: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PointerObject {
@@ -446,18 +448,59 @@ fn checked_pointer_object(
     name:&str,record:&str, layouts:&[CheckedRecordLayout],
     types:&HashMap<String,Vec<String>>,
 )->Result<PointerObject,String> {
+    fn visit(
+        id:&str,prefix:&str,base_offset:u32,layouts:&[CheckedRecordLayout],
+        out:&mut Vec<PointerField>,
+    )->Result<(),String> {
+        let layout=layouts.iter().find(|r|r.declaration==id)
+            .ok_or("pointer target nested record layout missing")?;
+        if let Some(base)=&layout.base {
+            visit(base,prefix,base_offset,layouts,out)?;
+        }
+        for field in &layout.fields {
+            let offset=base_offset.checked_add(field.offset_bytes)
+                .ok_or("pointer field offset overflow")?;
+            let path=format!("{prefix}{}",field.name);
+            match &field.ty {
+                CheckedRecordFieldType::Integer=>out.push(PointerField {
+                    path,offset_bytes:offset,bits:32,target_record:None,
+                }),
+                CheckedRecordFieldType::Byte=>out.push(PointerField {
+                    path,offset_bytes:offset,bits:8,target_record:None,
+                }),
+                CheckedRecordFieldType::Pointer(target)=>out.push(PointerField {
+                    path,offset_bytes:offset,bits:64,target_record:Some(target.clone()),
+                }),
+                CheckedRecordFieldType::Record(child)=>visit(
+                    child,&format!("{path}."),offset,layouts,out)?,
+            }
+        }
+        Ok(())
+    }
     let record_name=record.rsplit('.').next()
         .ok_or("pointer record identity is empty")?;
-    let leaves=types.get(record_name)
+    let expected=types.get(record_name)
         .ok_or("pointer target has no checked record fields")?;
-    let shape=record_shape(record,layouts,leaves)?;
-    let bytes=layouts.iter().find(|r|r.declaration==record)
-        .ok_or("pointer target layout missing")?.size_bytes;
-    let fields=shape.fields.iter().zip(&shape.bytes)
-        .map(|(name,&(offset,bits))|PointerField {
-            path:name.clone(),offset_bytes:offset,bits,
-        }).collect();
-    Ok(PointerObject{name:name.into(),record:record.into(),bytes,fields})
+    let layout=layouts.iter().find(|r|r.declaration==record)
+        .ok_or("pointer target layout missing")?;
+    if layout.size_bytes==0 || layout.size_bytes>4096 ||
+        !matches!(layout.alignment_bytes,1|4|8) {
+        return Err("unsupported pointer target extent/alignment".into());
+    }
+    let mut fields=Vec::new();
+    visit(record,"",0,layouts,&mut fields)?;
+    if fields.iter().map(|f|&f.path).ne(expected.iter()) {
+        return Err("pointer target checked leaf paths disagree with record layout".into());
+    }
+    for field in &fields {
+        if field.offset_bytes.checked_add(u32::from(field.bits/8))
+            .is_none_or(|end|end>layout.size_bytes) {
+            return Err("pointer field crosses checked record byte extent".into());
+        }
+    }
+    Ok(PointerObject {
+        name:name.into(),record:record.into(),bytes:layout.size_bytes,fields,
+    })
 }
 fn checked_pointer_field(
     pointers:&PointerBindings,root:&str,fields:&str,
