@@ -68,6 +68,8 @@ pub struct PointerField {
     pub path: String,
     pub offset_bytes: u32,
     pub bits: u8,
+    /// Required for chained typed dereferences, never inferred from bits.
+    pub target_record: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PointerObject {
@@ -77,6 +79,22 @@ pub struct PointerObject {
     pub fields: Vec<PointerField>,
 }
 type PointerBindings = HashMap<String,(usize,PointerObject)>;
+type PointerTargets = HashMap<String,PointerObject>;
+struct PointerContext<'a> {
+    objects: &'a PointerBindings,
+    targets: &'a PointerTargets,
+}
+
+#[derive(Clone,Debug)]
+struct PointerAccess {
+    root:usize,
+    /// Offsets of pointer-valued fields traversed before the selected field.
+    hops:Vec<u32>,
+    offset:u32,
+    bits:u8,
+    target:Option<String>,
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
@@ -93,6 +111,11 @@ pub enum Expr {
     RecordField { array: usize, byte_offset: u32, bits: u8 },
     /// Checked dereference of a private pointer to a source-checked record.
     PointerField { pointer: usize, byte_offset: u32, bits: u8 },
+    PointerChainField {pointer:usize,hops:Vec<u32>,byte_offset:u32,bits:u8},
+    /// Full-width pointer from a local/global object or a checked link.
+    PointerValue {pointer:usize,hops:Vec<u32>,byte_offset:Option<u32>},
+    NilPointer,
+    PointerNullTest {value:Box<Expr>,equal:bool},
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
@@ -116,6 +139,11 @@ pub enum Stmt {
     AssignPointerField {pointer:usize,byte_offset:u32,bits:u8,value:Expr},
     NewPointer {pointer:usize,bytes:u32},
     AssignPointer {pointer:usize,source:Option<usize>},
+    AssignPointerValue {pointer:usize,value:Expr},
+    AssignPointerChainField {
+        pointer:usize,hops:Vec<u32>,byte_offset:u32,bits:u8,value:Expr,
+    },
+    NewPointerLink {pointer:usize,hops:Vec<u32>,byte_offset:u32,bytes:u32},
     /// Checked record/subrecord byte range, including padding. The frontend
     /// proves both nominal projections and range bounds; reverse memmove
     /// ordering is required only when two ranges overlap within one object.
@@ -134,7 +162,8 @@ pub enum Stmt {
 // Private homogeneous INTEGER records now use contiguous checked memory,
 // with 4-byte fields and an addressable allocation root. No record ABI,
 // pointer exposure, record extension or heterogeneous fields are inferred.
-fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
+fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>,
+    pointers:&HashMap<String,String>)
     -> Result<Option<Vec<String>>, String>
 {
     match ty {
@@ -151,12 +180,14 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
                     .ok_or("unsupported record extension base")?
             } else { Vec::new() };
             for field in fields {
-                let nested=if matches!(&field.ty,
-                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] || q.as_slice()==["BYTE"]) {
-                    None
-                } else {
-                    Some(record_fields(&field.ty, types)?
-                        .ok_or("record fields must be INTEGER, BYTE or supported private records")?)
+                let scalar=matches!(&field.ty,
+                    TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"] ||
+                        q.as_slice()==["BYTE"] ||
+                        (q.len()==1 && pointers.contains_key(&q[0])))
+                    || matches!(&field.ty,TypeExpr::Pointer(_,_));
+                let nested=if scalar {None} else {
+                    Some(record_fields(&field.ty,types,pointers)?
+                        .ok_or("record fields must use checked scalar, pointer or record types")?)
                 };
                 for (name, _) in &field.names {
                     // Oberon accepts an extension that hides a base field,
@@ -217,6 +248,9 @@ pub enum CheckedRecordFieldType {
     Integer,
     Byte,
     Record(String),
+    /// A full-width pointer to a nominal record; the pointee is not embedded
+    /// and may be declared later (including self-referential record cycles).
+    Pointer(String),
 }
 
 /// The source-checked object declaration and its exact nominal record.
@@ -237,7 +271,7 @@ pub type CheckedRecordProjection = (
 
 /// Natural byte layout of the checked private INTEGER/BYTE subset.
 fn align_checked_record(bytes:u32,alignment:u32)->Result<u32,String> {
-    if !matches!(alignment,1|4) {
+    if !matches!(alignment,1|4|8) {
         return Err("unsupported private record scalar alignment".into());
     }
     bytes.checked_add(alignment-1)
@@ -253,6 +287,7 @@ fn checked_record_layout(
     ty: &TypeExpr,
     identity: &str,
     named: &HashMap<String, String>,
+    pointers: &HashMap<String,String>,
     layouts: &mut Vec<CheckedRecordLayout>,
 ) -> Result<Option<String>, String> {
     match ty {
@@ -274,18 +309,26 @@ fn checked_record_layout(
             for field in fields {
                 for (name, _) in &field.names {
                     let child_id = format!("{identity}.{name}");
-                    let child = checked_record_layout(&field.ty, &child_id, named, layouts)?;
+                    let child = checked_record_layout(&field.ty,&child_id,named,pointers,layouts)?;
                     let kind = match (&field.ty, child) {
                         (TypeExpr::Named(q, _), None) if q.as_slice() == ["INTEGER"] =>
                             CheckedRecordFieldType::Integer,
                         (TypeExpr::Named(q, _), None) if q.as_slice() == ["BYTE"] =>
                             CheckedRecordFieldType::Byte,
                         (_, Some(id)) => CheckedRecordFieldType::Record(id),
-                        _ => return Err("checked record metadata needs INTEGER or record field".into()),
+                        (TypeExpr::Named(q,_),None) if q.len()==1 &&
+                            pointers.contains_key(&q[0]) =>
+                            CheckedRecordFieldType::Pointer(pointers[&q[0]].clone()),
+                        (TypeExpr::Pointer(_,_),None) =>
+                            CheckedRecordFieldType::Pointer(
+                                pointer_record_target(&field.ty,pointers,named)?
+                                    .ok_or("pointer field has no nominal record target")?),
+                        _ => return Err("checked record field needs INTEGER, BYTE, pointer or record".into()),
                     };
                     let (bytes,align) = match &kind {
                         CheckedRecordFieldType::Integer => (4,4),
                         CheckedRecordFieldType::Byte => (1,1),
+                        CheckedRecordFieldType::Pointer(_) => (8,8),
                         CheckedRecordFieldType::Record(id) => {
                             let nested=layouts.iter().find(|r|&r.declaration==id)
                                 .ok_or("checked nested record layout missing")?;
@@ -365,6 +408,7 @@ fn record_shape(
             match &field.ty {
                 CheckedRecordFieldType::Integer=>out.push((path,field_offset,32)),
                 CheckedRecordFieldType::Byte=>out.push((path,field_offset,8)),
+                CheckedRecordFieldType::Pointer(_)=>out.push((path,field_offset,64)),
                 CheckedRecordFieldType::Record(child)=>{
                     let nested=layouts.iter().find(|r|&r.declaration==child)
                         .ok_or("checked nested region layout missing")?;
@@ -430,40 +474,126 @@ fn checked_pointer_object(
     name:&str,record:&str, layouts:&[CheckedRecordLayout],
     types:&HashMap<String,Vec<String>>,
 )->Result<PointerObject,String> {
+    fn visit(
+        id:&str,prefix:&str,base_offset:u32,layouts:&[CheckedRecordLayout],
+        out:&mut Vec<PointerField>,
+    )->Result<(),String> {
+        let layout=layouts.iter().find(|r|r.declaration==id)
+            .ok_or("pointer target nested record layout missing")?;
+        if let Some(base)=&layout.base {
+            visit(base,prefix,base_offset,layouts,out)?;
+        }
+        for field in &layout.fields {
+            let offset=base_offset.checked_add(field.offset_bytes)
+                .ok_or("pointer field offset overflow")?;
+            let path=format!("{prefix}{}",field.name);
+            match &field.ty {
+                CheckedRecordFieldType::Integer=>out.push(PointerField {
+                    path,offset_bytes:offset,bits:32,target_record:None,
+                }),
+                CheckedRecordFieldType::Byte=>out.push(PointerField {
+                    path,offset_bytes:offset,bits:8,target_record:None,
+                }),
+                CheckedRecordFieldType::Pointer(target)=>out.push(PointerField {
+                    path,offset_bytes:offset,bits:64,target_record:Some(target.clone()),
+                }),
+                CheckedRecordFieldType::Record(child)=>visit(
+                    child,&format!("{path}."),offset,layouts,out)?,
+            }
+        }
+        Ok(())
+    }
     let record_name=record.rsplit('.').next()
         .ok_or("pointer record identity is empty")?;
-    let leaves=types.get(record_name)
+    let expected=types.get(record_name)
         .ok_or("pointer target has no checked record fields")?;
-    let shape=record_shape(record,layouts,leaves)?;
-    let bytes=layouts.iter().find(|r|r.declaration==record)
-        .ok_or("pointer target layout missing")?.size_bytes;
-    let fields=shape.fields.iter().zip(&shape.bytes)
-        .map(|(name,&(offset,bits))|PointerField {
-            path:name.clone(),offset_bytes:offset,bits,
-        }).collect();
-    Ok(PointerObject{name:name.into(),record:record.into(),bytes,fields})
-}
-fn checked_pointer_field(
-    pointers:&PointerBindings,root:&str,fields:&str,
-)->Result<(usize,u32,u8),String> {
-    let (index,object)=pointers.get(root)
-        .ok_or("field dereference requires a checked private record pointer")?;
-    let field=object.fields.iter().find(|f|f.path==fields)
-        .ok_or("selected pointer field is absent from checked target record")?;
-    Ok((*index,field.offset_bytes,field.bits))
-}
-fn pointer_deref_fields(d:&syntax::ast::Designator)->Option<String> {
-    if d.base.len()!=1 || d.sels.len()<2 ||
-       !matches!(d.sels.first(),Some(syntax::ast::Selector::Deref)) {
-        return None;
+    let layout=layouts.iter().find(|r|r.declaration==record)
+        .ok_or("pointer target layout missing")?;
+    if layout.size_bytes==0 || layout.size_bytes>4096 ||
+        !matches!(layout.alignment_bytes,1|4|8) {
+        return Err("unsupported pointer target extent/alignment".into());
     }
-    let mut names=Vec::new();
-    for selector in &d.sels[1..] {
-        if let syntax::ast::Selector::Field(name)=selector {
+    let mut fields=Vec::new();
+    visit(record,"",0,layouts,&mut fields)?;
+    if fields.iter().map(|f|&f.path).ne(expected.iter()) {
+        return Err("pointer target checked leaf paths disagree with record layout".into());
+    }
+    for field in &fields {
+        if field.offset_bytes.checked_add(u32::from(field.bits/8))
+            .is_none_or(|end|end>layout.size_bytes) {
+            return Err("pointer field crosses checked record byte extent".into());
+        }
+    }
+    Ok(PointerObject {
+        name:name.into(),record:record.into(),bytes:layout.size_bytes,fields,
+    })
+}
+fn resolve_pointer_access(
+    d:&syntax::ast::Designator,pointers:&PointerBindings,
+    targets:&PointerTargets,
+)->Result<PointerAccess,String> {
+    if d.base.len()!=1 || d.sels.len()<2 {
+        return Err("checked record-pointer field requires ^ and a field".into());
+    }
+    let (root,object)=pointers.get(&d.base[0])
+        .ok_or("pointer field starts from an unknown checked object")?;
+    let mut record=object.record.clone();
+    let mut hops=Vec::new();
+    let mut cursor=0;
+    loop {
+        if !matches!(d.sels.get(cursor),Some(syntax::ast::Selector::Deref)) {
+            return Err("pointer record chain must explicitly dereference ^".into());
+        }
+        cursor+=1;
+        let mut names=Vec::new();
+        while let Some(syntax::ast::Selector::Field(name))=d.sels.get(cursor) {
             names.push(name.as_str());
-        } else {return None;}
+            cursor+=1;
+        }
+        if names.is_empty(){return Err("pointer dereference needs a field".into());}
+        let shape=targets.get(&record)
+            .ok_or("checked pointer target record layout unavailable")?;
+        let path=names.join(".");
+        let field=shape.fields.iter().find(|f|f.path==path)
+            .ok_or("pointer field is absent from checked record layout")?;
+        if cursor==d.sels.len() {
+            return Ok(PointerAccess {
+                root:*root,hops,offset:field.offset_bytes,bits:field.bits,
+                target:field.target_record.clone(),
+            });
+        }
+        if cursor>d.sels.len() || hops.len()>=16 {
+            return Err("pointer record selector chain is unsupported or too deep".into());
+        }
+        let target=field.target_record.as_ref()
+            .ok_or("pointer chain can only traverse pointer-valued fields")?;
+        hops.push(field.offset_bytes);
+        record=target.clone();
     }
-    Some(names.join("."))
+}
+fn pointer_value(
+    expr:&OberonExpr,pointers:&PointerBindings,
+    targets:&PointerTargets,
+)->Result<Option<(Expr,String)>,String> {
+    match &expr.kind {
+        ExprKind::Nil=>Ok(None),
+        ExprKind::Designator(d) if d.base.len()==1 && d.sels.is_empty()=>{
+            let (index,object)=pointers.get(&d.base[0])
+                .ok_or("expected source-checked pointer variable")?;
+            Ok(Some((Expr::PointerValue {
+                pointer:*index,hops:Vec::new(),byte_offset:None,
+            },object.record.clone())))
+        },
+        ExprKind::Designator(d)=>{
+            let access=resolve_pointer_access(d,pointers,targets)?;
+            let target=access.target.ok_or("expected pointer-valued record field")?;
+            Ok(Some((Expr::PointerValue {
+                pointer:access.root,hops:access.hops,
+                byte_offset:Some(access.offset),
+            },target)))
+        },
+        _=>Err("pointer value must be NIL or a checked pointer designator".into()),
+    }
 }
 
 type RecordObjects = HashMap<String,(usize,RecordShape)>;
@@ -688,7 +818,7 @@ fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
               arrays:&ArrayBindings<'_>,
               records:&RecordObjects,
-              pointers:&PointerBindings,
+              pointers:&PointerContext<'_>,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants)->Result<Expr,String> {
     if d.base.len()!=1 || d.sels.len()!=1 {
@@ -715,15 +845,28 @@ fn lower_call(d:&syntax::ast::Designator,
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
-              pointers:&PointerBindings,
+              pointers:&PointerContext<'_>,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Expr, String> {
     match &expr.kind {
-        ExprKind::Designator(d) if pointer_deref_fields(d).is_some() => {
-            let fields=pointer_deref_fields(d).ok_or("invalid pointer dereference")?;
-            let (pointer,byte_offset,bits)=checked_pointer_field(
-                pointers,&d.base[0],&fields)?;
-            Ok(Expr::PointerField {pointer,byte_offset,bits})
+        ExprKind::Designator(d) if d.base.len()==1 &&
+            d.sels.iter().any(|sel|matches!(sel,syntax::ast::Selector::Deref)) => {
+            let access=resolve_pointer_access(d,pointers.objects,pointers.targets)?;
+            if access.bits==64 {
+                Ok(Expr::PointerValue {
+                    pointer:access.root,hops:access.hops,
+                    byte_offset:Some(access.offset),
+                })
+            } else if access.hops.is_empty() {
+                Ok(Expr::PointerField {
+                    pointer:access.root,byte_offset:access.offset,bits:access.bits,
+                })
+            } else {
+                Ok(Expr::PointerChainField {
+                    pointer:access.root,hops:access.hops,
+                    byte_offset:access.offset,bits:access.bits,
+                })
+            }
         }
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
@@ -732,6 +875,16 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
         }
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
+        ExprKind::Nil=>Ok(Expr::NilPointer),
+        ExprKind::Binary(op,left,right) if matches!(op,BinOp::Eq|BinOp::Ne) &&
+            (matches!(left.kind,ExprKind::Nil) || matches!(right.kind,ExprKind::Nil)) => {
+            let non_nil=if matches!(left.kind,ExprKind::Nil) {right} else {left};
+            let (value,_target)=pointer_value(non_nil,pointers.objects,pointers.targets)?
+                .ok_or("pointer null comparison requires a pointer operand")?;
+            Ok(Expr::PointerNullTest {
+                value:Box::new(value),equal:matches!(op,BinOp::Eq),
+            })
+        },
         ExprKind::Designator(d) if d.sels.is_empty() && d.base.len() == 1 => {
             if let Some(index)=names.get(d.base[0].as_str()) {
                 Ok(Expr::Variable(*index))
@@ -806,7 +959,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
-              pointers:&PointerBindings,
+              pointers:&PointerContext<'_>,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
 {
@@ -825,31 +978,53 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 let ExprKind::Designator(actual)=&argument.kind else {
                     return Err("NEW needs an assignable pointer variable".into());
                 };
-                if actual.base.len()!=1 || !actual.sels.is_empty() {
-                    return Err("NEW only supports direct private pointer objects".into());
+                if actual.base.len()!=1 {
+                    return Err("NEW requires a source-checked private pointer object".into());
                 }
-                let (pointer,object)=pointers.get(&actual.base[0])
-                    .ok_or("NEW needs a checked private pointer variable")?;
-                out.push(Stmt::NewPointer {pointer:*pointer,bytes:object.bytes});
+                if actual.sels.is_empty() {
+                    let (pointer,object)=pointers.objects.get(&actual.base[0])
+                        .ok_or("NEW needs a checked private pointer variable")?;
+                    out.push(Stmt::NewPointer {pointer:*pointer,bytes:object.bytes});
+                } else {
+                    let access=resolve_pointer_access(actual,pointers.objects,pointers.targets)?;
+                    let record=access.target
+                        .ok_or("NEW target field must have pointer-to-record type")?;
+                    let shape=pointers.targets.get(&record)
+                        .ok_or("NEW target record layout missing")?;
+                    out.push(Stmt::NewPointerLink {
+                        pointer:access.root,hops:access.hops,
+                        byte_offset:access.offset,bytes:shape.bytes,
+                    });
+                }
             }
             StmtKind::Call(d)=>out.push(Stmt::Call(
                 lower_call(d,names,arrays,records,pointers,functions,constants)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
-                if let Some((pointer,object))=pointers.get(&target.base[0]) {
-                    let source=match &value.kind {
-                        ExprKind::Nil=>None,
-                        ExprKind::Designator(d) if d.base.len()==1 && d.sels.is_empty()=>{
-                            let (index,from)=pointers.get(&d.base[0])
-                                .ok_or("pointer assignment requires checked source pointer")?;
-                            if from.record!=object.record {
-                                return Err("pointer assignment requires same nominal record target".into());
+                if let Some((pointer,object))=pointers.objects.get(&target.base[0]) {
+                    let value=pointer_value(value,pointers.objects,pointers.targets)?;
+                    if let Some((source,record))=value {
+                        if record!=object.record {
+                            return Err("pointer assignment requires same nominal record target".into());
+                        }
+                        if let Expr::PointerValue {pointer:from,hops,byte_offset:None}=&source {
+                            if hops.is_empty() {
+                                out.push(Stmt::AssignPointer {
+                                    pointer:*pointer,source:Some(*from),
+                                });
+                            } else {
+                                out.push(Stmt::AssignPointerValue {
+                                    pointer:*pointer,value:source,
+                                });
                             }
-                            Some(*index)
-                        },
-                        _=>return Err("pointer assignment only supports NIL or compatible pointer".into()),
-                    };
-                    out.push(Stmt::AssignPointer {pointer:*pointer,source});
+                        } else {
+                            out.push(Stmt::AssignPointerValue {
+                                pointer:*pointer,value:source,
+                            });
+                        }
+                    } else {
+                        out.push(Stmt::AssignPointer {pointer:*pointer,source:None});
+                    }
                 } else if let Some(copies)=lower_record_copy(target,value,records)? {
                     out.extend(copies);
                 } else {
@@ -859,15 +1034,29 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                         lower_expr(value,names,arrays,records,pointers,functions,constants)?});
                 }
             }
-            StmtKind::Assign {target,value} if pointer_deref_fields(target).is_some() => {
-                let fields=pointer_deref_fields(target)
-                    .ok_or("invalid pointer target field chain")?;
-                let (pointer,byte_offset,bits)=checked_pointer_field(
-                    pointers,&target.base[0],&fields)?;
-                out.push(Stmt::AssignPointerField {
-                    pointer,byte_offset,bits,
-                    value:lower_expr(value,names,arrays,records,pointers,functions,constants)?,
-                });
+            StmtKind::Assign {target,value} if target.base.len()==1 &&
+                target.sels.iter().any(|sel|matches!(sel,syntax::ast::Selector::Deref)) => {
+                let access=resolve_pointer_access(target,pointers.objects,pointers.targets)?;
+                let val=if let Some(record)=&access.target {
+                    match pointer_value(value,pointers.objects,pointers.targets)? {
+                        Some((source,source_record)) if source_record==*record=>source,
+                        None=>Expr::NilPointer,
+                        _=>return Err("pointer-link assignment requires compatible nominal record target".into()),
+                    }
+                } else {
+                    lower_expr(value,names,arrays,records,pointers,functions,constants)?
+                };
+                if access.hops.is_empty() && access.bits!=64 {
+                    out.push(Stmt::AssignPointerField {
+                        pointer:access.root,byte_offset:access.offset,
+                        bits:access.bits,value:val,
+                    });
+                } else {
+                    out.push(Stmt::AssignPointerChainField {
+                        pointer:access.root,hops:access.hops,
+                        byte_offset:access.offset,bits:access.bits,value:val,
+                    });
+                }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                 !target.sels.is_empty() &&
@@ -988,8 +1177,25 @@ pub fn lower_module_with_record_objects(source: &str)
     let module_constants=checked_constants(
         &module.decls.consts,&CheckedConstants::new())?;
     let mut record_types = HashMap::<String, Vec<String>>::new();
+    // Predeclare record identities before visiting pointer declarations:
+    // TYPE Node=POINTER TO NodeDesc; NodeDesc=RECORD next:Node END
+    // is semantically legal and must not create a by-value infinite record.
     let mut record_nominals = HashMap::<String, String>::new();
+    for decl in &module.decls.types {
+        if matches!(decl.ty,TypeExpr::Record{..}) {
+            record_nominals.insert(decl.name.clone(),
+                format!("{}.{}",module.name,decl.name));
+        }
+    }
     let mut pointer_types=HashMap::<String,String>::new();
+    // Resolve pointer aliases against the complete set of named record
+    // declarations, while preserving the sema checker as type authority.
+    for decl in &module.decls.types {
+        if let Some(target)=pointer_record_target(
+            &decl.ty,&pointer_types,&record_nominals)? {
+            pointer_types.insert(decl.name.clone(),target);
+        }
+    }
     let mut checked_layouts = Vec::<CheckedRecordLayout>::new();
     let mut checked_objects = Vec::<CheckedRecordObject>::new();
     for decl in &module.decls.types {
@@ -1001,11 +1207,11 @@ pub fn lower_module_with_record_objects(source: &str)
             pointer_types.insert(decl.name.clone(),target);
             continue;
         }
-        let fields = record_fields(&decl.ty, &record_types)?
+        let fields = record_fields(&decl.ty,&record_types,&pointer_types)?
             .ok_or_else(|| format!("unsupported type declaration: {}", decl.name))?;
         let declaration = format!("{}.{}", module.name, decl.name);
         let nominal = checked_record_layout(
-            &decl.ty, &declaration, &record_nominals, &mut checked_layouts,
+            &decl.ty,&declaration,&record_nominals,&pointer_types,&mut checked_layouts,
         )?.ok_or("unsupported source-checked record type")?;
         record_nominals.insert(decl.name.clone(), nominal);
         record_types.insert(decl.name.clone(), fields);
@@ -1026,11 +1232,11 @@ pub fn lower_module_with_record_objects(source: &str)
             }
             continue;
         }
-        if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+        if let Some(fields) = record_fields(&decl.ty,&record_types,&pointer_types)? {
             let first = decl.names.first().ok_or("record variable declaration has no names")?;
             let identity = format!("{}.global.{}", module.name, first.0);
             let record = checked_record_layout(
-                &decl.ty, &identity, &record_nominals, &mut checked_layouts,
+                &decl.ty,&identity,&record_nominals,&pointer_types,&mut checked_layouts,
             )?.ok_or("checked global record identity is missing")?;
             let shape=record_shape(&record,&checked_layouts,&fields)?;
             for (name, exported) in &decl.names {
@@ -1064,6 +1270,17 @@ pub fn lower_module_with_record_objects(source: &str)
                 }
             }
             _ => return Err("only INTEGER globals and fixed INTEGER arrays are supported".into()),
+        }
+    }
+
+    // Finite nominal record shapes for resolving pointer chains; the target
+    // map is independent of allocation roots and never expands pointer
+    // fields recursively.
+    let mut pointer_targets=PointerTargets::new();
+    for (name,identity) in &record_nominals {
+        if record_types.contains_key(name) {
+            pointer_targets.insert(identity.clone(),
+                checked_pointer_object(name,identity,&checked_layouts,&record_types)?);
         }
     }
 
@@ -1108,11 +1325,11 @@ pub fn lower_module_with_record_objects(source: &str)
                 }
                 continue;
             }
-            if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+            if let Some(fields) = record_fields(&decl.ty,&record_types,&pointer_types)? {
                 let first = decl.names.first().ok_or("local record declaration has no names")?;
                 let identity = format!("{}.{}.local.{}", module.name, proc.name, first.0);
                 let record = checked_record_layout(
-                    &decl.ty, &identity, &record_nominals, &mut checked_layouts,
+                    &decl.ty,&identity,&record_nominals,&pointer_types,&mut checked_layouts,
                 )?.ok_or("checked local record identity is missing")?;
                 let shape=record_shape(&record,&checked_layouts,&fields)?;
                 for (name, _) in &decl.names {
@@ -1184,7 +1401,10 @@ pub fn lower_module_with_record_objects(source: &str)
         for (i,p) in pointer_locals.iter().enumerate() {
             pointers.insert(p.name.clone(),(i,p.clone()));
         }
-        let body=lower_stmts(&proc.body,&names,&arrays,&records,&pointers,
+        let pointer_context=PointerContext {
+            objects:&pointers,targets:&pointer_targets,
+        };
+        let body=lower_stmts(&proc.body,&names,&arrays,&records,&pointer_context,
             &signatures,&proc_constants)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
@@ -1215,7 +1435,10 @@ pub fn lower_module_with_record_objects(source: &str)
             .collect();
         let pointers:PointerBindings=pointer_globals.iter().enumerate()
             .map(|(i,p)|(p.name.clone(),(i,p.clone()))).collect();
-        let body=lower_stmts(&module.body,&names,&arrays,&records,&pointers,
+        let pointer_context=PointerContext {
+            objects:&pointers,targets:&pointer_targets,
+        };
+        let body=lower_stmts(&module.body,&names,&arrays,&records,&pointer_context,
             &signatures,&module_constants)?;
         if contains_return(&body) {
             return Err("module initialization cannot return a value".into());
