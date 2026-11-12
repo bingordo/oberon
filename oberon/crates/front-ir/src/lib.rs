@@ -937,11 +937,17 @@ pub fn lower_module_with_record_objects(source: &str)
         &module.decls.consts,&CheckedConstants::new())?;
     let mut record_types = HashMap::<String, Vec<String>>::new();
     let mut record_nominals = HashMap::<String, String>::new();
+    let mut pointer_types=HashMap::<String,String>::new();
     let mut checked_layouts = Vec::<CheckedRecordLayout>::new();
     let mut checked_objects = Vec::<CheckedRecordObject>::new();
     for decl in &module.decls.types {
         if decl.export {
             return Err("exported record types require a native ABI layout".into());
+        }
+        if let Some(target)=pointer_record_target(
+            &decl.ty,&pointer_types,&record_nominals)? {
+            pointer_types.insert(decl.name.clone(),target);
+            continue;
         }
         let fields = record_fields(&decl.ty, &record_types)?
             .ok_or_else(|| format!("unsupported type declaration: {}", decl.name))?;
@@ -954,9 +960,20 @@ pub fn lower_module_with_record_objects(source: &str)
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
+    let mut pointer_globals=Vec::<PointerObject>::new();
     let mut global_array_dims=HashMap::<String,Vec<u32>>::new();
     let mut module_record_fields=HashMap::<String,RecordShape>::new();
     for decl in &module.decls.vars {
+        if let Some(record)=pointer_record_target(
+            &decl.ty,&pointer_types,&record_nominals)? {
+            for (name,exported) in &decl.names {
+                if *exported {return Err(
+                    "exported pointer objects require explicit pointer ABI admission".into());}
+                pointer_globals.push(checked_pointer_object(
+                    name,&record,&checked_layouts,&record_types)?);
+            }
+            continue;
+        }
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
             let first = decl.names.first().ok_or("record variable declaration has no names")?;
             let identity = format!("{}.global.{}", module.name, first.0);
@@ -1027,9 +1044,18 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
+        let mut pointer_locals=Vec::<PointerObject>::new();
         let mut local_array_dims=HashMap::<String,Vec<u32>>::new();
         let mut local_record_fields=HashMap::<String,RecordShape>::new();
         for decl in &proc.decls.vars {
+            if let Some(record)=pointer_record_target(
+                &decl.ty,&pointer_types,&record_nominals)? {
+                for (name,_) in &decl.names {
+                    pointer_locals.push(checked_pointer_object(
+                        name,&record,&checked_layouts,&record_types)?);
+                }
+                continue;
+            }
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
                 let first = decl.names.first().ok_or("local record declaration has no names")?;
                 let identity = format!("{}.{}.local.{}", module.name, proc.name, first.0);
@@ -1096,8 +1122,18 @@ pub fn lower_module_with_record_objects(source: &str)
                 records.insert(a.name.clone(),(i,shape.clone()));
             }
         }
-        let body=lower_stmts(&proc.body,&names,&arrays,&records,&signatures,
-            &proc_constants)?;
+        let mut pointers:PointerBindings=pointer_globals.iter()
+            .enumerate().map(|(i,p)|(p.name.clone(),
+                (pointer_locals.len()+i,p.clone()))).collect();
+        for name in parameters.iter().chain(locals.iter())
+            .chain(fixed_arrays.iter().map(|a|&a.name)) {
+            pointers.remove(name);
+        }
+        for (i,p) in pointer_locals.iter().enumerate() {
+            pointers.insert(p.name.clone(),(i,p.clone()));
+        }
+        let body=lower_stmts(&proc.body,&names,&arrays,&records,&pointers,
+            &signatures,&proc_constants)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
         if !contains_return(&body) {
@@ -1106,6 +1142,7 @@ pub fn lower_module_with_record_objects(source: &str)
         functions.push(Function { name: proc.name.clone(), parameters, locals,
                                   arrays:fixed_arrays,
                                   global_arrays:global_arrays.clone(),
+                                  pointer_locals,pointer_globals:pointer_globals.clone(),
                                   globals: globals.iter().map(|g| g.name.clone()).collect(),
                                   body });
     }
@@ -1124,8 +1161,10 @@ pub fn lower_module_with_record_objects(source: &str)
             .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
                 (a.name.clone(),(i,shape.clone()))))
             .collect();
-        let body=lower_stmts(&module.body,&names,&arrays,&records,&signatures,
-            &module_constants)?;
+        let pointers:PointerBindings=pointer_globals.iter().enumerate()
+            .map(|(i,p)|(p.name.clone(),(i,p.clone()))).collect();
+        let body=lower_stmts(&module.body,&names,&arrays,&records,&pointers,
+            &signatures,&module_constants)?;
         if contains_return(&body) {
             return Err("module initialization cannot return a value".into());
         }
@@ -1133,16 +1172,18 @@ pub fn lower_module_with_record_objects(source: &str)
             name: "__module_init".into(),
             parameters: Vec::new(), locals: Vec::new(), arrays: Vec::new(),
             global_arrays: global_arrays.clone(),
+            pointer_locals:Vec::new(),pointer_globals:pointer_globals.clone(),
             globals: globals.iter().map(|g| g.name.clone()).collect(),
             body,
         })
     };
     if functions.is_empty() && globals.is_empty() && global_arrays.is_empty()
-        && initializer.is_none() {
+        && pointer_globals.is_empty() && initializer.is_none() {
         return Err("module has no supported procedures, globals or initialization".into());
     }
     Ok((
-        Module { name: module.name, globals, global_arrays, functions, initializer },
+        Module { name: module.name, globals, global_arrays, pointer_globals,
+            functions, initializer },
         exported_procedures,
         checked_layouts,
         checked_objects,
