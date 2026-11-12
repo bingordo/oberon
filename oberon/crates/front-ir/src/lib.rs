@@ -79,6 +79,18 @@ pub struct PointerObject {
     pub fields: Vec<PointerField>,
 }
 type PointerBindings = HashMap<String,(usize,PointerObject)>;
+type PointerTargets = HashMap<String,PointerObject>;
+
+#[derive(Clone,Debug)]
+struct PointerAccess {
+    root:usize,
+    /// Offsets of pointer-valued fields traversed before the selected field.
+    hops:Vec<u32>,
+    offset:u32,
+    bits:u8,
+    target:Option<String>,
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
@@ -95,6 +107,11 @@ pub enum Expr {
     RecordField { array: usize, byte_offset: u32, bits: u8 },
     /// Checked dereference of a private pointer to a source-checked record.
     PointerField { pointer: usize, byte_offset: u32, bits: u8 },
+    PointerChainField {pointer:usize,hops:Vec<u32>,byte_offset:u32,bits:u8},
+    /// Full-width pointer from a local/global object or a checked link.
+    PointerValue {pointer:usize,hops:Vec<u32>,byte_offset:Option<u32>},
+    NilPointer,
+    PointerNullTest {value:Box<Expr>,equal:bool},
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
@@ -118,6 +135,11 @@ pub enum Stmt {
     AssignPointerField {pointer:usize,byte_offset:u32,bits:u8,value:Expr},
     NewPointer {pointer:usize,bytes:u32},
     AssignPointer {pointer:usize,source:Option<usize>},
+    AssignPointerValue {pointer:usize,value:Expr},
+    AssignPointerChainField {
+        pointer:usize,hops:Vec<u32>,byte_offset:u32,bits:u8,value:Expr,
+    },
+    NewPointerLink {pointer:usize,hops:Vec<u32>,byte_offset:u32,bytes:u32},
     /// Checked record/subrecord byte range, including padding. The frontend
     /// proves both nominal projections and range bounds; reverse memmove
     /// ordering is required only when two ranges overlap within one object.
@@ -523,6 +545,77 @@ fn pointer_deref_fields(d:&syntax::ast::Designator)->Option<String> {
         } else {return None;}
     }
     Some(names.join("."))
+}
+
+/// Resolve explicit record-pointer dereferences through nominal layouts.
+/// Each ^ consumes a pointer field and crosses into its proven target record.
+/// This remains finite even for self-referential type declarations.
+fn resolve_pointer_access(
+    d:&syntax::ast::Designator,pointers:&PointerBindings,
+    targets:&PointerTargets,
+)->Result<PointerAccess,String> {
+    if d.base.len()!=1 || d.sels.len()<2 {
+        return Err("checked record-pointer field requires ^ and a field".into());
+    }
+    let (root,object)=pointers.get(&d.base[0])
+        .ok_or("pointer field starts from an unknown checked object")?;
+    let mut record=object.record.clone();
+    let mut hops=Vec::new();
+    let mut cursor=0;
+    loop {
+        if !matches!(d.sels.get(cursor),Some(syntax::ast::Selector::Deref)) {
+            return Err("pointer record chain must explicitly dereference ^".into());
+        }
+        cursor+=1;
+        let mut names=Vec::new();
+        while let Some(syntax::ast::Selector::Field(name))=d.sels.get(cursor) {
+            names.push(name.as_str());
+            cursor+=1;
+        }
+        if names.is_empty() {return Err("pointer dereference needs a field".into());}
+        let shape=targets.get(&record)
+            .ok_or("checked pointer target record layout unavailable")?;
+        let path=names.join(".");
+        let field=shape.fields.iter().find(|f|f.path==path)
+            .ok_or("pointer field is absent from checked record layout")?;
+        if cursor==d.sels.len() {
+            return Ok(PointerAccess {
+                root:*root,hops,offset:field.offset_bytes,bits:field.bits,
+                target:field.target_record.clone(),
+            });
+        }
+        if cursor>d.sels.len() || hops.len()>=16 {
+            return Err("pointer record selector chain is unsupported or too deep".into());
+        }
+        let target=field.target_record.as_ref()
+            .ok_or("pointer chain can only traverse pointer-valued fields")?;
+        hops.push(field.offset_bytes);
+        record=target.clone();
+    }
+}
+fn pointer_value(
+    expr:&OberonExpr,pointers:&PointerBindings,
+    targets:&PointerTargets,
+)->Result<Option<(Expr,String)>,String> {
+    match &expr.kind {
+        ExprKind::Nil=>Ok(None),
+        ExprKind::Designator(d) if d.base.len()==1 && d.sels.is_empty()=>{
+            let (index,object)=pointers.get(&d.base[0])
+                .ok_or("expected source-checked pointer variable")?;
+            Ok(Some((Expr::PointerValue {
+                pointer:*index,hops:Vec::new(),byte_offset:None,
+            },object.record.clone())))
+        },
+        ExprKind::Designator(d)=>{
+            let access=resolve_pointer_access(d,pointers,targets)?;
+            let target=access.target.ok_or("expected pointer-valued record field")?;
+            Ok(Some((Expr::PointerValue {
+                pointer:access.root,hops:access.hops,
+                byte_offset:Some(access.offset),
+            },target)))
+        },
+        _=>Err("pointer value must be NIL or a checked pointer designator".into()),
+    }
 }
 
 type RecordObjects = HashMap<String,(usize,RecordShape)>;
