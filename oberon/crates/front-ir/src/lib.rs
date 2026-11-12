@@ -3,6 +3,54 @@
 //! Only syntax and semantic-analysis crates are dependencies. Unsupported
 //! constructs fail closed; the consuming compiler owns SSA and code generation.
 use std::collections::HashMap;
+
+pub use sema::sym::{Interface,Item as InterfaceItem};
+pub fn parse_interface(text:&str)->Result<Interface,String>{
+    sema::sym::parse(text)
+}
+pub fn render_interface(interface:&Interface)->String {
+    sema::sym::render(interface)
+}
+
+/// Only the ABI we lower natively is advertised in this initial .sym writer:
+/// exported INTEGER-returning functions taking value/VAR INTEGER scalars.
+/// Other exports must not silently disappear from an interface file.
+pub fn checked_scalar_interface(source:&str)->Result<Interface,String> {
+    let (checked,diagnostics)=sema::check_module_recovering(source,&[]);
+    if let Some(diagnostic)=diagnostics.iter().find(|d|d.is_error()) {
+        return Err(format!("Oberon interface semantic or syntax error: {diagnostic:?}"));
+    }
+    let module=checked.ok_or("missing checked Oberon module")?;
+    if !module.imports.is_empty(){
+        return Err("native scalar interface writer does not re-export imports".into());
+    }
+    if module.decls.types.iter().any(|x|x.export) ||
+       module.decls.vars.iter().any(|x|x.names.iter().any(|(_,export)|*export)) ||
+       module.decls.consts.iter().any(|x|x.export) {
+        return Err("native scalar .sym writer cannot hide non-procedure exports".into());
+    }
+    let mut items=Vec::new();
+    for proc in &module.decls.procs {
+        if !proc.export {continue;}
+        if !matches!(proc.result.as_deref(),Some([ty]) if ty=="INTEGER") {
+            return Err("native scalar .sym requires INTEGER result".into());
+        }
+        let mut params=Vec::new();
+        for section in &proc.params {
+            if section.ty.open!=0 || section.ty.base.as_slice()!=["INTEGER"] {
+                return Err("native scalar .sym supports INTEGER and VAR INTEGER formals only".into());
+            }
+            for _ in &section.names {
+                params.push(if section.by_ref {"VAR INTEGER"} else {"INTEGER"}.into());
+            }
+        }
+        items.push(InterfaceItem::Proc {
+            name:proc.name.clone(),params,result:Some("INTEGER".into()),
+        });
+    }
+    Ok(Interface{module:module.name,imports:Vec::new(),items})
+}
+
 use syntax::ast::{BinOp, Expr as OberonExpr, ExprKind, Stmt as OberonStmt,
                   StmtKind, TypeExpr, UnOp};
 use sema::const_eval::{self, Const as CheckedConst};
@@ -16,6 +64,8 @@ pub struct Module {
     /// Private checked pointer-to-record storage; never an exported ABI type.
     pub pointer_globals: Vec<PointerObject>,
     pub functions: Vec<Function>,
+    /// Source-checked exported imported scalar function declarations.
+    pub imported_procedures: Vec<ImportedProcedure>,
     /// Checked module BEGIN body; emitted as a private constructor.
     pub initializer: Option<Function>,
 }
@@ -34,6 +84,13 @@ pub struct ArrayGlobal {
     pub name: String,
     pub length: u32,
     pub exported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedProcedure {
+    pub module: String,
+    pub name: String,
+    pub parameter_by_ref: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +182,9 @@ pub enum Expr {
     Binary(Op, Box<Expr>, Box<Expr>),
     /// Checked same-module INTEGER function call, including recursion.
     Call { name:String, args:Vec<Expr> },
+    /// Direct call to an imported source-checked scalar function; the defining
+    /// module name is authoritative, and the alias is not part of its symbol.
+    ImportedCall {module:String,name:String,args:Vec<Expr>},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -818,29 +878,35 @@ fn checked_array_length(
     }
 }
 
+#[derive(Clone,Debug)]
+struct CallSignature {
+    parameter_by_ref:Vec<bool>,
+    module:Option<String>,
+}
+
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
               arrays:&ArrayBindings<'_>,
               records:&RecordObjects,
               pointers:&PointerContext<'_>,
-              functions:&HashMap<String,Vec<bool>>,
+              functions:&HashMap<String,CallSignature>,
               constants:&CheckedConstants)->Result<Expr,String> {
-    if d.base.len()!=1 || d.sels.len()!=1 {
+    if !(1..=2).contains(&d.base.len()) || d.sels.len()!=1 {
         return Err("unsupported qualified or selected function call".into());
     }
-    let symbol=&d.base[0];
-    let expected=functions.get(symbol)
-        .ok_or_else(||format!("unsupported call to non-local function {symbol}"))?;
+    let symbol=d.base.join(".");
+    let expected=functions.get(&symbol)
+        .ok_or_else(||format!("unsupported or non-exported function {symbol}"))?;
     let raw_args=match &d.sels[0] {
         syntax::ast::Selector::Call(args)=>args.as_slice(),
         syntax::ast::Selector::Args(args)=>args.as_deref().unwrap_or(&[]),
         _=>return Err("expected direct function call".into()),
     };
-    if raw_args.len()!=expected.len() {
+    if raw_args.len()!=expected.parameter_by_ref.len() {
         return Err(format!("{symbol}: call argument count mismatch"));
     }
     let mut args=Vec::with_capacity(raw_args.len());
-    for (arg,&by_ref) in raw_args.iter().zip(expected) {
+    for (arg,&by_ref) in raw_args.iter().zip(&expected.parameter_by_ref) {
         if by_ref {
             let ExprKind::Designator(actual)=&arg.kind else {
                 return Err("VAR INTEGER argument must be assignable scalar designator".into());
@@ -855,14 +921,20 @@ fn lower_call(d:&syntax::ast::Designator,
             args.push(lower_expr(arg,names,arrays,records,pointers,functions,constants)?);
         }
     }
-    Ok(Expr::Call{name:symbol.clone(),args})
+    if let Some(module)=&expected.module {
+        Ok(Expr::ImportedCall {
+            module:module.clone(),name:d.base[1].clone(),args,
+        })
+    } else {
+        Ok(Expr::Call{name:symbol,args})
+    }
 }
 
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               pointers:&PointerContext<'_>,
-              functions:&HashMap<String,Vec<bool>>,
+              functions:&HashMap<String,CallSignature>,
               constants:&CheckedConstants) -> Result<Expr, String> {
     match &expr.kind {
         ExprKind::Designator(d) if d.base.len()==1 &&
@@ -884,7 +956,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 })
             }
         }
-        ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
+        ExprKind::Designator(d) if (1..=2).contains(&d.base.len()) && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
                         syntax::ast::Selector::Args(_)) => {
             lower_call(d,names,arrays,records,pointers,functions,constants)
@@ -976,7 +1048,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               pointers:&PointerContext<'_>,
-              functions:&HashMap<String,Vec<bool>>,
+              functions:&HashMap<String,CallSignature>,
               constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
 {
     let mut out = Vec::new();
@@ -1177,8 +1249,16 @@ pub fn lower_module_with_metadata(source: &str)
 /// supported records and the module/procedure objects that instantiate them.
 /// Existing front-ir output remains ABI- and layout-compatible.
 pub fn lower_module_with_record_objects(source: &str)
-    -> Result<CheckedRecordProjection, String> {
-    let (checked, diagnostics) = sema::check_module_recovering(source, &[]);
+    -> Result<CheckedRecordProjection,String> {
+    lower_module_with_record_objects_and_interfaces(source,&[])
+}
+
+/// Imported interfaces are always fed to the original source semantic
+/// checker, rather than guessed from names/arity by code generation.
+pub fn lower_module_with_record_objects_and_interfaces(
+    source:&str,interfaces:&[Interface],
+)->Result<CheckedRecordProjection,String> {
+    let (checked, diagnostics) = sema::check_module_recovering(source,interfaces);
     if let Some(d) = diagnostics.iter().find(|d| d.is_error()) {
         return Err(format!("Oberon semantic or syntax error: {d:?}"));
     }
@@ -1187,8 +1267,33 @@ pub fn lower_module_with_record_objects(source: &str)
         .filter(|proc| proc.export)
         .map(|proc| proc.name.clone())
         .collect::<Vec<_>>();
-    if !module.imports.is_empty() {
-        return Err("module imports are not yet supported".into());
+    let mut imported_procedures=Vec::<ImportedProcedure>::new();
+    let mut imported_names=HashMap::<String,(String,Vec<bool>)>::new();
+    for import in &module.imports {
+        let interface=interfaces.iter().find(|item|item.module==import.module)
+            .ok_or("no checked source interface for imported module")?;
+        for item in &interface.items {
+            if let InterfaceItem::Proc{name,params,result}=item {
+                // Only fixed scalar INTEGER arguments/results have a native
+                // TypeId ABI in this first import milestone.
+                if result.as_deref()!=Some("INTEGER") {continue;}
+                let modes=params.iter().map(|p|match p.as_str() {
+                    "INTEGER"=>Some(false),
+                    "VAR INTEGER"=>Some(true),
+                    _=>None,
+                }).collect::<Option<Vec<_>>>();
+                let Some(modes)=modes else {continue;};
+                if import.module==module.name || name.contains("__") {
+                    return Err("unsupported or colliding imported scalar function".into());
+                }
+                imported_names.insert(format!("{}.{}",import.alias,name),
+                    (import.module.clone(),modes.clone()));
+                imported_procedures.push(ImportedProcedure {
+                    module:import.module.clone(),name:name.clone(),
+                    parameter_by_ref:modes,
+                });
+            }
+        }
     }
     let module_constants=checked_constants(
         &module.decls.consts,&CheckedConstants::new())?;
@@ -1303,13 +1408,22 @@ pub fn lower_module_with_record_objects(source: &str)
     // Collect the checked signatures before lowering procedure bodies. The
     // Oberon semantic checker already enforces source declaration order;
     // this map does not authorize forward references.
-    let mut signatures=HashMap::<String,Vec<bool>>::new();
+    let mut signatures=HashMap::<String,CallSignature>::new();
     for proc in &module.decls.procs {
         let by_ref=proc.params.iter()
             .flat_map(|section|std::iter::repeat_n(section.by_ref,section.names.len()))
             .collect();
-        if signatures.insert(proc.name.clone(),by_ref).is_some() {
+        if signatures.insert(proc.name.clone(),CallSignature{
+            parameter_by_ref:by_ref,module:None,
+        }).is_some() {
             return Err(format!("duplicate procedure {}",proc.name));
+        }
+    }
+    for (name,(module,modes)) in imported_names {
+        if signatures.insert(name,CallSignature{
+            parameter_by_ref:modes,module:Some(module),
+        }).is_some() {
+            return Err("ambiguous imported procedure declaration".into());
         }
     }
     let mut functions = Vec::new();
@@ -1481,7 +1595,7 @@ pub fn lower_module_with_record_objects(source: &str)
     }
     Ok((
         Module { name: module.name, globals, global_arrays, pointer_globals,
-            functions, initializer },
+            functions, imported_procedures, initializer },
         exported_procedures,
         checked_layouts,
         checked_objects,
