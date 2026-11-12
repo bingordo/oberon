@@ -664,12 +664,25 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 syntax::ast::Selector::Field(field) => {
                     record_field(records,&d.base[0],field)
                 }
-                syntax::ast::Selector::Index(indices) if indices.len()==1 => {
-                    let array=*arrays.get(d.base[0].as_str())
+                syntax::ast::Selector::Index(indices) => {
+                    let (array,dims)=arrays.get(d.base[0].as_str())
                         .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
-                    Ok(Expr::ArrayElement {
-                        array,index:Box::new(lower_expr(&indices[0],names,arrays,records,functions,constants)?),
-                    })
+                    if indices.len()!=dims.len() {
+                        return Err("fixed INTEGER array requires exactly one index per dimension".into());
+                    }
+                    let mut lowered=Vec::with_capacity(indices.len());
+                    for index in indices {
+                        lowered.push(lower_expr(index,names,arrays,records,functions,constants)?);
+                    }
+                    if dims.len()==1 {
+                        Ok(Expr::ArrayElement {
+                            array:*array,index:Box::new(lowered.remove(0)),
+                        })
+                    } else {
+                        Ok(Expr::MultiArrayElement {
+                            array:*array,indices:lowered,dims:dims.clone(),
+                        })
+                    }
                 }
                 _=>Err(format!("unsupported array selector at {}",d.span.lo)),
             }
@@ -739,14 +752,26 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                         out.push(record_store(records,&target.base[0],field,
                             lower_expr(value,names,arrays,records,functions,constants)?)?);
                     }
-                    syntax::ast::Selector::Index(indices) if indices.len()==1 => {
-                        let array=*arrays.get(target.base[0].as_str())
+                    syntax::ast::Selector::Index(indices) => {
+                        let (array,dims)=arrays.get(target.base[0].as_str())
                             .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
-                        out.push(Stmt::AssignArray {
-                            array,
-                            index:lower_expr(&indices[0],names,arrays,records,functions,constants)?,
-                            value:lower_expr(value,names,arrays,records,functions,constants)?,
-                        });
+                        if indices.len()!=dims.len() {
+                            return Err("fixed INTEGER array assignment requires one index per dimension".into());
+                        }
+                        let mut lowered=Vec::with_capacity(indices.len());
+                        for index in indices {
+                            lowered.push(lower_expr(index,names,arrays,records,functions,constants)?);
+                        }
+                        let value=lower_expr(value,names,arrays,records,functions,constants)?;
+                        if dims.len()==1 {
+                            out.push(Stmt::AssignArray {
+                                array:*array,index:lowered.remove(0),value,
+                            });
+                        } else {
+                            out.push(Stmt::AssignMultiArray {
+                                array:*array,indices:lowered,dims:dims.clone(),value,
+                            });
+                        }
                     }
                     _=>return Err(format!("unsupported array assignment at {}",s.span.lo)),
                 }
