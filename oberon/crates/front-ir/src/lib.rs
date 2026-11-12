@@ -841,6 +841,7 @@ fn lower_call(d:&syntax::ast::Designator,
               arrays:&ArrayBindings<'_>,
               records:&RecordObjects,
               pointers:&PointerBindings,
+              targets:&PointerTargets,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants)->Result<Expr,String> {
     if d.base.len()!=1 || d.sels.len()!=1 {
@@ -859,7 +860,7 @@ fn lower_call(d:&syntax::ast::Designator,
     }
     let mut args=Vec::with_capacity(raw_args.len());
     for arg in raw_args {
-        args.push(lower_expr(arg,names,arrays,records,pointers,functions,constants)?);
+        args.push(lower_expr(arg,names,arrays,records,pointers,targets,functions,constants)?);
     }
     Ok(Expr::Call{name:symbol.clone(),args})
 }
@@ -868,6 +869,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               pointers:&PointerBindings,
+              targets:&PointerTargets,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Expr, String> {
     match &expr.kind {
@@ -880,7 +882,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
                         syntax::ast::Selector::Args(_)) => {
-            lower_call(d,names,arrays,records,pointers,functions,constants)
+            lower_call(d,names,arrays,records,pointers,targets,functions,constants)
         }
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
@@ -916,7 +918,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                     }
                     let mut lowered=Vec::with_capacity(indices.len());
                     for index in indices {
-                        lowered.push(lower_expr(index,names,arrays,records,pointers,functions,constants)?);
+                        lowered.push(lower_expr(index,names,arrays,records,pointers,targets,functions,constants)?);
                     }
                     if dims.len()==1 {
                         Ok(Expr::ArrayElement {
@@ -944,13 +946,13 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 BinOp::Ge => Op::Ge,
                 _ => return Err(format!("unsupported binary expression: {op:?}")),
             };
-            Ok(Expr::Binary(op, Box::new(lower_expr(a,names,arrays,records,pointers,functions,constants)?),
-                            Box::new(lower_expr(b,names,arrays,records,pointers,functions,constants)?)))
+            Ok(Expr::Binary(op, Box::new(lower_expr(a,names,arrays,records,pointers,targets,functions,constants)?),
+                            Box::new(lower_expr(b,names,arrays,records,pointers,targets,functions,constants)?)))
         }
-        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a,names,arrays,records,pointers,functions,constants),
+        ExprKind::Unary(UnOp::Plus, a) => lower_expr(a,names,arrays,records,pointers,targets,functions,constants),
         ExprKind::Unary(UnOp::Neg, a) =>
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
-                            Box::new(lower_expr(a,names,arrays,records,pointers,functions,constants)?))),
+                            Box::new(lower_expr(a,names,arrays,records,pointers,targets,functions,constants)?))),
         _ => Err(format!("unsupported expression at {}", expr.span.lo)),
     }
 }
@@ -959,6 +961,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               pointers:&PointerBindings,
+              targets:&PointerTargets,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
 {
@@ -985,7 +988,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 out.push(Stmt::NewPointer {pointer:*pointer,bytes:object.bytes});
             }
             StmtKind::Call(d)=>out.push(Stmt::Call(
-                lower_call(d,names,arrays,records,pointers,functions,constants)?)),
+                lower_call(d,names,arrays,records,pointers,targets,functions,constants)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
                 if let Some((pointer,object))=pointers.get(&target.base[0]) {
@@ -1008,7 +1011,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     let variable=names.get(target.base[0].as_str()).copied()
                         .ok_or_else(||format!("unknown local or parameter: {}",target.base[0]))?;
                     out.push(Stmt::Assign {variable,value:
-                        lower_expr(value,names,arrays,records,pointers,functions,constants)?});
+                        lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?});
                 }
             }
             StmtKind::Assign {target,value} if pointer_deref_fields(target).is_some() => {
@@ -1018,7 +1021,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     pointers,&target.base[0],&fields)?;
                 out.push(Stmt::AssignPointerField {
                     pointer,byte_offset,bits,
-                    value:lower_expr(value,names,arrays,records,pointers,functions,constants)?,
+                    value:lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?,
                 });
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
@@ -1030,7 +1033,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     let fields=record_selector_path(target)
                         .ok_or("unsupported record selector")?;
                     out.push(record_store(records,&target.base[0],&fields,
-                        lower_expr(value,names,arrays,records,pointers,functions,constants)?)?);
+                        lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?)?);
                 }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
@@ -1038,7 +1041,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 match &target.sels[0] {
                     syntax::ast::Selector::Field(field) => {
                         out.push(record_store(records,&target.base[0],field,
-                            lower_expr(value,names,arrays,records,pointers,functions,constants)?)?);
+                            lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?)?);
                     }
                     syntax::ast::Selector::Index(indices) => {
                         let (array,dims)=arrays.get(target.base[0].as_str())
@@ -1048,9 +1051,9 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                         }
                         let mut lowered=Vec::with_capacity(indices.len());
                         for index in indices {
-                            lowered.push(lower_expr(index,names,arrays,records,pointers,functions,constants)?);
+                            lowered.push(lower_expr(index,names,arrays,records,pointers,targets,functions,constants)?);
                         }
-                        let value=lower_expr(value,names,arrays,records,pointers,functions,constants)?;
+                        let value=lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?;
                         if dims.len()==1 {
                             out.push(Stmt::AssignArray {
                                 array:*array,index:lowered.remove(0),value,
@@ -1065,18 +1068,18 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 }
             }
             StmtKind::Return(Some(e)) =>
-                out.push(Stmt::Return(lower_expr(e,names,arrays,records,pointers,functions,constants)?)),
+                out.push(Stmt::Return(lower_expr(e,names,arrays,records,pointers,targets,functions,constants)?)),
             StmtKind::If { arms, els } => {
                 if arms.is_empty() { return Err("IF with no arm".into()); }
                 let mut tail = match els {
-                    Some(stmts) => lower_stmts(stmts,names,arrays,records,pointers,functions,constants)?,
+                    Some(stmts) => lower_stmts(stmts,names,arrays,records,pointers,targets,functions,constants)?,
                     None => Vec::new(),
                 };
                 // ELSIF is lowered into a nested IF in the previous else arm.
                 for (condition, body) in arms.iter().rev() {
                     tail = vec![Stmt::If {
-                        condition: lower_expr(condition,names,arrays,records,pointers,functions,constants)?,
-                        then_body: lower_stmts(body,names,arrays,records,pointers,functions,constants)?,
+                        condition: lower_expr(condition,names,arrays,records,pointers,targets,functions,constants)?,
+                        then_body: lower_stmts(body,names,arrays,records,pointers,targets,functions,constants)?,
                         else_body: tail,
                     }];
                 }
@@ -1085,8 +1088,8 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
             StmtKind::While { arms } if arms.len() == 1 => {
                 let (condition, body) = &arms[0];
                 out.push(Stmt::While {
-                    condition: lower_expr(condition,names,arrays,records,pointers,functions,constants)?,
-                    body: lower_stmts(body,names,arrays,records,pointers,functions,constants)?,
+                    condition: lower_expr(condition,names,arrays,records,pointers,targets,functions,constants)?,
+                    body: lower_stmts(body,names,arrays,records,pointers,targets,functions,constants)?,
                 });
             }
             _ => return Err(format!("unsupported Oberon statement at {}", s.span.lo)),
@@ -1236,6 +1239,17 @@ pub fn lower_module_with_record_objects(source: &str)
         }
     }
 
+    // Finite nominal record shapes for resolving pointer chains; the target
+    // map is independent of allocation roots and never expands pointer
+    // fields recursively.
+    let mut pointer_targets=PointerTargets::new();
+    for (name,identity) in &record_nominals {
+        if record_types.contains_key(name) {
+            pointer_targets.insert(identity.clone(),
+                checked_pointer_object(name,identity,&checked_layouts,&record_types)?);
+        }
+    }
+
     // Collect the checked signatures before lowering procedure bodies. The
     // Oberon semantic checker already enforces source declaration order;
     // this map does not authorize forward references.
@@ -1354,7 +1368,7 @@ pub fn lower_module_with_record_objects(source: &str)
             pointers.insert(p.name.clone(),(i,p.clone()));
         }
         let body=lower_stmts(&proc.body,&names,&arrays,&records,&pointers,
-            &signatures,&proc_constants)?;
+            &pointer_targets,&signatures,&proc_constants)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
         if !contains_return(&body) {
@@ -1385,7 +1399,7 @@ pub fn lower_module_with_record_objects(source: &str)
         let pointers:PointerBindings=pointer_globals.iter().enumerate()
             .map(|(i,p)|(p.name.clone(),(i,p.clone()))).collect();
         let body=lower_stmts(&module.body,&names,&arrays,&records,&pointers,
-            &signatures,&module_constants)?;
+            &pointer_targets,&signatures,&module_constants)?;
         if contains_return(&body) {
             return Err("module initialization cannot return a value".into());
         }
