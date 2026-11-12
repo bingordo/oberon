@@ -62,6 +62,10 @@ pub enum Expr {
     Variable(usize),
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
+    /// Source-checked fixed INTEGER array, flattened into one native
+    /// contiguous word allocation. Each dimension must be checked on its
+    /// own: an in-range flattened offset is not proof of valid subscripts.
+    MultiArrayElement { array: usize, indices: Vec<Expr>, dims: Vec<u32> },
     /// Source-checked private record leaf: exact byte offset from its
     /// existing declared local/global storage root, with width 8 or 32.
     /// No free pointer, by-value record ABI or arbitrary byte access.
@@ -83,6 +87,7 @@ pub enum Op {
 pub enum Stmt {
     Assign { variable: usize, value: Expr },
     AssignArray { array: usize, index: Expr, value: Expr },
+    AssignMultiArray { array: usize, indices: Vec<Expr>, dims: Vec<u32>, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
     AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
     /// Checked record/subrecord byte range, including padding. The frontend
@@ -536,6 +541,7 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
 /// and array bounds. Native lowering only admits values it can represent;
 /// it never reimplements DIV/MOD, overflow or predeclared-function rules.
 type CheckedConstants = HashMap<String,CheckedConst>;
+type ArrayBindings<'a> = HashMap<&'a str,(usize,Vec<u32>)>;
 
 fn lookup_constant(expr:&OberonExpr, constants:&CheckedConstants)->Option<CheckedConst> {
     let ExprKind::Designator(d)=&expr.kind else {return None};
@@ -562,6 +568,28 @@ fn checked_constants(
     Ok(constants)
 }
 
+/// A single verified source dimension maps to one explicit runtime bounds
+/// check. The total is limited by the existing local frame/native array cap.
+fn checked_array_dimensions(
+    dims:&[OberonExpr],constants:&CheckedConstants,
+)->Result<(Vec<u32>,u32),String> {
+    if dims.is_empty() || dims.len()>3 {
+        return Err("native fixed INTEGER arrays require 1..=3 dimensions".into());
+    }
+    let mut total=1u32;
+    let mut lengths=Vec::with_capacity(dims.len());
+    for dim in dims {
+        let length=checked_array_length(dim,constants)?;
+        total=total.checked_mul(length)
+            .ok_or("native fixed INTEGER array extent overflow")?;
+        if total>1024 {
+            return Err("native fixed INTEGER array exceeds 1024 elements".into());
+        }
+        lengths.push(length);
+    }
+    Ok((lengths,total))
+}
+
 fn checked_array_length(
     dim:&OberonExpr,constants:&CheckedConstants,
 )->Result<u32,String> {
@@ -574,7 +602,7 @@ fn checked_array_length(
 
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
-              arrays:&HashMap<&str,usize>,
+              arrays:&ArrayBindings<'_>,
               records:&RecordObjects,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants)->Result<Expr,String> {
@@ -600,7 +628,7 @@ fn lower_call(d:&syntax::ast::Designator,
 }
 
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
-              arrays: &HashMap<&str, usize>,
+              arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Expr, String> {
@@ -671,7 +699,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
 }
 
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
-              arrays: &HashMap<&str, usize>,
+              arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
