@@ -441,9 +441,15 @@ fn record_region(records:&RecordObjects, root:&str, path:&str)
 /// Resolve only checked *record-valued* regions, never scalar field paths.
 /// For derived-to-base assignment, the source region may be larger but its
 /// field prefix must preserve names, widths and *relative byte offsets*.
+struct RecordByteRegion {
+    array: usize,
+    offset: u32,
+    size: u32,
+    leaves: Vec<(String,u32,u8)>,
+}
 fn record_byte_region(
     records:&RecordObjects,root:&str,path:&str,
-)->Option<(usize,u32,u32,Vec<(String,u32,u8)>)> {
+)->Option<RecordByteRegion> {
     let (array,shape)=records.get(root)?;
     let region=shape.regions.iter().find(|r|r.path==path)?;
     let prefix=if path.is_empty() {String::new()} else {format!("{path}.")};
@@ -460,7 +466,9 @@ fn record_byte_region(
     if leaves.is_empty() || region.offset.checked_add(region.size)?>shape.words*4 {
         return None;
     }
-    Some((*array,region.offset,region.size,leaves))
+    Some(RecordByteRegion {
+        array:*array,offset:region.offset,size:region.size,leaves,
+    })
 }
 
 /// A whole record or selected subrecord assignment uses only frontend-checked
@@ -484,12 +492,12 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
     // unsound when a BYTE field changes the memory stride.
     if records.get(&target.base[0]).is_some_and(|(_,s)|s.has_byte) ||
        records.get(&src.base[0]).is_some_and(|(_,s)|s.has_byte) {
-        let (da,doff,dlen,df)=record_byte_region(
-            records,&target.base[0],&dst_path)
+        let dst=record_byte_region(records,&target.base[0],&dst_path)
             .ok_or("selected destination is not a checked record byte region")?;
-        let (sa,soff,slen,sf)=record_byte_region(
-            records,&src.base[0],&src_path)
+        let src=record_byte_region(records,&src.base[0],&src_path)
             .ok_or("selected source is not a checked record byte region")?;
+        let (da,doff,dlen,df)=(dst.array,dst.offset,dst.size,&dst.leaves);
+        let (sa,soff,slen,sf)=(src.array,src.offset,src.size,&src.leaves);
         if slen<dlen || sf.len()<df.len() ||
            !sf.iter().zip(df.iter()).all(|(a,b)|a==b) {
             return Err("record byte copy requires a compatible source record prefix".into());
