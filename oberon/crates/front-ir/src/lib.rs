@@ -62,6 +62,10 @@ pub enum Expr {
     Variable(usize),
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
+    /// Source-checked fixed INTEGER array, flattened into one native
+    /// contiguous word allocation. Each dimension must be checked on its
+    /// own: an in-range flattened offset is not proof of valid subscripts.
+    MultiArrayElement { array: usize, indices: Vec<Expr>, dims: Vec<u32> },
     /// Source-checked private record leaf: exact byte offset from its
     /// existing declared local/global storage root, with width 8 or 32.
     /// No free pointer, by-value record ABI or arbitrary byte access.
@@ -83,6 +87,7 @@ pub enum Op {
 pub enum Stmt {
     Assign { variable: usize, value: Expr },
     AssignArray { array: usize, index: Expr, value: Expr },
+    AssignMultiArray { array: usize, indices: Vec<Expr>, dims: Vec<u32>, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
     AssignRecordField { array: usize, byte_offset: u32, bits: u8, value: Expr },
     /// Checked record/subrecord byte range, including padding. The frontend
@@ -536,6 +541,7 @@ fn lower_record_copy(target:&syntax::ast::Designator, value:&OberonExpr,
 /// and array bounds. Native lowering only admits values it can represent;
 /// it never reimplements DIV/MOD, overflow or predeclared-function rules.
 type CheckedConstants = HashMap<String,CheckedConst>;
+type ArrayBindings<'a> = HashMap<&'a str,(usize,Vec<u32>)>;
 
 fn lookup_constant(expr:&OberonExpr, constants:&CheckedConstants)->Option<CheckedConst> {
     let ExprKind::Designator(d)=&expr.kind else {return None};
@@ -562,6 +568,28 @@ fn checked_constants(
     Ok(constants)
 }
 
+/// A single verified source dimension maps to one explicit runtime bounds
+/// check. The total is limited by the existing local frame/native array cap.
+fn checked_array_dimensions(
+    dims:&[OberonExpr],constants:&CheckedConstants,
+)->Result<(Vec<u32>,u32),String> {
+    if dims.is_empty() || dims.len()>3 {
+        return Err("native fixed INTEGER arrays require 1..=3 dimensions".into());
+    }
+    let mut total=1u32;
+    let mut lengths=Vec::with_capacity(dims.len());
+    for dim in dims {
+        let length=checked_array_length(dim,constants)?;
+        total=total.checked_mul(length)
+            .ok_or("native fixed INTEGER array extent overflow")?;
+        if total>1024 {
+            return Err("native fixed INTEGER array exceeds 1024 elements".into());
+        }
+        lengths.push(length);
+    }
+    Ok((lengths,total))
+}
+
 fn checked_array_length(
     dim:&OberonExpr,constants:&CheckedConstants,
 )->Result<u32,String> {
@@ -574,7 +602,7 @@ fn checked_array_length(
 
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
-              arrays:&HashMap<&str,usize>,
+              arrays:&ArrayBindings<'_>,
               records:&RecordObjects,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants)->Result<Expr,String> {
@@ -600,7 +628,7 @@ fn lower_call(d:&syntax::ast::Designator,
 }
 
 fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
-              arrays: &HashMap<&str, usize>,
+              arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Expr, String> {
@@ -636,12 +664,25 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 syntax::ast::Selector::Field(field) => {
                     record_field(records,&d.base[0],field)
                 }
-                syntax::ast::Selector::Index(indices) if indices.len()==1 => {
-                    let array=*arrays.get(d.base[0].as_str())
+                syntax::ast::Selector::Index(indices) => {
+                    let (array,dims)=arrays.get(d.base[0].as_str())
                         .ok_or_else(||format!("not a supported local array: {}",d.base[0]))?;
-                    Ok(Expr::ArrayElement {
-                        array,index:Box::new(lower_expr(&indices[0],names,arrays,records,functions,constants)?),
-                    })
+                    if indices.len()!=dims.len() {
+                        return Err("fixed INTEGER array requires exactly one index per dimension".into());
+                    }
+                    let mut lowered=Vec::with_capacity(indices.len());
+                    for index in indices {
+                        lowered.push(lower_expr(index,names,arrays,records,functions,constants)?);
+                    }
+                    if dims.len()==1 {
+                        Ok(Expr::ArrayElement {
+                            array:*array,index:Box::new(lowered.remove(0)),
+                        })
+                    } else {
+                        Ok(Expr::MultiArrayElement {
+                            array:*array,indices:lowered,dims:dims.clone(),
+                        })
+                    }
                 }
                 _=>Err(format!("unsupported array selector at {}",d.span.lo)),
             }
@@ -671,7 +712,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
 }
 
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
-              arrays: &HashMap<&str, usize>,
+              arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
@@ -711,14 +752,26 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                         out.push(record_store(records,&target.base[0],field,
                             lower_expr(value,names,arrays,records,functions,constants)?)?);
                     }
-                    syntax::ast::Selector::Index(indices) if indices.len()==1 => {
-                        let array=*arrays.get(target.base[0].as_str())
+                    syntax::ast::Selector::Index(indices) => {
+                        let (array,dims)=arrays.get(target.base[0].as_str())
                             .ok_or_else(||format!("not a supported local array: {}",target.base[0]))?;
-                        out.push(Stmt::AssignArray {
-                            array,
-                            index:lower_expr(&indices[0],names,arrays,records,functions,constants)?,
-                            value:lower_expr(value,names,arrays,records,functions,constants)?,
-                        });
+                        if indices.len()!=dims.len() {
+                            return Err("fixed INTEGER array assignment requires one index per dimension".into());
+                        }
+                        let mut lowered=Vec::with_capacity(indices.len());
+                        for index in indices {
+                            lowered.push(lower_expr(index,names,arrays,records,functions,constants)?);
+                        }
+                        let value=lower_expr(value,names,arrays,records,functions,constants)?;
+                        if dims.len()==1 {
+                            out.push(Stmt::AssignArray {
+                                array:*array,index:lowered.remove(0),value,
+                            });
+                        } else {
+                            out.push(Stmt::AssignMultiArray {
+                                array:*array,indices:lowered,dims:dims.clone(),value,
+                            });
+                        }
                     }
                     _=>return Err(format!("unsupported array assignment at {}",s.span.lo)),
                 }
@@ -817,6 +870,7 @@ pub fn lower_module_with_record_objects(source: &str)
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
+    let mut global_array_dims=HashMap::<String,Vec<u32>>::new();
     let mut module_record_fields=HashMap::<String,RecordShape>::new();
     for decl in &module.decls.vars {
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
@@ -846,13 +900,14 @@ pub fn lower_module_with_record_objects(source: &str)
                     globals.push(Global { name: name.clone(), exported: *exported });
                 }
             }
-            TypeExpr::Array { dims, elem, .. } if dims.len()==1 &&
+            TypeExpr::Array { dims, elem, .. } if
                 matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
-                let length=checked_array_length(&dims[0],&module_constants)?;
+                let (lengths,length)=checked_array_dimensions(dims,&module_constants)?;
                 for (name, exported) in &decl.names {
                     global_arrays.push(ArrayGlobal {
                         name: name.clone(), length, exported: *exported,
                     });
+                    global_array_dims.insert(name.clone(),lengths.clone());
                 }
             }
             _ => return Err("only INTEGER globals and fixed INTEGER arrays are supported".into()),
@@ -888,6 +943,7 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
+        let mut local_array_dims=HashMap::<String,Vec<u32>>::new();
         let mut local_record_fields=HashMap::<String,RecordShape>::new();
         for decl in &proc.decls.vars {
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
@@ -913,14 +969,13 @@ pub fn lower_module_with_record_objects(source: &str)
                 TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
                     for (name,_) in &decl.names {locals.push(name.clone());}
                 }
-                TypeExpr::Array{dims,elem,..} if dims.len()==1 &&
+                TypeExpr::Array{dims,elem,..} if
                     matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
-                    // Do not invent a constant evaluator or assume a stride
-                    // for a non-integer/multidimensional element type.
-                    let length=checked_array_length(&dims[0],&proc_constants)
+                    let (lengths,length)=checked_array_dimensions(dims,&proc_constants)
                         .map_err(|err|format!("{}: {err}",proc.name))?;
                     for (name,_) in &decl.names {
                         fixed_arrays.push(ArrayLocal{name:name.clone(),length});
+                        local_array_dims.insert(name.clone(),lengths.clone());
                     }
                 }
                 _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
@@ -937,10 +992,13 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         // Local array names shadow module array names; global arrays
         // follow local arrays in the checked bridge's array index space.
-        let mut arrays:HashMap<&str,usize>=global_arrays.iter().enumerate()
-            .map(|(i,a)|(a.name.as_str(),fixed_arrays.len()+i)).collect();
+        let mut arrays:ArrayBindings<'_>=global_arrays.iter().enumerate()
+            .map(|(i,a)|(a.name.as_str(),(fixed_arrays.len()+i,
+                global_array_dims.get(&a.name).cloned().unwrap_or_else(||vec![a.length]))))
+            .collect();
         for (i, array) in fixed_arrays.iter().enumerate() {
-            arrays.insert(array.name.as_str(), i);
+            arrays.insert(array.name.as_str(),(i,
+                local_array_dims.get(&array.name).cloned().unwrap_or_else(||vec![array.length])));
         }
         let mut records:RecordObjects=global_arrays.iter().enumerate()
             .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
@@ -974,8 +1032,10 @@ pub fn lower_module_with_record_objects(source: &str)
         // verified module globals are legal roots for assignments/indexing.
         let names: HashMap<&str, usize> = globals.iter().enumerate()
             .map(|(i, item)| (item.name.as_str(), i)).collect();
-        let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
-            .map(|(i, item)| (item.name.as_str(), i)).collect();
+        let arrays:ArrayBindings<'_>=global_arrays.iter().enumerate()
+            .map(|(i,item)|(item.name.as_str(),(i,
+                global_array_dims.get(&item.name).cloned().unwrap_or_else(||vec![item.length]))))
+            .collect();
         let records:RecordObjects=global_arrays.iter().enumerate()
             .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
                 (a.name.clone(),(i,shape.clone()))))
@@ -1372,10 +1432,11 @@ mod tests {
             VAR a: ARRAY 0 OF INTEGER;
             BEGIN RETURN x END T; END A.");
         assert!(e.is_err(),"zero-length arrays must not be silently accepted");
-        let e=lower_module("MODULE A; PROCEDURE T*(x: INTEGER): INTEGER;
+        let multi=lower_module("MODULE A; PROCEDURE T*(x: INTEGER): INTEGER;
             VAR a: ARRAY 2, 3 OF INTEGER;
-            BEGIN RETURN x END T; END A.");
-        assert!(e.is_err(),"multidimensional arrays need separate layout rules");
+            BEGIN a[1,2]:=x; RETURN a[1,2] END T; END A.").unwrap();
+        assert_eq!(multi.functions[0].arrays[0].length,6);
+        assert!(matches!(multi.functions[0].body[0],Stmt::AssignMultiArray{..}));
     }
 
     #[test]
@@ -1457,7 +1518,7 @@ mod tests {
         let module=lower_module("MODULE Data; VAR values*: ARRAY 8 OF INTEGER; END Data.").unwrap();
         assert!(module.functions.is_empty());
         assert_eq!(module.global_arrays[0].length,8);
-        for dim in ["0", "1025", "2, 2"] {
+        for dim in ["0", "1025", "1024,2"] {
             let src=format!("MODULE Data; VAR values: ARRAY {dim} OF INTEGER; END Data.");
             assert!(lower_module(&src).is_err());
         }
@@ -1467,8 +1528,8 @@ mod tests {
     fn unsupported_global_types_are_rejected() {
         let array="MODULE M; VAR a: ARRAY 3, 2 OF INTEGER;
             PROCEDURE R*(v: INTEGER): INTEGER;
-            BEGIN RETURN v END R; END M.";
-        assert!(lower_module(array).unwrap_err().contains("fixed INTEGER arrays"));
+            BEGIN a[2,1]:=v; RETURN a[2,1] END R; END M.";
+        assert_eq!(lower_module(array).unwrap().global_arrays[0].length,6);
         let real="MODULE M; VAR a: REAL;
             PROCEDURE R*(v: INTEGER): INTEGER;
             BEGIN RETURN v END R; END M.";
