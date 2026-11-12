@@ -12,18 +12,41 @@ pub fn render_interface(interface:&Interface)->String {
     sema::sym::render(interface)
 }
 
+/// Parse the actual Oberon module dependency list before interfaces are
+/// available. Semantic admission always happens later through sema with all
+/// resolved, checked interfaces; these names never grant codegen authority.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct ModuleDependencies {
+    pub module:String,
+    pub imports:Vec<String>,
+    /// A source BEGIN body is not safe for independent multi-module object
+    /// linking without a defined initializer dependency order.
+    pub has_initializer:bool,
+}
+pub fn module_dependencies(source:&str)->Result<ModuleDependencies,String> {
+    let parsed=syntax::parse_module(source)
+        .map_err(|error|format!("Oberon dependency parse error: {error:?}"))?;
+    Ok(ModuleDependencies {
+        module:parsed.name,
+        imports:parsed.imports.iter().map(|import|import.module.clone()).collect(),
+        has_initializer:!parsed.body.is_empty(),
+    })
+}
+
 /// Only the ABI we lower natively is advertised in this initial .sym writer:
 /// exported INTEGER-returning functions taking value/VAR INTEGER scalars.
 /// Other exports must not silently disappear from an interface file.
 pub fn checked_scalar_interface(source:&str)->Result<Interface,String> {
-    let (checked,diagnostics)=sema::check_module_recovering(source,&[]);
+    checked_scalar_interface_with_imports(source,&[])
+}
+pub fn checked_scalar_interface_with_imports(
+    source:&str,interfaces:&[Interface],
+)->Result<Interface,String> {
+    let (checked,diagnostics)=sema::check_module_recovering(source,interfaces);
     if let Some(diagnostic)=diagnostics.iter().find(|d|d.is_error()) {
         return Err(format!("Oberon interface semantic or syntax error: {diagnostic:?}"));
     }
     let module=checked.ok_or("missing checked Oberon module")?;
-    if !module.imports.is_empty(){
-        return Err("native scalar interface writer does not re-export imports".into());
-    }
     if module.decls.types.iter().any(|x|x.export) ||
        module.decls.vars.iter().any(|x|x.names.iter().any(|(_,export)|*export)) ||
        module.decls.consts.iter().any(|x|x.export) {
@@ -48,7 +71,11 @@ pub fn checked_scalar_interface(source:&str)->Result<Interface,String> {
             name:proc.name.clone(),params,result:Some("INTEGER".into()),
         });
     }
-    Ok(Interface{module:module.name,imports:Vec::new(),items})
+    Ok(Interface {
+        module:module.name,
+        imports:module.imports.iter().map(|import|import.module.clone()).collect(),
+        items,
+    })
 }
 
 use syntax::ast::{BinOp, Expr as OberonExpr, ExprKind, Stmt as OberonStmt,
