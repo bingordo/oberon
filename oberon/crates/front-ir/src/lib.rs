@@ -845,6 +845,7 @@ pub fn lower_module_with_record_objects(source: &str)
     }
     let mut globals = Vec::<Global>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
+    let mut global_array_dims=HashMap::<String,Vec<u32>>::new();
     let mut module_record_fields=HashMap::<String,RecordShape>::new();
     for decl in &module.decls.vars {
         if let Some(fields) = record_fields(&decl.ty, &record_types)? {
@@ -874,13 +875,14 @@ pub fn lower_module_with_record_objects(source: &str)
                     globals.push(Global { name: name.clone(), exported: *exported });
                 }
             }
-            TypeExpr::Array { dims, elem, .. } if dims.len()==1 &&
+            TypeExpr::Array { dims, elem, .. } if
                 matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
-                let length=checked_array_length(&dims[0],&module_constants)?;
+                let (lengths,length)=checked_array_dimensions(dims,&module_constants)?;
                 for (name, exported) in &decl.names {
                     global_arrays.push(ArrayGlobal {
                         name: name.clone(), length, exported: *exported,
                     });
+                    global_array_dims.insert(name.clone(),lengths.clone());
                 }
             }
             _ => return Err("only INTEGER globals and fixed INTEGER arrays are supported".into()),
@@ -916,6 +918,7 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
+        let mut local_array_dims=HashMap::<String,Vec<u32>>::new();
         let mut local_record_fields=HashMap::<String,RecordShape>::new();
         for decl in &proc.decls.vars {
             if let Some(fields) = record_fields(&decl.ty, &record_types)? {
@@ -941,14 +944,13 @@ pub fn lower_module_with_record_objects(source: &str)
                 TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
                     for (name,_) in &decl.names {locals.push(name.clone());}
                 }
-                TypeExpr::Array{dims,elem,..} if dims.len()==1 &&
+                TypeExpr::Array{dims,elem,..} if
                     matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
-                    // Do not invent a constant evaluator or assume a stride
-                    // for a non-integer/multidimensional element type.
-                    let length=checked_array_length(&dims[0],&proc_constants)
+                    let (lengths,length)=checked_array_dimensions(dims,&proc_constants)
                         .map_err(|err|format!("{}: {err}",proc.name))?;
                     for (name,_) in &decl.names {
                         fixed_arrays.push(ArrayLocal{name:name.clone(),length});
+                        local_array_dims.insert(name.clone(),lengths.clone());
                     }
                 }
                 _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
@@ -965,10 +967,13 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         // Local array names shadow module array names; global arrays
         // follow local arrays in the checked bridge's array index space.
-        let mut arrays:HashMap<&str,usize>=global_arrays.iter().enumerate()
-            .map(|(i,a)|(a.name.as_str(),fixed_arrays.len()+i)).collect();
+        let mut arrays:ArrayBindings<'_>=global_arrays.iter().enumerate()
+            .map(|(i,a)|(a.name.as_str(),(fixed_arrays.len()+i,
+                global_array_dims.get(&a.name).cloned().unwrap_or_else(||vec![a.length]))))
+            .collect();
         for (i, array) in fixed_arrays.iter().enumerate() {
-            arrays.insert(array.name.as_str(), i);
+            arrays.insert(array.name.as_str(),(i,
+                local_array_dims.get(&array.name).cloned().unwrap_or_else(||vec![array.length])));
         }
         let mut records:RecordObjects=global_arrays.iter().enumerate()
             .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
@@ -1002,8 +1007,10 @@ pub fn lower_module_with_record_objects(source: &str)
         // verified module globals are legal roots for assignments/indexing.
         let names: HashMap<&str, usize> = globals.iter().enumerate()
             .map(|(i, item)| (item.name.as_str(), i)).collect();
-        let arrays: HashMap<&str, usize> = global_arrays.iter().enumerate()
-            .map(|(i, item)| (item.name.as_str(), i)).collect();
+        let arrays:ArrayBindings<'_>=global_arrays.iter().enumerate()
+            .map(|(i,item)|(item.name.as_str(),(i,
+                global_array_dims.get(&item.name).cloned().unwrap_or_else(||vec![item.length]))))
+            .collect();
         let records:RecordObjects=global_arrays.iter().enumerate()
             .filter_map(|(i,a)|module_record_fields.get(&a.name).map(|shape|
                 (a.name.clone(),(i,shape.clone()))))
