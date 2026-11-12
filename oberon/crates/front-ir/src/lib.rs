@@ -524,100 +524,6 @@ fn checked_pointer_object(
         name:name.into(),record:record.into(),bytes:layout.size_bytes,fields,
     })
 }
-fn checked_pointer_field(
-    pointers:&PointerBindings,root:&str,fields:&str,
-)->Result<(usize,u32,u8),String> {
-    let (index,object)=pointers.get(root)
-        .ok_or("field dereference requires a checked private record pointer")?;
-    let field=object.fields.iter().find(|f|f.path==fields)
-        .ok_or("selected pointer field is absent from checked target record")?;
-    Ok((*index,field.offset_bytes,field.bits))
-}
-fn pointer_deref_fields(d:&syntax::ast::Designator)->Option<String> {
-    if d.base.len()!=1 || d.sels.len()<2 ||
-       !matches!(d.sels.first(),Some(syntax::ast::Selector::Deref)) {
-        return None;
-    }
-    let mut names=Vec::new();
-    for selector in &d.sels[1..] {
-        if let syntax::ast::Selector::Field(name)=selector {
-            names.push(name.as_str());
-        } else {return None;}
-    }
-    Some(names.join("."))
-}
-
-/// Resolve explicit record-pointer dereferences through nominal layouts.
-/// Each ^ consumes a pointer field and crosses into its proven target record.
-/// This remains finite even for self-referential type declarations.
-fn resolve_pointer_access(
-    d:&syntax::ast::Designator,pointers:&PointerBindings,
-    targets:&PointerTargets,
-)->Result<PointerAccess,String> {
-    if d.base.len()!=1 || d.sels.len()<2 {
-        return Err("checked record-pointer field requires ^ and a field".into());
-    }
-    let (root,object)=pointers.get(&d.base[0])
-        .ok_or("pointer field starts from an unknown checked object")?;
-    let mut record=object.record.clone();
-    let mut hops=Vec::new();
-    let mut cursor=0;
-    loop {
-        if !matches!(d.sels.get(cursor),Some(syntax::ast::Selector::Deref)) {
-            return Err("pointer record chain must explicitly dereference ^".into());
-        }
-        cursor+=1;
-        let mut names=Vec::new();
-        while let Some(syntax::ast::Selector::Field(name))=d.sels.get(cursor) {
-            names.push(name.as_str());
-            cursor+=1;
-        }
-        if names.is_empty() {return Err("pointer dereference needs a field".into());}
-        let shape=targets.get(&record)
-            .ok_or("checked pointer target record layout unavailable")?;
-        let path=names.join(".");
-        let field=shape.fields.iter().find(|f|f.path==path)
-            .ok_or("pointer field is absent from checked record layout")?;
-        if cursor==d.sels.len() {
-            return Ok(PointerAccess {
-                root:*root,hops,offset:field.offset_bytes,bits:field.bits,
-                target:field.target_record.clone(),
-            });
-        }
-        if cursor>d.sels.len() || hops.len()>=16 {
-            return Err("pointer record selector chain is unsupported or too deep".into());
-        }
-        let target=field.target_record.as_ref()
-            .ok_or("pointer chain can only traverse pointer-valued fields")?;
-        hops.push(field.offset_bytes);
-        record=target.clone();
-    }
-}
-fn pointer_value(
-    expr:&OberonExpr,pointers:&PointerBindings,
-    targets:&PointerTargets,
-)->Result<Option<(Expr,String)>,String> {
-    match &expr.kind {
-        ExprKind::Nil=>Ok(None),
-        ExprKind::Designator(d) if d.base.len()==1 && d.sels.is_empty()=>{
-            let (index,object)=pointers.get(&d.base[0])
-                .ok_or("expected source-checked pointer variable")?;
-            Ok(Some((Expr::PointerValue {
-                pointer:*index,hops:Vec::new(),byte_offset:None,
-            },object.record.clone())))
-        },
-        ExprKind::Designator(d)=>{
-            let access=resolve_pointer_access(d,pointers,targets)?;
-            let target=access.target.ok_or("expected pointer-valued record field")?;
-            Ok(Some((Expr::PointerValue {
-                pointer:access.root,hops:access.hops,
-                byte_offset:Some(access.offset),
-            },target)))
-        },
-        _=>Err("pointer value must be NIL or a checked pointer designator".into()),
-    }
-}
-
 type RecordObjects = HashMap<String,(usize,RecordShape)>;
 fn record_field(records:&RecordObjects, base:&str, field:&str)->Result<Expr,String> {
     let (object,shape)=records.get(base)
@@ -873,11 +779,24 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               functions:&HashMap<String,usize>,
               constants:&CheckedConstants) -> Result<Expr, String> {
     match &expr.kind {
-        ExprKind::Designator(d) if pointer_deref_fields(d).is_some() => {
-            let fields=pointer_deref_fields(d).ok_or("invalid pointer dereference")?;
-            let (pointer,byte_offset,bits)=checked_pointer_field(
-                pointers,&d.base[0],&fields)?;
-            Ok(Expr::PointerField {pointer,byte_offset,bits})
+        ExprKind::Designator(d) if d.base.len()==1 &&
+            d.sels.iter().any(|sel|matches!(sel,syntax::ast::Selector::Deref)) => {
+            let access=resolve_pointer_access(d,pointers,targets)?;
+            if access.bits==64 {
+                Ok(Expr::PointerValue {
+                    pointer:access.root,hops:access.hops,
+                    byte_offset:Some(access.offset),
+                })
+            } else if access.hops.is_empty() {
+                Ok(Expr::PointerField {
+                    pointer:access.root,byte_offset:access.offset,bits:access.bits,
+                })
+            } else {
+                Ok(Expr::PointerChainField {
+                    pointer:access.root,hops:access.hops,
+                    byte_offset:access.offset,bits:access.bits,
+                })
+            }
         }
         ExprKind::Designator(d) if d.base.len()==1 && d.sels.len()==1
             && matches!(d.sels[0],syntax::ast::Selector::Call(_)|
@@ -886,6 +805,16 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
         }
         ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
+        ExprKind::Nil=>Ok(Expr::NilPointer),
+        ExprKind::Binary(op,left,right) if matches!(op,BinOp::Eq|BinOp::Ne) &&
+            (matches!(left.kind,ExprKind::Nil) || matches!(right.kind,ExprKind::Nil)) => {
+            let non_nil=if matches!(left.kind,ExprKind::Nil) {right} else {left};
+            let (value,_target)=pointer_value(non_nil,pointers,targets)?
+                .ok_or("pointer null comparison requires a pointer operand")?;
+            Ok(Expr::PointerNullTest {
+                value:Box::new(value),equal:matches!(op,BinOp::Eq),
+            })
+        },
         ExprKind::Designator(d) if d.sels.is_empty() && d.base.len() == 1 => {
             if let Some(index)=names.get(d.base[0].as_str()) {
                 Ok(Expr::Variable(*index))
@@ -980,31 +909,53 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 let ExprKind::Designator(actual)=&argument.kind else {
                     return Err("NEW needs an assignable pointer variable".into());
                 };
-                if actual.base.len()!=1 || !actual.sels.is_empty() {
-                    return Err("NEW only supports direct private pointer objects".into());
+                if actual.base.len()!=1 {
+                    return Err("NEW requires a source-checked private pointer object".into());
                 }
-                let (pointer,object)=pointers.get(&actual.base[0])
-                    .ok_or("NEW needs a checked private pointer variable")?;
-                out.push(Stmt::NewPointer {pointer:*pointer,bytes:object.bytes});
+                if actual.sels.is_empty() {
+                    let (pointer,object)=pointers.get(&actual.base[0])
+                        .ok_or("NEW needs a checked private pointer variable")?;
+                    out.push(Stmt::NewPointer {pointer:*pointer,bytes:object.bytes});
+                } else {
+                    let access=resolve_pointer_access(actual,pointers,targets)?;
+                    let record=access.target
+                        .ok_or("NEW target field must have pointer-to-record type")?;
+                    let shape=targets.get(&record)
+                        .ok_or("NEW target record layout missing")?;
+                    out.push(Stmt::NewPointerLink {
+                        pointer:access.root,hops:access.hops,
+                        byte_offset:access.offset,bytes:shape.bytes,
+                    });
+                }
             }
             StmtKind::Call(d)=>out.push(Stmt::Call(
                 lower_call(d,names,arrays,records,pointers,targets,functions,constants)?)),
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
                 if let Some((pointer,object))=pointers.get(&target.base[0]) {
-                    let source=match &value.kind {
-                        ExprKind::Nil=>None,
-                        ExprKind::Designator(d) if d.base.len()==1 && d.sels.is_empty()=>{
-                            let (index,from)=pointers.get(&d.base[0])
-                                .ok_or("pointer assignment requires checked source pointer")?;
-                            if from.record!=object.record {
-                                return Err("pointer assignment requires same nominal record target".into());
+                    let value=pointer_value(value,pointers,targets)?;
+                    if let Some((source,record))=value {
+                        if record!=object.record {
+                            return Err("pointer assignment requires same nominal record target".into());
+                        }
+                        if let Expr::PointerValue {pointer:from,hops,byte_offset:None}=&source {
+                            if hops.is_empty() {
+                                out.push(Stmt::AssignPointer {
+                                    pointer:*pointer,source:Some(*from),
+                                });
+                            } else {
+                                out.push(Stmt::AssignPointerValue {
+                                    pointer:*pointer,value:source,
+                                });
                             }
-                            Some(*index)
-                        },
-                        _=>return Err("pointer assignment only supports NIL or compatible pointer".into()),
-                    };
-                    out.push(Stmt::AssignPointer {pointer:*pointer,source});
+                        } else {
+                            out.push(Stmt::AssignPointerValue {
+                                pointer:*pointer,value:source,
+                            });
+                        }
+                    } else {
+                        out.push(Stmt::AssignPointer {pointer:*pointer,source:None});
+                    }
                 } else if let Some(copies)=lower_record_copy(target,value,records)? {
                     out.extend(copies);
                 } else {
@@ -1014,15 +965,29 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                         lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?});
                 }
             }
-            StmtKind::Assign {target,value} if pointer_deref_fields(target).is_some() => {
-                let fields=pointer_deref_fields(target)
-                    .ok_or("invalid pointer target field chain")?;
-                let (pointer,byte_offset,bits)=checked_pointer_field(
-                    pointers,&target.base[0],&fields)?;
-                out.push(Stmt::AssignPointerField {
-                    pointer,byte_offset,bits,
-                    value:lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?,
-                });
+            StmtKind::Assign {target,value} if target.base.len()==1 &&
+                target.sels.iter().any(|sel|matches!(sel,syntax::ast::Selector::Deref)) => {
+                let access=resolve_pointer_access(target,pointers,targets)?;
+                let val=if let Some(record)=&access.target {
+                    match pointer_value(value,pointers,targets)? {
+                        Some((source,source_record)) if source_record==*record=>source,
+                        None=>Expr::NilPointer,
+                        _=>return Err("pointer-link assignment requires compatible nominal record target".into()),
+                    }
+                } else {
+                    lower_expr(value,names,arrays,records,pointers,targets,functions,constants)?
+                };
+                if access.hops.is_empty() && access.bits!=64 {
+                    out.push(Stmt::AssignPointerField {
+                        pointer:access.root,byte_offset:access.offset,
+                        bits:access.bits,value:val,
+                    });
+                } else {
+                    out.push(Stmt::AssignPointerChainField {
+                        pointer:access.root,hops:access.hops,
+                        byte_offset:access.offset,bits:access.bits,value:val,
+                    });
+                }
             }
             StmtKind::Assign { target, value } if target.base.len()==1 &&
                 !target.sels.is_empty() &&
