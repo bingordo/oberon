@@ -1432,10 +1432,11 @@ mod tests {
             VAR a: ARRAY 0 OF INTEGER;
             BEGIN RETURN x END T; END A.");
         assert!(e.is_err(),"zero-length arrays must not be silently accepted");
-        let e=lower_module("MODULE A; PROCEDURE T*(x: INTEGER): INTEGER;
+        let multi=lower_module("MODULE A; PROCEDURE T*(x: INTEGER): INTEGER;
             VAR a: ARRAY 2, 3 OF INTEGER;
-            BEGIN RETURN x END T; END A.");
-        assert!(e.is_err(),"multidimensional arrays need separate layout rules");
+            BEGIN a[1,2]:=x; RETURN a[1,2] END T; END A.").unwrap();
+        assert_eq!(multi.functions[0].arrays[0].length,6);
+        assert!(matches!(multi.functions[0].body[0],Stmt::AssignMultiArray{..}));
     }
 
     #[test]
@@ -1517,7 +1518,7 @@ mod tests {
         let module=lower_module("MODULE Data; VAR values*: ARRAY 8 OF INTEGER; END Data.").unwrap();
         assert!(module.functions.is_empty());
         assert_eq!(module.global_arrays[0].length,8);
-        for dim in ["0", "1025", "2, 2"] {
+        for dim in ["0", "1025", "1024,2"] {
             let src=format!("MODULE Data; VAR values: ARRAY {dim} OF INTEGER; END Data.");
             assert!(lower_module(&src).is_err());
         }
@@ -1527,8 +1528,8 @@ mod tests {
     fn unsupported_global_types_are_rejected() {
         let array="MODULE M; VAR a: ARRAY 3, 2 OF INTEGER;
             PROCEDURE R*(v: INTEGER): INTEGER;
-            BEGIN RETURN v END R; END M.";
-        assert!(lower_module(array).unwrap_err().contains("fixed INTEGER arrays"));
+            BEGIN a[2,1]:=v; RETURN a[2,1] END R; END M.";
+        assert_eq!(lower_module(array).unwrap().global_arrays[0].length,6);
         let real="MODULE M; VAR a: REAL;
             PROCEDURE R*(v: INTEGER): INTEGER;
             BEGIN RETURN v END R; END M.";
