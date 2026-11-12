@@ -134,7 +134,8 @@ pub enum Stmt {
 // Private homogeneous INTEGER records now use contiguous checked memory,
 // with 4-byte fields and an addressable allocation root. No record ABI,
 // pointer exposure, record extension or heterogeneous fields are inferred.
-fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
+fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>,
+    pointers:&HashMap<String,String>)
     -> Result<Option<Vec<String>>, String>
 {
     match ty {
@@ -151,12 +152,14 @@ fn record_fields(ty: &TypeExpr, types: &HashMap<String, Vec<String>>)
                     .ok_or("unsupported record extension base")?
             } else { Vec::new() };
             for field in fields {
-                let nested=if matches!(&field.ty,
-                    TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] || q.as_slice()==["BYTE"]) {
-                    None
-                } else {
-                    Some(record_fields(&field.ty, types)?
-                        .ok_or("record fields must be INTEGER, BYTE or supported private records")?)
+                let scalar=matches!(&field.ty,
+                    TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"] ||
+                        q.as_slice()==["BYTE"] ||
+                        (q.len()==1 && pointers.contains_key(&q[0])))
+                    || matches!(&field.ty,TypeExpr::Pointer(_,_));
+                let nested=if scalar {None} else {
+                    Some(record_fields(&field.ty,types,pointers)?
+                        .ok_or("record fields must use checked scalar, pointer or record types")?)
                 };
                 for (name, _) in &field.names {
                     // Oberon accepts an extension that hides a base field,
@@ -217,6 +220,9 @@ pub enum CheckedRecordFieldType {
     Integer,
     Byte,
     Record(String),
+    /// A full-width pointer to a nominal record; the pointee is not embedded
+    /// and may be declared later (including self-referential record cycles).
+    Pointer(String),
 }
 
 /// The source-checked object declaration and its exact nominal record.
@@ -237,7 +243,7 @@ pub type CheckedRecordProjection = (
 
 /// Natural byte layout of the checked private INTEGER/BYTE subset.
 fn align_checked_record(bytes:u32,alignment:u32)->Result<u32,String> {
-    if !matches!(alignment,1|4) {
+    if !matches!(alignment,1|4|8) {
         return Err("unsupported private record scalar alignment".into());
     }
     bytes.checked_add(alignment-1)
@@ -253,6 +259,7 @@ fn checked_record_layout(
     ty: &TypeExpr,
     identity: &str,
     named: &HashMap<String, String>,
+    pointers: &HashMap<String,String>,
     layouts: &mut Vec<CheckedRecordLayout>,
 ) -> Result<Option<String>, String> {
     match ty {
@@ -274,18 +281,26 @@ fn checked_record_layout(
             for field in fields {
                 for (name, _) in &field.names {
                     let child_id = format!("{identity}.{name}");
-                    let child = checked_record_layout(&field.ty, &child_id, named, layouts)?;
+                    let child = checked_record_layout(&field.ty,&child_id,named,pointers,layouts)?;
                     let kind = match (&field.ty, child) {
                         (TypeExpr::Named(q, _), None) if q.as_slice() == ["INTEGER"] =>
                             CheckedRecordFieldType::Integer,
                         (TypeExpr::Named(q, _), None) if q.as_slice() == ["BYTE"] =>
                             CheckedRecordFieldType::Byte,
                         (_, Some(id)) => CheckedRecordFieldType::Record(id),
-                        _ => return Err("checked record metadata needs INTEGER or record field".into()),
+                        (TypeExpr::Named(q,_),None) if q.len()==1 &&
+                            pointers.contains_key(&q[0]) =>
+                            CheckedRecordFieldType::Pointer(pointers[&q[0]].clone()),
+                        (TypeExpr::Pointer(_,_),None) =>
+                            CheckedRecordFieldType::Pointer(
+                                pointer_record_target(&field.ty,pointers,named)?
+                                    .ok_or("pointer field has no nominal record target")?),
+                        _ => return Err("checked record field needs INTEGER, BYTE, pointer or record".into()),
                     };
                     let (bytes,align) = match &kind {
                         CheckedRecordFieldType::Integer => (4,4),
                         CheckedRecordFieldType::Byte => (1,1),
+                        CheckedRecordFieldType::Pointer(_) => (8,8),
                         CheckedRecordFieldType::Record(id) => {
                             let nested=layouts.iter().find(|r|&r.declaration==id)
                                 .ok_or("checked nested record layout missing")?;
@@ -365,6 +380,7 @@ fn record_shape(
             match &field.ty {
                 CheckedRecordFieldType::Integer=>out.push((path,field_offset,32)),
                 CheckedRecordFieldType::Byte=>out.push((path,field_offset,8)),
+                CheckedRecordFieldType::Pointer(_)=>out.push((path,field_offset,64)),
                 CheckedRecordFieldType::Record(child)=>{
                     let nested=layouts.iter().find(|r|&r.declaration==child)
                         .ok_or("checked nested region layout missing")?;
@@ -988,8 +1004,25 @@ pub fn lower_module_with_record_objects(source: &str)
     let module_constants=checked_constants(
         &module.decls.consts,&CheckedConstants::new())?;
     let mut record_types = HashMap::<String, Vec<String>>::new();
+    // Predeclare record identities before visiting pointer declarations:
+    // TYPE Node=POINTER TO NodeDesc; NodeDesc=RECORD next:Node END
+    // is semantically legal and must not create a by-value infinite record.
     let mut record_nominals = HashMap::<String, String>::new();
+    for decl in &module.decls.types {
+        if matches!(decl.ty,TypeExpr::Record{..}) {
+            record_nominals.insert(decl.name.clone(),
+                format!("{}.{}",module.name,decl.name));
+        }
+    }
     let mut pointer_types=HashMap::<String,String>::new();
+    // Resolve pointer aliases against the complete set of named record
+    // declarations, while preserving the sema checker as type authority.
+    for decl in &module.decls.types {
+        if let Some(target)=pointer_record_target(
+            &decl.ty,&pointer_types,&record_nominals)? {
+            pointer_types.insert(decl.name.clone(),target);
+        }
+    }
     let mut checked_layouts = Vec::<CheckedRecordLayout>::new();
     let mut checked_objects = Vec::<CheckedRecordObject>::new();
     for decl in &module.decls.types {
@@ -1001,11 +1034,11 @@ pub fn lower_module_with_record_objects(source: &str)
             pointer_types.insert(decl.name.clone(),target);
             continue;
         }
-        let fields = record_fields(&decl.ty, &record_types)?
+        let fields = record_fields(&decl.ty,&record_types,&pointer_types)?
             .ok_or_else(|| format!("unsupported type declaration: {}", decl.name))?;
         let declaration = format!("{}.{}", module.name, decl.name);
         let nominal = checked_record_layout(
-            &decl.ty, &declaration, &record_nominals, &mut checked_layouts,
+            &decl.ty,&declaration,&record_nominals,&pointer_types,&mut checked_layouts,
         )?.ok_or("unsupported source-checked record type")?;
         record_nominals.insert(decl.name.clone(), nominal);
         record_types.insert(decl.name.clone(), fields);
@@ -1026,11 +1059,11 @@ pub fn lower_module_with_record_objects(source: &str)
             }
             continue;
         }
-        if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+        if let Some(fields) = record_fields(&decl.ty,&record_types,&pointer_types)? {
             let first = decl.names.first().ok_or("record variable declaration has no names")?;
             let identity = format!("{}.global.{}", module.name, first.0);
             let record = checked_record_layout(
-                &decl.ty, &identity, &record_nominals, &mut checked_layouts,
+                &decl.ty,&identity,&record_nominals,&pointer_types,&mut checked_layouts,
             )?.ok_or("checked global record identity is missing")?;
             let shape=record_shape(&record,&checked_layouts,&fields)?;
             for (name, exported) in &decl.names {
@@ -1108,11 +1141,11 @@ pub fn lower_module_with_record_objects(source: &str)
                 }
                 continue;
             }
-            if let Some(fields) = record_fields(&decl.ty, &record_types)? {
+            if let Some(fields) = record_fields(&decl.ty,&record_types,&pointer_types)? {
                 let first = decl.names.first().ok_or("local record declaration has no names")?;
                 let identity = format!("{}.{}.local.{}", module.name, proc.name, first.0);
                 let record = checked_record_layout(
-                    &decl.ty, &identity, &record_nominals, &mut checked_layouts,
+                    &decl.ty,&identity,&record_nominals,&pointer_types,&mut checked_layouts,
                 )?.ok_or("checked local record identity is missing")?;
                 let shape=record_shape(&record,&checked_layouts,&fields)?;
                 for (name, _) in &decl.names {
