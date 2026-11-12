@@ -41,6 +41,8 @@ pub struct Function {
     pub name: String,
     /// Value INTEGER parameters, in source order.
     pub parameters: Vec<String>,
+    /// True for VAR INTEGER, false for value INTEGER. One entry per name.
+    pub parameter_by_ref: Vec<bool>,
     /// Zero-initialized INTEGER locals, in source order.
     pub locals: Vec<String>,
     /// Fixed-size single-dimensional local INTEGER arrays. Nonzero lengths.
@@ -99,6 +101,8 @@ struct PointerAccess {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Variable(usize),
+    /// Address of a checked assignable INTEGER scalar, exclusively for VAR calls.
+    AddressOfScalar(usize),
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
     /// Source-checked fixed INTEGER array, flattened into one native
@@ -819,25 +823,37 @@ fn lower_call(d:&syntax::ast::Designator,
               arrays:&ArrayBindings<'_>,
               records:&RecordObjects,
               pointers:&PointerContext<'_>,
-              functions:&HashMap<String,usize>,
+              functions:&HashMap<String,Vec<bool>>,
               constants:&CheckedConstants)->Result<Expr,String> {
     if d.base.len()!=1 || d.sels.len()!=1 {
         return Err("unsupported qualified or selected function call".into());
     }
     let symbol=&d.base[0];
-    let expected=*functions.get(symbol)
+    let expected=functions.get(symbol)
         .ok_or_else(||format!("unsupported call to non-local function {symbol}"))?;
     let raw_args=match &d.sels[0] {
         syntax::ast::Selector::Call(args)=>args.as_slice(),
         syntax::ast::Selector::Args(args)=>args.as_deref().unwrap_or(&[]),
         _=>return Err("expected direct function call".into()),
     };
-    if raw_args.len()!=expected {
+    if raw_args.len()!=expected.len() {
         return Err(format!("{symbol}: call argument count mismatch"));
     }
     let mut args=Vec::with_capacity(raw_args.len());
-    for arg in raw_args {
-        args.push(lower_expr(arg,names,arrays,records,pointers,functions,constants)?);
+    for (arg,&by_ref) in raw_args.iter().zip(expected) {
+        if by_ref {
+            let ExprKind::Designator(actual)=&arg.kind else {
+                return Err("VAR INTEGER argument must be assignable scalar designator".into());
+            };
+            if actual.base.len()!=1 || !actual.sels.is_empty() {
+                return Err("VAR INTEGER argument must be a direct scalar object".into());
+            }
+            let index=names.get(actual.base[0].as_str())
+                .ok_or("VAR INTEGER argument is not an addressable checked scalar")?;
+            args.push(Expr::AddressOfScalar(*index));
+        } else {
+            args.push(lower_expr(arg,names,arrays,records,pointers,functions,constants)?);
+        }
     }
     Ok(Expr::Call{name:symbol.clone(),args})
 }
@@ -846,7 +862,7 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               pointers:&PointerContext<'_>,
-              functions:&HashMap<String,usize>,
+              functions:&HashMap<String,Vec<bool>>,
               constants:&CheckedConstants) -> Result<Expr, String> {
     match &expr.kind {
         ExprKind::Designator(d) if d.base.len()==1 &&
@@ -960,7 +976,7 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
               pointers:&PointerContext<'_>,
-              functions:&HashMap<String,usize>,
+              functions:&HashMap<String,Vec<bool>>,
               constants:&CheckedConstants) -> Result<Vec<Stmt>, String>
 {
     let mut out = Vec::new();
@@ -1287,10 +1303,12 @@ pub fn lower_module_with_record_objects(source: &str)
     // Collect the checked signatures before lowering procedure bodies. The
     // Oberon semantic checker already enforces source declaration order;
     // this map does not authorize forward references.
-    let mut signatures=HashMap::<String,usize>::new();
+    let mut signatures=HashMap::<String,Vec<bool>>::new();
     for proc in &module.decls.procs {
-        let count=proc.params.iter().map(|section|section.names.len()).sum();
-        if signatures.insert(proc.name.clone(),count).is_some() {
+        let by_ref=proc.params.iter()
+            .flat_map(|section|std::iter::repeat_n(section.by_ref,section.names.len()))
+            .collect();
+        if signatures.insert(proc.name.clone(),by_ref).is_some() {
             return Err(format!("duplicate procedure {}",proc.name));
         }
     }
@@ -1304,12 +1322,15 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         let proc_constants=checked_constants(&proc.decls.consts,&module_constants)?;
         let mut parameters = Vec::new();
+        let mut parameter_by_ref=Vec::new();
         for section in &proc.params {
-            if section.by_ref || section.ty.open != 0 ||
-               section.ty.base.as_slice() != ["INTEGER"] {
-                return Err(format!("{}: only value INTEGER parameters are supported", proc.name));
+            if section.ty.open != 0 || section.ty.base.as_slice() != ["INTEGER"] {
+                return Err(format!("{}: only value or VAR INTEGER parameters are supported",proc.name));
             }
-            for (name, _) in &section.names { parameters.push(name.clone()); }
+            for (name,_) in &section.names {
+                parameters.push(name.clone());
+                parameter_by_ref.push(section.by_ref);
+            }
         }
         let mut locals = Vec::new();
         let mut fixed_arrays = Vec::new();
@@ -1411,7 +1432,8 @@ pub fn lower_module_with_record_objects(source: &str)
         if !contains_return(&body) {
             return Err(format!("{}: function must return a value", proc.name));
         }
-        functions.push(Function { name: proc.name.clone(), parameters, locals,
+        functions.push(Function { name: proc.name.clone(), parameters,
+                                  parameter_by_ref,locals,
                                   arrays:fixed_arrays,
                                   global_arrays:global_arrays.clone(),
                                   pointer_locals,pointer_globals:pointer_globals.clone(),
@@ -1445,7 +1467,8 @@ pub fn lower_module_with_record_objects(source: &str)
         }
         Some(Function {
             name: "__module_init".into(),
-            parameters: Vec::new(), locals: Vec::new(), arrays: Vec::new(),
+            parameters: Vec::new(),parameter_by_ref:Vec::new(),
+            locals: Vec::new(), arrays: Vec::new(),
             global_arrays: global_arrays.clone(),
             pointer_locals:Vec::new(),pointer_globals:pointer_globals.clone(),
             globals: globals.iter().map(|g| g.name.clone()).collect(),
