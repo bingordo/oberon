@@ -207,6 +207,8 @@ pub enum Expr {
     Integer(i32),
     Boolean(bool),
     Binary(Op, Box<Expr>, Box<Expr>),
+    /// BOOLEAN negation; the consumer lowers this as a reversed CFG edge.
+    Not(Box<Expr>),
     /// Checked same-module INTEGER function call, including recursion.
     Call { name:String, args:Vec<Expr> },
     /// Direct call to an imported source-checked scalar function; the defining
@@ -219,6 +221,8 @@ pub enum Op {
     Add, Sub, Mul,
     /// Runtime Oberon floor quotient/remainder (not truncating signed / and %).
     Div, Mod,
+    /// Short-circuit BOOLEAN operations, not eager arithmetic.
+    And, Or,
     Eq, Ne, Lt, Le, Gt, Ge,
 }
 
@@ -1065,6 +1069,8 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 BinOp::Mul => Op::Mul,
                 BinOp::IDiv => Op::Div,
                 BinOp::Mod => Op::Mod,
+                BinOp::And => Op::And,
+                BinOp::Or => Op::Or,
                 BinOp::Eq => Op::Eq,
                 BinOp::Ne => Op::Ne,
                 BinOp::Lt => Op::Lt,
@@ -1076,6 +1082,8 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
             Ok(Expr::Binary(op, Box::new(lower_expr(a,names,arrays,records,pointers,functions,constants)?),
                             Box::new(lower_expr(b,names,arrays,records,pointers,functions,constants)?)))
         }
+        ExprKind::Unary(UnOp::Not, a) => Ok(Expr::Not(Box::new(
+            lower_expr(a,names,arrays,records,pointers,functions,constants)?))),
         ExprKind::Unary(UnOp::Plus, a) => lower_expr(a,names,arrays,records,pointers,functions,constants),
         ExprKind::Unary(UnOp::Neg, a) => {
             // The signed minimum's positive magnitude is not representable
@@ -2182,6 +2190,57 @@ mod tests {
             indices,dims,step:Expr::Integer(1),decrement:true,..
         } if dims==&[2,3,4] && indices==&[
             Expr::Integer(1),Expr::Integer(2),Expr::Integer(3)]));
+    }
+
+    #[test]
+    fn native_boolean_conditions_preserve_short_circuit_structure() {
+        let src="MODULE Logic;
+            PROCEDURE BoolCall*(n: INTEGER): BOOLEAN;
+            BEGIN RETURN n > 0 END BoolCall;
+            PROCEDURE Run*(n: INTEGER): INTEGER;
+            BEGIN
+                IF (n > 0) & BoolCall(n) THEN RETURN 1
+                ELSIF (n < 0) OR BoolCall(n) THEN RETURN -1
+                ELSE RETURN 0 END
+            END Run; END Logic.";
+        // BOOLEAN-valued procedures are not part of this narrow native ABI.
+        assert!(lower_module(src).is_err());
+        let src="MODULE Logic;
+            PROCEDURE Run*(n: INTEGER): INTEGER;
+            BEGIN
+                IF (n > 0) & (10 DIV n > 1) THEN RETURN 1
+                ELSIF (n < 0) OR (10 DIV n > 1) THEN RETURN -1
+                ELSE RETURN 0 END
+            END Run; END Logic.";
+        let module=lower_module(src).unwrap();
+        let body=&module.functions[0].body;
+        assert!(matches!(&body[0],Stmt::If {
+            condition:Expr::Binary(Op::And,_,_),..
+        }));
+        let Stmt::If{else_body,..}=&body[0] else {unreachable!()};
+        assert!(matches!(&else_body[0],Stmt::If{
+            condition:Expr::Binary(Op::Or,_,_),..
+        }));
+    }
+
+    #[test]
+    fn native_boolean_not_and_repeat_conditions_project() {
+        let src="MODULE Logic;
+            PROCEDURE Run*(n: INTEGER): INTEGER;
+            VAR i: INTEGER;
+            BEGIN i:=0;
+                WHILE ~(i >= n) & (n > 0) DO INC(i) END;
+                REPEAT DEC(i) UNTIL (i <= 0) OR (n < 0);
+                RETURN i END Run; END Logic.";
+        let module=lower_module(src).unwrap();
+        let body=&module.functions[0].body;
+        assert!(matches!(&body[1],Stmt::While{
+            condition:Expr::Binary(Op::And,left,_),..
+        } if matches!(&**left,Expr::Not(_))));
+        assert!(matches!(&body[3],Stmt::While{
+            condition:Expr::Binary(Op::Eq,left,right),..
+        } if matches!(&**left,Expr::Binary(Op::Or,_,_))
+            && **right==Expr::Boolean(false)));
     }
 
     #[test]
