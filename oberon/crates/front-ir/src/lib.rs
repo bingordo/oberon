@@ -217,6 +217,8 @@ pub enum Expr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Add, Sub, Mul,
+    /// Runtime Oberon floor quotient/remainder (not truncating signed / and %).
+    Div, Mod,
     Eq, Ne, Lt, Le, Gt, Ge,
 }
 
@@ -1054,6 +1056,8 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                 BinOp::Add => Op::Add,
                 BinOp::Sub => Op::Sub,
                 BinOp::Mul => Op::Mul,
+                BinOp::IDiv => Op::Div,
+                BinOp::Mod => Op::Mod,
                 BinOp::Eq => Op::Eq,
                 BinOp::Ne => Op::Ne,
                 BinOp::Lt => Op::Lt,
@@ -2042,6 +2046,24 @@ mod tests {
         let good = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
             BEGIN RETURN -2147483648 END P; END R.";
         assert!(lower_module(good).is_ok());
+    }
+
+    #[test]
+    fn native_runtime_div_mod_are_distinct_from_constant_evaluation() {
+        let source = "MODULE Quotients;
+            PROCEDURE Quot*(x, y: INTEGER): INTEGER;
+            BEGIN RETURN x DIV y END Quot;
+            PROCEDURE Rem*(x, y: INTEGER): INTEGER;
+            BEGIN RETURN x MOD y END Rem;
+            END Quotients.";
+        let m = lower_module(source).unwrap();
+        assert_eq!(m.functions.len(), 2);
+        assert!(matches!(&m.functions[0].body[0],
+            Stmt::Return(Expr::Binary(Op::Div, lhs, rhs))
+            if **lhs == Expr::Variable(0) && **rhs == Expr::Variable(1)));
+        assert!(matches!(&m.functions[1].body[0],
+            Stmt::Return(Expr::Binary(Op::Mod, lhs, rhs))
+            if **lhs == Expr::Variable(0) && **rhs == Expr::Variable(1)));
     }
 
     #[test]
