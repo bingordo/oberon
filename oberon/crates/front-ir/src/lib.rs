@@ -2478,10 +2478,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operations_fail_closed() {
-        let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
-            BEGIN RETURN x DIV 3 END P; END M.");
-        assert!(e.unwrap_err().contains("unsupported binary"));
+    fn runtime_div_supported_but_unsupported_types_fail_closed() {
+        let m = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
+            BEGIN RETURN x DIV 3 END P; END M.").unwrap();
+        assert!(matches!(&m.functions[0].body[0],
+            Stmt::Return(Expr::Binary(Op::Div,_,rhs))
+            if **rhs==Expr::Integer(3)));
         let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
             VAR z: REAL; BEGIN RETURN x END P; END M.");
         assert!(e.unwrap_err().contains("INTEGER local"));
