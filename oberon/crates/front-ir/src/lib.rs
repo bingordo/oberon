@@ -228,6 +228,10 @@ pub enum Stmt {
     /// Predefined INC/DEC of a checked 1D INTEGER array element.
     /// The native consumer must evaluate index exactly once.
     UpdateArray { array: usize, index: Expr, step: Expr, decrement: bool },
+    /// Checked multidimensional update; the native consumer computes one
+    /// address and reuses it for the read-modify-write operation.
+    UpdateMultiArray { array: usize, indices: Vec<Expr>, dims: Vec<u32>,
+        step: Expr, decrement: bool },
     AssignArray { array: usize, index: Expr, value: Expr },
     AssignMultiArray { array: usize, indices: Vec<Expr>, dims: Vec<u32>, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
@@ -1140,11 +1144,21 @@ fn lower_inc_dec(
     if let [syntax::ast::Selector::Index(indices)] = target.sels.as_slice() {
         let (array,dims)=arrays.get(target.base[0].as_str())
             .ok_or("INC/DEC need a checked INTEGER array")?;
-        if dims.len()!=1 || indices.len()!=1 {
-            return Err("INC/DEC indexed targets require one-dimensional INTEGER array".into());
+        if indices.len()!=dims.len() {
+            return Err("INC/DEC indexed target requires one subscript per dimension".into());
         }
-        let index=lower_expr(&indices[0],names,arrays,records,pointers,functions,constants)?;
-        return Ok(Some(Stmt::UpdateArray{array:*array,index,step,decrement}));
+        let lowered=indices.iter().map(|index|
+            lower_expr(index,names,arrays,records,pointers,functions,constants))
+            .collect::<Result<Vec<_>,_>>()?;
+        if dims.len()==1 {
+            return Ok(Some(Stmt::UpdateArray {
+                array:*array,index:lowered.into_iter().next().expect("one checked index"),
+                step,decrement,
+            }));
+        }
+        return Ok(Some(Stmt::UpdateMultiArray {
+            array:*array,indices:lowered,dims:dims.clone(),step,decrement,
+        }));
     }
     Err("INC/DEC target must be scalar or single indexed INTEGER element".into())
 }
@@ -2148,8 +2162,26 @@ mod tests {
     fn native_inc_dec_reject_unsupported_targets() {
         let src="MODULE Updates; PROCEDURE F*(n:INTEGER):INTEGER;
           VAR a:ARRAY 2,2 OF INTEGER;
-          BEGIN INC(a[0,0]); RETURN n END F; END Updates.";
+          BEGIN INC(a[0]); RETURN n END F; END Updates.";
         assert!(lower_module(src).is_err());
+    }
+
+    #[test]
+    fn native_multidim_inc_dec_produce_checked_single_address_updates() {
+        let src="MODULE Updates; PROCEDURE F*(n:INTEGER):INTEGER;
+          VAR a:ARRAY 2,3 OF INTEGER; b:ARRAY 2,3,4 OF INTEGER;
+          BEGIN INC(a[1,2],n); DEC(b[1,2,3]);
+            RETURN a[1,2]+b[1,2,3] END F; END Updates.";
+        let m=lower_module(src).unwrap();
+        let body=&m.functions[0].body;
+        assert!(matches!(&body[0], Stmt::UpdateMultiArray{
+            indices,dims,step:Expr::Variable(0),decrement:false,..
+        } if dims==&[2,3] && indices==&[
+            Expr::Integer(1),Expr::Integer(2)]));
+        assert!(matches!(&body[1], Stmt::UpdateMultiArray{
+            indices,dims,step:Expr::Integer(1),decrement:true,..
+        } if dims==&[2,3,4] && indices==&[
+            Expr::Integer(1),Expr::Integer(2),Expr::Integer(3)]));
     }
 
     #[test]
