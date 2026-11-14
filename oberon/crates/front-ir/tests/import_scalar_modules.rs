@@ -49,10 +49,10 @@ fn import_alias_resolves_to_defining_module_symbol_and_checked_var_modes() {
     assert_eq!(client.imported_procedures[1].parameter_by_ref,[true,false]);
     let body=&client.functions[0].body;
     assert!(matches!(&body[0],Stmt::Assign {
-        value:Expr::ImportedCall{module,name,args},..
+        value:Expr::ImportedCall{module,name,args,..},..
     } if module=="Arithmetic" && name=="Add" && args.len()==2));
     assert!(matches!(&body[1],Stmt::Assign {
-        value:Expr::ImportedCall{module,name,args},..
+        value:Expr::ImportedCall{module,name,args,..},..
     } if module=="Arithmetic" && name=="Bump"
         && matches!(args.as_slice(),[Expr::AddressOfScalar(_),Expr::Integer(3)])));
 }
