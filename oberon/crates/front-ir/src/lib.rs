@@ -55,20 +55,25 @@ pub fn checked_scalar_interface_with_imports(
     let mut items=Vec::new();
     for proc in &module.decls.procs {
         if !proc.export {continue;}
-        if !matches!(proc.result.as_deref(),Some([ty]) if ty=="INTEGER") {
-            return Err("native scalar .sym requires INTEGER result".into());
-        }
+        let result=match proc.result.as_deref() {
+            Some([ty]) if ty=="INTEGER" || ty=="BOOLEAN"=>ty.clone(),
+            _=>return Err("native scalar .sym requires INTEGER or BOOLEAN result".into()),
+        };
         let mut params=Vec::new();
         for section in &proc.params {
-            if section.ty.open!=0 || section.ty.base.as_slice()!=["INTEGER"] {
-                return Err("native scalar .sym supports INTEGER and VAR INTEGER formals only".into());
+            if section.ty.open!=0 {
+                return Err("native scalar .sym does not support open arrays".into());
             }
-            for _ in &section.names {
-                params.push(if section.by_ref {"VAR INTEGER"} else {"INTEGER"}.into());
-            }
+            let formal=match (section.ty.base.as_slice(),section.by_ref) {
+                ([ty],false) if ty=="INTEGER"=>"INTEGER",
+                ([ty],true) if ty=="INTEGER"=>"VAR INTEGER",
+                ([ty],false) if ty=="BOOLEAN"=>"BOOLEAN",
+                _=>return Err("native scalar .sym requires INTEGER, VAR INTEGER, or BOOLEAN".into()),
+            };
+            for _ in &section.names {params.push(formal.into());}
         }
         items.push(InterfaceItem::Proc {
-            name:proc.name.clone(),params,result:Some("INTEGER".into()),
+            name:proc.name.clone(),params,result:Some(result),
         });
     }
     Ok(Interface {
@@ -118,12 +123,17 @@ pub struct ImportedProcedure {
     pub module: String,
     pub name: String,
     pub parameter_by_ref: Vec<bool>,
+    /// BOOLEAN values use a canonical 32-bit 0/1 native ABI, like INTEGER.
+    pub boolean_parameters: Vec<bool>,
+    pub returns_boolean: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
     pub name: String,
-    /// Value INTEGER parameters, in source order.
+    /// BOOLEAN results use a canonical 32-bit 0/1 native ABI.
+    pub returns_boolean: bool,
+    /// Value INTEGER or BOOLEAN parameters, in source order.
     pub parameters: Vec<String>,
     /// True for VAR INTEGER, false for value INTEGER. One entry per name.
     pub parameter_by_ref: Vec<bool>,
@@ -213,11 +223,17 @@ pub enum Expr {
     Binary(Op, Box<Expr>, Box<Expr>),
     /// BOOLEAN negation; the consumer lowers this as a reversed CFG edge.
     Not(Box<Expr>),
-    /// Checked same-module INTEGER function call, including recursion.
-    Call { name:String, args:Vec<Expr> },
-    /// Direct call to an imported source-checked scalar function; the defining
-    /// module name is authoritative, and the alias is not part of its symbol.
-    ImportedCall {module:String,name:String,args:Vec<Expr>},
+    /// Source-checked scalar function call, including BOOLEAN by-value
+    /// arguments and results. The native ABI carries each BOOLEAN as I32 0/1.
+    Call {
+        name:String,args:Vec<Expr>,
+        boolean_arguments:Vec<bool>,returns_boolean:bool,
+    },
+    /// Direct call to imported source-checked scalar function.
+    ImportedCall {
+        module:String,name:String,args:Vec<Expr>,
+        boolean_arguments:Vec<bool>,returns_boolean:bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -925,6 +941,8 @@ fn checked_array_length(
 #[derive(Clone,Debug)]
 struct CallSignature {
     parameter_by_ref:Vec<bool>,
+    boolean_parameters:Vec<bool>,
+    returns_boolean:bool,
     module:Option<String>,
 }
 
@@ -968,9 +986,15 @@ fn lower_call(d:&syntax::ast::Designator,
     if let Some(module)=&expected.module {
         Ok(Expr::ImportedCall {
             module:module.clone(),name:d.base[1].clone(),args,
+            boolean_arguments:expected.boolean_parameters.clone(),
+            returns_boolean:expected.returns_boolean,
         })
     } else {
-        Ok(Expr::Call{name:symbol,args})
+        Ok(Expr::Call {
+            name:symbol,args,
+            boolean_arguments:expected.boolean_parameters.clone(),
+            returns_boolean:expected.returns_boolean,
+        })
     }
 }
 
@@ -1419,29 +1443,36 @@ pub fn lower_module_with_record_objects_and_interfaces(
         .map(|proc| proc.name.clone())
         .collect::<Vec<_>>();
     let mut imported_procedures=Vec::<ImportedProcedure>::new();
-    let mut imported_names=HashMap::<String,(String,Vec<bool>)>::new();
+    let mut imported_names=HashMap::<String,(String,Vec<bool>,Vec<bool>,bool)>::new();
     for import in &module.imports {
         let interface=interfaces.iter().find(|item|item.module==import.module)
             .ok_or("no checked source interface for imported module")?;
         for item in &interface.items {
             if let InterfaceItem::Proc{name,params,result}=item {
-                // Only fixed scalar INTEGER arguments/results have a native
-                // TypeId ABI in this first import milestone.
-                if result.as_deref()!=Some("INTEGER") {continue;}
-                let modes=params.iter().map(|p|match p.as_str() {
-                    "INTEGER"=>Some(false),
-                    "VAR INTEGER"=>Some(true),
+                // Both scalar types have explicit 32-bit native ABI slots;
+                // VAR BOOLEAN and aggregate formals remain out of scope.
+                let returns_boolean=match result.as_deref() {
+                    Some("INTEGER")=>false,
+                    Some("BOOLEAN")=>true,
+                    _=>continue,
+                };
+                let formals=params.iter().map(|p|match p.as_str() {
+                    "INTEGER"=>Some((false,false)),
+                    "VAR INTEGER"=>Some((true,false)),
+                    "BOOLEAN"=>Some((false,true)),
                     _=>None,
                 }).collect::<Option<Vec<_>>>();
-                let Some(modes)=modes else {continue;};
+                let Some(formals)=formals else {continue;};
                 if import.module==module.name || name.contains("__") {
                     return Err("unsupported or colliding imported scalar function".into());
                 }
+                let modes=formals.iter().map(|(by_ref,_)|*by_ref).collect::<Vec<_>>();
+                let bools=formals.iter().map(|(_,b)|*b).collect::<Vec<_>>();
                 imported_names.insert(format!("{}.{}",import.alias,name),
-                    (import.module.clone(),modes.clone()));
+                    (import.module.clone(),modes.clone(),bools.clone(),returns_boolean));
                 imported_procedures.push(ImportedProcedure {
                     module:import.module.clone(),name:name.clone(),
-                    parameter_by_ref:modes,
+                    parameter_by_ref:modes,boolean_parameters:bools,returns_boolean,
                 });
             }
         }
@@ -1576,37 +1607,52 @@ pub fn lower_module_with_record_objects_and_interfaces(
         let by_ref=proc.params.iter()
             .flat_map(|section|std::iter::repeat_n(section.by_ref,section.names.len()))
             .collect();
+        let bools=proc.params.iter().flat_map(|section|
+            std::iter::repeat_n(section.ty.base.as_slice()==["BOOLEAN"],section.names.len()))
+            .collect();
         if signatures.insert(proc.name.clone(),CallSignature{
-            parameter_by_ref:by_ref,module:None,
+            parameter_by_ref:by_ref,boolean_parameters:bools,
+            returns_boolean:matches!(proc.result.as_deref(),Some([ty]) if ty=="BOOLEAN"),
+            module:None,
         }).is_some() {
             return Err(format!("duplicate procedure {}",proc.name));
         }
     }
-    for (name,(module,modes)) in imported_names {
+    for (name,(module,modes,bools,returns_boolean)) in imported_names {
         if signatures.insert(name,CallSignature{
-            parameter_by_ref:modes,module:Some(module),
+            parameter_by_ref:modes,boolean_parameters:bools,returns_boolean,
+            module:Some(module),
         }).is_some() {
             return Err("ambiguous imported procedure declaration".into());
         }
     }
     let mut functions = Vec::new();
     for proc in &module.decls.procs {
-        if !matches!(proc.result.as_deref(), Some([t]) if t == "INTEGER") {
-            return Err(format!("{}: only INTEGER-returning functions are supported", proc.name));
-        }
+        let returns_boolean=match proc.result.as_deref() {
+            Some([ty]) if ty=="INTEGER"=>false,
+            Some([ty]) if ty=="BOOLEAN"=>true,
+            _=>return Err(format!(
+                "{}: only INTEGER and BOOLEAN results are supported",proc.name)),
+        };
         if !proc.decls.procs.is_empty() || !proc.decls.types.is_empty() {
             return Err(format!("{}: nested procedures or types unsupported",proc.name));
         }
         let proc_constants=checked_constants(&proc.decls.consts,&module_constants)?;
         let mut parameters = Vec::new();
         let mut parameter_by_ref=Vec::new();
+        let mut boolean_parameters=Vec::new();
         for section in &proc.params {
-            if section.ty.open != 0 || section.ty.base.as_slice() != ["INTEGER"] {
-                return Err(format!("{}: only value or VAR INTEGER parameters are supported",proc.name));
+            let is_boolean=section.ty.base.as_slice()==["BOOLEAN"];
+            let is_integer=section.ty.base.as_slice()==["INTEGER"];
+            if section.ty.open!=0 || !(is_integer || (is_boolean && !section.by_ref)) {
+                return Err(format!(
+                    "{}: only value INTEGER/BOOLEAN or VAR INTEGER formals are supported",
+                    proc.name));
             }
             for (name,_) in &section.names {
                 parameters.push(name.clone());
                 parameter_by_ref.push(section.by_ref);
+                boolean_parameters.push(is_boolean);
             }
         }
         let mut locals = Vec::new();
@@ -1666,6 +1712,9 @@ pub fn lower_module_with_record_objects_and_interfaces(
             }
         }
         let mut boolean_variables=Vec::<usize>::new();
+        for (index,is_boolean) in boolean_parameters.iter().enumerate() {
+            if *is_boolean {boolean_variables.push(index);}
+        }
         for (index,name) in locals.iter().enumerate() {
             if boolean_locals.contains(name) {
                 boolean_variables.push(parameters.len()+index);
@@ -1728,7 +1777,7 @@ pub fn lower_module_with_record_objects_and_interfaces(
             return Err(format!("{}: function must return a value on every path", proc.name));
         }
         functions.push(Function { name: proc.name.clone(), parameters,
-                                  parameter_by_ref,locals,boolean_variables,
+                                  returns_boolean,parameter_by_ref,locals,boolean_variables,
                                   arrays:fixed_arrays,
                                   global_arrays:global_arrays.clone(),
                                   pointer_locals,pointer_globals:pointer_globals.clone(),
@@ -1761,7 +1810,7 @@ pub fn lower_module_with_record_objects_and_interfaces(
             return Err("module initialization cannot return a value".into());
         }
         Some(Function {
-            name: "__module_init".into(),
+            name: "__module_init".into(),returns_boolean:false,
             parameters: Vec::new(),parameter_by_ref:Vec::new(),
             locals: Vec::new(),
             boolean_variables: globals.iter().enumerate()
@@ -2069,7 +2118,7 @@ mod tests {
         assert_eq!(init.globals,["counter"]);
         assert_eq!(init.global_arrays[0].length,4);
         assert!(matches!(&init.body[0],Stmt::Assign{variable:0,
-            value:Expr::Call{name,args}} if name=="Twice"&&args.len()==1));
+            value:Expr::Call{name,args,..}} if name=="Twice"&&args.len()==1));
         assert!(matches!(&init.body[1],Stmt::AssignArray{array:0,..}));
         assert!(matches!(&init.body[2],Stmt::If{..}));
         assert!(module.functions.iter().all(|f|f.name!="__module_init"));
@@ -2102,7 +2151,7 @@ mod tests {
         let module=lower_module(src).unwrap();
         assert_eq!(module.functions.len(),2);
         assert!(matches!(&module.functions[1].body[0],
-            Stmt::Return(Expr::Call{name,args}) if
+            Stmt::Return(Expr::Call{name,args,..}) if
                 name=="Add" && args.len()==2));
         // The semantic checker follows Oberon's declaration-order rule:
         // calling a later procedure without a prior declaration is invalid.
