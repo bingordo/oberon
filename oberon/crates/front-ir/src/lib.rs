@@ -988,7 +988,9 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                         syntax::ast::Selector::Args(_)) => {
             lower_call(d,names,arrays,records,pointers,functions,constants)
         }
-        ExprKind::Int(value) => Ok(Expr::Integer(*value as i32)),
+        ExprKind::Int(value) => i32::try_from(*value)
+            .map(Expr::Integer)
+            .map_err(|_| format!("INTEGER literal out of range at {}", expr.span.lo)),
         ExprKind::Bool(value) => Ok(Expr::Boolean(*value)),
         ExprKind::Nil=>Ok(Expr::NilPointer),
         ExprKind::Binary(op,left,right) if matches!(op,BinOp::Eq|BinOp::Ne) &&
@@ -1064,9 +1066,17 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
                             Box::new(lower_expr(b,names,arrays,records,pointers,functions,constants)?)))
         }
         ExprKind::Unary(UnOp::Plus, a) => lower_expr(a,names,arrays,records,pointers,functions,constants),
-        ExprKind::Unary(UnOp::Neg, a) =>
+        ExprKind::Unary(UnOp::Neg, a) => {
+            // The signed minimum's positive magnitude is not representable
+            // as an i32. Handle it before validating positive literals.
+            if let ExprKind::Int(magnitude) = &a.kind {
+                return i32::try_from(-i64::from(*magnitude))
+                    .map(Expr::Integer)
+                    .map_err(|_| format!("INTEGER literal out of range at {}", expr.span.lo));
+            }
             Ok(Expr::Binary(Op::Sub, Box::new(Expr::Integer(0)),
-                            Box::new(lower_expr(a,names,arrays,records,pointers,functions,constants)?))),
+                            Box::new(lower_expr(a,names,arrays,records,pointers,functions,constants)?)))
+        },
         _ => Err(format!("unsupported expression at {}", expr.span.lo)),
     }
 }
@@ -1239,6 +1249,20 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                 out.push(Stmt::While {
                     condition: lower_expr(condition,names,arrays,records,pointers,functions,constants)?,
                     body: lower_stmts(body,names,arrays,records,pointers,functions,constants)?,
+                });
+            }
+            StmtKind::Repeat { body, until } => {
+                // Execute the body unconditionally once, and then evaluate
+                // UNTIL after every iteration. Reuse the existing While IR
+                // without introducing a backend-specific loop instruction.
+                // EXIT remains unsupported until loops expose a break edge.
+                let repeated = lower_stmts(body,names,arrays,records,pointers,functions,constants)?;
+                let condition = lower_expr(until,names,arrays,records,pointers,functions,constants)?;
+                out.extend(repeated.clone());
+                out.push(Stmt::While {
+                    condition: Expr::Binary(Op::Eq,Box::new(condition),
+                                            Box::new(Expr::Boolean(false))),
+                    body: repeated,
                 });
             }
             _ => return Err(format!("unsupported Oberon statement at {}", s.span.lo)),
@@ -1570,8 +1594,8 @@ pub fn lower_module_with_record_objects_and_interfaces(
             &signatures,&proc_constants)?;
         // An absent return is rejected rather than relying on Oberon's
         // zero-valued return accumulator (not modeled by this narrow bridge).
-        if !contains_return(&body) {
-            return Err(format!("{}: function must return a value", proc.name));
+        if !definitely_returns(&body) {
+            return Err(format!("{}: function must return a value on every path", proc.name));
         }
         functions.push(Function { name: proc.name.clone(), parameters,
                                   parameter_by_ref,locals,
@@ -1627,6 +1651,18 @@ pub fn lower_module_with_record_objects_and_interfaces(
         checked_layouts,
         checked_objects,
     ))
+}
+
+/// Conservative structured return guarantee. WHILE may execute zero
+/// times, while REPEAT is projected as an unconditional body followed by
+/// WHILE. An IF guarantees a return only if every arm does.
+fn definitely_returns(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Return(_) => true,
+        Stmt::If { then_body, else_body, .. } =>
+            definitely_returns(then_body) && definitely_returns(else_body),
+        _ => false,
+    })
 }
 
 fn contains_return(body: &[Stmt]) -> bool {
@@ -1772,8 +1808,8 @@ mod tests {
             [ArrayGlobal{name:"global".into(),length:6,exported:false}]);
         let f=&m.functions[0];
         assert_eq!(f.arrays,[ArrayLocal{name:"local".into(),length:6}]);
-        for offset in 0..6 {
-            assert!(matches!(&f.body[offset],
+        for (offset, stmt) in f.body.iter().enumerate().take(6) {
+            assert!(matches!(stmt,
                 Stmt::AssignArray{array:0,index:Expr::Integer(i),..}
                 if *i==offset as i32));
         }
@@ -1964,6 +2000,48 @@ mod tests {
         assert_eq!(m.name, "Math");
         assert_eq!(m.functions[0].parameters, ["x", "y"]);
         assert!(matches!(m.functions[0].body[0], Stmt::Return(Expr::Binary(Op::Add, _, _))));
+    }
+
+    #[test]
+    fn native_checked_functions_must_return_on_all_paths() {
+        let partial = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            BEGIN IF x > 0 THEN RETURN 1 END END P; END R.";
+        assert!(lower_module(partial).unwrap_err().contains("every path"));
+        let loop_only = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            BEGIN WHILE x > 0 DO RETURN x END END P; END R.";
+        assert!(lower_module(loop_only).unwrap_err().contains("every path"));
+        let full = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            BEGIN IF x > 0 THEN RETURN 1 ELSE RETURN -1 END END P; END R.";
+        assert!(lower_module(full).is_ok());
+        let fallback = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            BEGIN IF x > 0 THEN RETURN 1 END; RETURN 0 END P; END R.";
+        assert!(lower_module(fallback).is_ok());
+    }
+
+    #[test]
+    fn native_repeat_until_preserves_first_iteration() {
+        let src = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            VAR n: INTEGER;
+            BEGIN n := x; REPEAT n := n - 1 UNTIL n = 0;
+            RETURN n END P; END R.";
+        let m = lower_module(src).unwrap();
+        let body = &m.functions[0].body;
+        assert_eq!(body.len(), 4);
+        assert!(matches!(&body[1], Stmt::Assign { .. }));
+        assert!(matches!(&body[2], Stmt::While {
+            condition: Expr::Binary(Op::Eq, _, rhs), body: repeated,
+        } if **rhs == Expr::Boolean(false) &&
+             repeated.as_slice() == &body[1..2]));
+    }
+
+    #[test]
+    fn native_front_integer_literals_reject_narrowing() {
+        let bad = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            BEGIN RETURN 4294967295 END P; END R.";
+        assert!(lower_module(bad).is_err());
+        let good = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
+            BEGIN RETURN -2147483648 END P; END R.";
+        assert!(lower_module(good).is_ok());
     }
 
     #[test]
