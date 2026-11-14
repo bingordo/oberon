@@ -30,7 +30,7 @@ fn var_integer_formals_are_exclusively_addressable_scalar_arguments() {
     assert!(matches!(bump.body[0],Stmt::Assign {variable:0,..}));
     let forward=&module.functions[1];
     assert_eq!(forward.parameter_by_ref,[true]);
-    assert!(matches!(&forward.body[0],Stmt::Return(Expr::Call {name,args})
+    assert!(matches!(&forward.body[0],Stmt::Return(Expr::Call {name,args,..})
         if name=="Bump" && matches!(args.as_slice(),[Expr::AddressOfScalar(0),Expr::Integer(2)])));
     let same=&module.functions[4];
     assert_eq!(same.parameter_by_ref,[true,true]);
