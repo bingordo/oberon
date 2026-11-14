@@ -39,6 +39,8 @@ use obc::line_col;
 mod compiler_subset;
 #[path = "obgen/compiler_arrays.rs"]
 mod compiler_arrays;
+#[path = "obgen/compiler_rich.rs"]
+mod compiler_rich;
 
 // random generator
 
@@ -1328,7 +1330,9 @@ fn main() {
     if let Some(mode)=compiler_subset_mode {
         let result=if mode.starts_with("array-") {
             compiler_arrays::render(base,&mode)
-        }else{
+        } else if mode.starts_with("rich-") {
+            compiler_rich::render(base,&mode)
+        } else {
             compiler_subset::render(base,&mode)
         };
         match result {
