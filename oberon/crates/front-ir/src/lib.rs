@@ -1808,8 +1808,8 @@ mod tests {
             [ArrayGlobal{name:"global".into(),length:6,exported:false}]);
         let f=&m.functions[0];
         assert_eq!(f.arrays,[ArrayLocal{name:"local".into(),length:6}]);
-        for offset in 0..6 {
-            assert!(matches!(&f.body[offset],
+        for (offset, stmt) in f.body.iter().enumerate().take(6) {
+            assert!(matches!(stmt,
                 Stmt::AssignArray{array:0,index:Expr::Integer(i),..}
                 if *i==offset as i32));
         }
