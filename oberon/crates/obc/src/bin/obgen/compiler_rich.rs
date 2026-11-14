@@ -11,8 +11,11 @@ const INPUTS:usize=44;
 struct RichCase {
     rows:usize,
     cols:usize,
+    /// Some depth adds a third checked dimension and index evaluation.
+    depth:Option<usize>,
     row:usize,
     col:usize,
+    plane:usize,
     iterations:i32,
     step:i32,
     initial:i32,
@@ -25,8 +28,10 @@ impl RichCase {
         let mut r=Rng::new(seed^0xb001_ea57_9d14_62c3);
         let rows=2+r.below(3);
         let cols=2+r.below(4);
+        let depth=if r.below(2)==0 {None} else {Some(2+r.below(3))};
+        let plane=depth.map_or(0,|n|r.below(n));
         Self {
-            rows,cols,
+            rows,cols,depth,plane,
             row:r.below(rows),
             col:r.below(cols),
             iterations:1+r.below(4) as i32,
@@ -70,7 +75,8 @@ impl RichCase {
         // arr[Touch(row),Touch(col)] := quotient+remainder;
         // INC(arr[Touch(row),Touch(col)],c);
         // DEC(arr[Touch(row),Touch(col)],remainder);
-        hits+=6; // six indices, never duplicated by either update
+        hits+=if self.depth.is_some() {9} else {6};
+        // 3-argument indexed updates have nine total side-effecting indexes.
         let element=quotient.wrapping_add(remainder)
             .wrapping_add(c).wrapping_sub(remainder)
             .wrapping_add(1).wrapping_sub(self.step);
@@ -102,6 +108,13 @@ impl RichCase {
 
     /// Render real Oberon procedures and a feature-rich exported Probe.
     fn procedures(&self)->String {
+        let dims=self.depth.map_or_else(String::new,|n|format!(", {n}"));
+        let zvar=if self.depth.is_some() {", z"} else {""};
+        let zinit=if self.depth.is_some() {
+            format!(" z := {};",self.plane)
+        } else {String::new()};
+        let zcall=if self.depth.is_some() {", Touch(z)"} else {""};
+        let zindex=if self.depth.is_some() {",z"} else {""};
         format!(r#"MODULE Fuzz;
 VAR hits: INTEGER;
   PROCEDURE Touch*(x: INTEGER): INTEGER;
@@ -116,27 +129,27 @@ VAR hits: INTEGER;
     RETURN result
   END Choose;
   PROCEDURE Probe*(a, b, c: INTEGER): INTEGER;
-  VAR arr: ARRAY {rows}, {cols} OF INTEGER;
-      i, j, k, divisor, quotient, remainder, acc: INTEGER;
+  VAR arr: ARRAY {rows}, {cols}{dims} OF INTEGER;
+      i, j, k{zvar}, divisor, quotient, remainder, acc: INTEGER;
       p, qflag: BOOLEAN;
   BEGIN
     hits := 0;
-    i := {row}; j := {col};
+    i := {row}; j := {col};{zinit}
     divisor := (b MOD {divisor_mod}) + 2;
     IF c < 0 THEN divisor := -divisor END;
     quotient := a DIV divisor;
     remainder := a MOD divisor;
     p := (a = 0) OR Flag(a, a > 0);
     qflag := ~p OR (c < 0);
-    arr[Touch(i), Touch(j)] := quotient + remainder;
-    INC(arr[Touch(i), Touch(j)], c);
-    DEC(arr[Touch(i), Touch(j)], remainder);
-    INC(arr[i,j]);
-    DEC(arr[i,j], {step});
+    arr[Touch(i), Touch(j){zcall}] := quotient + remainder;
+    INC(arr[Touch(i), Touch(j){zcall}], c);
+    DEC(arr[Touch(i), Touch(j){zcall}], remainder);
+    INC(arr[i,j{zindex}]);
+    DEC(arr[i,j{zindex}], {step});
     acc := {initial};
     k := 0;
     REPEAT
-      INC(acc, arr[i,j]);
+      INC(acc, arr[i,j{zindex}]);
       DEC(acc, quotient);
       INC(k)
     UNTIL k >= {iterations};
@@ -145,7 +158,8 @@ VAR hits: INTEGER;
     IF qflag & (quotient > 0) THEN INC(acc, 3) ELSE DEC(acc, 3) END;
     RETURN acc + quotient + remainder + hits * 3 + Choose(p, c)
   END Probe;
-"#,rows=self.rows,cols=self.cols,row=self.row,col=self.col,
+"#,rows=self.rows,cols=self.cols,dims=dims,zvar=zvar,
+        row=self.row,col=self.col,zinit=zinit,zcall=zcall,zindex=zindex,
         divisor_mod=self.divisor_mod,step=self.step,initial=self.initial,
         iterations=self.iterations)
     }
@@ -253,6 +267,8 @@ mod tests {
         assert!(cases.windows(2).any(|w|w[0].rows!=w[1].rows));
         assert!(cases.windows(2).any(|w|w[0].iterations!=w[1].iterations));
         assert!(cases.windows(2).any(|w|w[0].step!=w[1].step));
+        assert!(cases.iter().any(|case|case.depth.is_none()));
+        assert!(cases.iter().any(|case|case.depth.is_some()));
     }
     #[test]
     fn oracle_signed_floor_div_and_boundaries() {
