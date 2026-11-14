@@ -2280,6 +2280,82 @@ mod tests {
     }
 
     #[test]
+    fn native_boolean_formals_and_results_keep_checked_abi_types() {
+        let source="MODULE Pred;
+          PROCEDURE Positive*(x:INTEGER):BOOLEAN;
+          BEGIN RETURN x>0 END Positive;
+          PROCEDURE Both*(a,b:BOOLEAN):BOOLEAN;
+          BEGIN RETURN a & b END Both;
+          PROCEDURE Choose*(b:BOOLEAN; x:INTEGER):INTEGER;
+          BEGIN IF b THEN RETURN x ELSE RETURN -x END END Choose;
+          PROCEDURE Run*(x:INTEGER):INTEGER;
+          VAR b:BOOLEAN;
+          BEGIN
+            b:=(x#0) & Positive(x);
+            IF Both(b,Positive(x)) THEN RETURN Choose(b,x)
+            ELSE RETURN Choose(~b,x)
+            END
+          END Run;
+          END Pred.";
+        let m=lower_module(source).unwrap();
+        assert_eq!(m.functions.len(),4);
+        assert!(m.functions[0].returns_boolean);
+        assert_eq!(m.functions[1].boolean_variables,[0,1]);
+        assert!(m.functions[1].returns_boolean);
+        assert_eq!(m.functions[2].boolean_variables,[0]);
+        assert!(!m.functions[2].returns_boolean);
+        assert!(matches!(&m.functions[3].body[0], Stmt::Assign{
+            value:Expr::Binary(Op::And,_,rhs),..
+        } if matches!(&**rhs,Expr::Call{
+            returns_boolean:true,boolean_arguments,args,..
+        } if boolean_arguments==&[false] && args.len()==1)));
+        assert!(matches!(&m.functions[3].body[1], Stmt::If{
+            condition:Expr::Call{
+                returns_boolean:true,boolean_arguments,args,..
+            },..
+        } if boolean_arguments==&[true,true] && args.len()==2));
+        let sym=checked_scalar_interface(source).unwrap();
+        let view=render_interface(&sym);
+        assert!(view.contains("BOOLEAN"));
+    }
+
+    #[test]
+    fn native_boolean_imported_functions_preserve_signature_metadata() {
+        let source="MODULE Producer;
+          PROCEDURE Test*(x:INTEGER; a:BOOLEAN):BOOLEAN;
+          BEGIN RETURN a & (x>0) END Test; END Producer.";
+        let interface=checked_scalar_interface(source).unwrap();
+        let consumer="MODULE Consumer; IMPORT Producer;
+          PROCEDURE Run*(n:INTEGER):INTEGER;
+          BEGIN IF Producer.Test(n,n#0) THEN RETURN 1
+                ELSE RETURN 0 END
+          END Run; END Consumer.";
+        let (module,_,_,_)=lower_module_with_record_objects_and_interfaces(
+            consumer,&[interface]).unwrap();
+        assert_eq!(module.imported_procedures.len(),1);
+        assert_eq!(module.imported_procedures[0].boolean_parameters,[false,true]);
+        assert!(module.imported_procedures[0].returns_boolean);
+        assert!(matches!(&module.functions[0].body[0],Stmt::If {
+            condition:Expr::ImportedCall{
+                returns_boolean:true,boolean_arguments,args,..
+            },..
+        } if boolean_arguments==&[false,true] && args.len()==2));
+    }
+
+    #[test]
+    fn native_var_boolean_and_non_scalar_formals_fail_closed() {
+        let source="MODULE Pred;
+          PROCEDURE Bad*(VAR b:BOOLEAN):INTEGER;
+          BEGIN IF b THEN RETURN 1 ELSE RETURN 0 END END Bad;
+          END Pred.";
+        assert!(lower_module(source).is_err());
+        let source="MODULE Pred;
+          PROCEDURE Bad*(a:ARRAY OF BOOLEAN):BOOLEAN;
+          BEGIN RETURN TRUE END Bad; END Pred.";
+        assert!(lower_module(source).is_err());
+    }
+
+    #[test]
     fn native_boolean_locals_and_private_globals_keep_source_types() {
         let src="MODULE Truth;
             VAR flag: BOOLEAN; count: INTEGER;
