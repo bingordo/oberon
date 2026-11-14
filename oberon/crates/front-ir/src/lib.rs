@@ -225,6 +225,9 @@ pub enum Op {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
     Assign { variable: usize, value: Expr },
+    /// Predefined INC/DEC of a checked 1D INTEGER array element.
+    /// The native consumer must evaluate index exactly once.
+    UpdateArray { array: usize, index: Expr, step: Expr, decrement: bool },
     AssignArray { array: usize, index: Expr, value: Expr },
     AssignMultiArray { array: usize, indices: Vec<Expr>, dims: Vec<u32>, value: Expr },
     /// Ordered byte-exact private record leaf write; widths 8/32 only.
@@ -1085,6 +1088,67 @@ fn lower_expr(expr: &OberonExpr, names: &HashMap<&str, usize>,
     }
 }
 
+/// Predefined scalar/1D-array INC and DEC. The input has already passed
+/// semantic checking; avoid double evaluation of a potentially effectful
+/// array subscript by projecting an explicit update statement.
+fn lower_inc_dec(
+    d: &syntax::ast::Designator,
+    names: &HashMap<&str, usize>,
+    arrays: &ArrayBindings<'_>,
+    records: &RecordObjects,
+    pointers: &PointerContext<'_>,
+    functions: &HashMap<String,CallSignature>,
+    constants: &CheckedConstants,
+) -> Result<Option<Stmt>, String> {
+    if d.base.len()!=1 || functions.contains_key(&d.base[0]) {
+        return Ok(None);
+    }
+    let decrement=match d.base[0].as_str() {
+        "INC"=>false,
+        "DEC"=>true,
+        _=>return Ok(None),
+    };
+    let args:&[OberonExpr]=match d.sels.as_slice() {
+        [syntax::ast::Selector::Call(args)]=>args,
+        [syntax::ast::Selector::Args(Some(args))]=>args,
+        _=>return Err("INC/DEC require one or two arguments".into()),
+    };
+    if !(1..=2).contains(&args.len()) {
+        return Err("INC/DEC require one or two arguments".into());
+    }
+    let ExprKind::Designator(target)=&args[0].kind else {
+        return Err("INC/DEC require an assignable INTEGER target".into());
+    };
+    if target.base.len()!=1 {
+        return Err("INC/DEC only support local INTEGER scalar/array targets".into());
+    }
+    let step=if let Some(value)=args.get(1) {
+        lower_expr(value,names,arrays,records,pointers,functions,constants)?
+    } else {
+        Expr::Integer(1)
+    };
+    if target.sels.is_empty() {
+        let variable=*names.get(target.base[0].as_str())
+            .ok_or("INC/DEC need an assignable INTEGER variable")?;
+        return Ok(Some(Stmt::Assign {
+            variable,
+            value: Expr::Binary(
+                if decrement {Op::Sub} else {Op::Add},
+                Box::new(Expr::Variable(variable)),Box::new(step)),
+        }));
+    }
+    if let [syntax::ast::Selector::Index(indices)] = target.sels.as_slice() {
+        let (array,dims)=arrays.get(target.base[0].as_str())
+            .ok_or("INC/DEC need a checked INTEGER array")?;
+        if dims.len()!=1 || indices.len()!=1 {
+            return Err("INC/DEC indexed targets require one-dimensional INTEGER array".into());
+        }
+        let index=lower_expr(&indices[0],names,arrays,records,pointers,functions,constants)?;
+        return Ok(Some(Stmt::UpdateArray{array:*array,index,step,decrement}));
+    }
+    Err("INC/DEC target must be scalar or single indexed INTEGER element".into())
+}
+
 fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
               arrays: &ArrayBindings<'_>,
               records: &RecordObjects,
@@ -1126,8 +1190,14 @@ fn lower_stmts(stmts: &[OberonStmt], names: &HashMap<&str, usize>,
                     });
                 }
             }
-            StmtKind::Call(d)=>out.push(Stmt::Call(
-                lower_call(d,names,arrays,records,pointers,functions,constants)?)),
+            StmtKind::Call(d) => {
+                if let Some(stmt)=lower_inc_dec(d,names,arrays,records,pointers,functions,constants)? {
+                    out.push(stmt);
+                } else {
+                    out.push(Stmt::Call(lower_call(
+                        d,names,arrays,records,pointers,functions,constants)?));
+                }
+            },
             StmtKind::Assign { target, value } if target.sels.is_empty() &&
                                                    target.base.len() == 1 => {
                 if let Some((pointer,object))=pointers.objects.get(&target.base[0]) {
@@ -2046,6 +2116,40 @@ mod tests {
         let good = "MODULE R; PROCEDURE P*(x: INTEGER): INTEGER;
             BEGIN RETURN -2147483648 END P; END R.";
         assert!(lower_module(good).is_ok());
+    }
+
+    #[test]
+    fn native_inc_dec_scalar_and_index_are_projected() {
+        let src="MODULE Updates;
+          PROCEDURE One*(x: INTEGER): INTEGER;
+          VAR a: ARRAY 4 OF INTEGER; i: INTEGER;
+          BEGIN i:=x; INC(i); DEC(i,2);
+            INC(a[1],i); DEC(a[1]);
+            RETURN a[1]+i END One; END Updates.";
+        let m=lower_module(src).unwrap();
+        let body=&m.functions[0].body;
+        assert!(matches!(&body[1], Stmt::Assign{
+            value:Expr::Binary(Op::Add,_,step),..
+        } if **step==Expr::Integer(1)));
+        assert!(matches!(&body[2], Stmt::Assign{
+            value:Expr::Binary(Op::Sub,_,step),..
+        } if **step==Expr::Integer(2)));
+        assert!(matches!(&body[3], Stmt::UpdateArray{
+            index:Expr::Integer(1),step:Expr::Variable(_),
+            decrement:false,..
+        }));
+        assert!(matches!(&body[4], Stmt::UpdateArray{
+            index:Expr::Integer(1),step:Expr::Integer(1),
+            decrement:true,..
+        }));
+    }
+
+    #[test]
+    fn native_inc_dec_reject_unsupported_targets() {
+        let src="MODULE Updates; PROCEDURE F*(n:INTEGER):INTEGER;
+          VAR a:ARRAY 2,2 OF INTEGER;
+          BEGIN INC(a[0,0]); RETURN n END F; END Updates.";
+        assert!(lower_module(src).is_err());
     }
 
     #[test]
