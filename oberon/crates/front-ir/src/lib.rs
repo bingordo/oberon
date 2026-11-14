@@ -2388,15 +2388,16 @@ mod tests {
     }
 
     #[test]
-    fn native_boolean_public_storage_and_formals_still_fail_closed() {
+    fn native_boolean_public_storage_fails_but_value_formals_are_admitted() {
         assert!(lower_module("MODULE Truth;
             VAR flag*: BOOLEAN;
             PROCEDURE Run*(n:INTEGER):INTEGER;
             BEGIN RETURN n END Run; END Truth.").is_err());
-        assert!(lower_module("MODULE Truth;
+        let m=lower_module("MODULE Truth;
             PROCEDURE Run*(b:BOOLEAN):INTEGER;
             BEGIN IF b THEN RETURN 1 ELSE RETURN 0 END END Run;
-            END Truth.").is_err());
+            END Truth.").unwrap();
+        assert_eq!(m.functions[0].boolean_variables,[0]);
     }
 
     #[test]
@@ -2410,8 +2411,14 @@ mod tests {
                 ELSIF (n < 0) OR BoolCall(n) THEN RETURN -1
                 ELSE RETURN 0 END
             END Run; END Logic.";
-        // BOOLEAN-valued procedures are not part of this narrow native ABI.
-        assert!(lower_module(src).is_err());
+        // BOOLEAN-valued calls in structured guards now retain the correct
+        // native signature without eager evaluation.
+        let with_boolean_call=lower_module(src).unwrap();
+        assert!(with_boolean_call.functions[0].returns_boolean);
+        assert!(matches!(&with_boolean_call.functions[1].body[0],
+            Stmt::If {
+                condition:Expr::Binary(Op::And,_,right),..
+            } if matches!(&**right,Expr::Call{returns_boolean:true,..})));
         let src="MODULE Logic;
             PROCEDURE Run*(n: INTEGER): INTEGER;
             BEGIN
