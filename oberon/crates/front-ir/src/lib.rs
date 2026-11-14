@@ -129,6 +129,10 @@ pub struct Function {
     pub parameter_by_ref: Vec<bool>,
     /// Zero-initialized INTEGER locals, in source order.
     pub locals: Vec<String>,
+    /// Scalar indexes (parameters, locals, then module globals) that have
+    /// source type BOOLEAN. Native storage is private canonical 0/1 i32;
+    /// this metadata is authoritative when producing Bool SSA values.
+    pub boolean_variables: Vec<usize>,
     /// Fixed-size single-dimensional local INTEGER arrays. Nonzero lengths.
     pub arrays: Vec<ArrayLocal>,
     /// Module arrays follow locals in array-index numbering.
@@ -1485,6 +1489,7 @@ pub fn lower_module_with_record_objects_and_interfaces(
         record_types.insert(decl.name.clone(), fields);
     }
     let mut globals = Vec::<Global>::new();
+    let mut boolean_globals = Vec::<String>::new();
     let mut global_arrays = Vec::<ArrayGlobal>::new();
     let mut pointer_globals=Vec::<PointerObject>::new();
     let mut global_array_dims=HashMap::<String,Vec<u32>>::new();
@@ -1525,6 +1530,17 @@ pub fn lower_module_with_record_objects_and_interfaces(
             TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
                 for (name, exported) in &decl.names {
                     globals.push(Global { name: name.clone(), exported: *exported });
+                }
+            }
+            TypeExpr::Named(q, _) if q.as_slice()==["BOOLEAN"] => {
+                for (name, exported) in &decl.names {
+                    // A BOOLEAN's public memory ABI is not yet defined;
+                    // only private canonical 0/1 storage is supported.
+                    if *exported {
+                        return Err("exported BOOLEAN globals require an ABI contract".into());
+                    }
+                    boolean_globals.push(name.clone());
+                    globals.push(Global {name:name.clone(),exported:false});
                 }
             }
             TypeExpr::Array { dims, elem, .. } if
@@ -1594,6 +1610,7 @@ pub fn lower_module_with_record_objects_and_interfaces(
             }
         }
         let mut locals = Vec::new();
+        let mut boolean_locals = Vec::<String>::new();
         let mut fixed_arrays = Vec::new();
         let mut pointer_locals=Vec::<PointerObject>::new();
         let mut local_array_dims=HashMap::<String,Vec<u32>>::new();
@@ -1630,6 +1647,12 @@ pub fn lower_module_with_record_objects_and_interfaces(
                 TypeExpr::Named(q, _) if q.as_slice()==["INTEGER"] => {
                     for (name,_) in &decl.names {locals.push(name.clone());}
                 }
+                TypeExpr::Named(q, _) if q.as_slice()==["BOOLEAN"] => {
+                    for (name,_) in &decl.names {
+                        boolean_locals.push(name.clone());
+                        locals.push(name.clone());
+                    }
+                }
                 TypeExpr::Array{dims,elem,..} if
                     matches!(elem.as_ref(),TypeExpr::Named(q,_) if q.as_slice()==["INTEGER"]) => {
                     let (lengths,length)=checked_array_dimensions(dims,&proc_constants)
@@ -1640,6 +1663,17 @@ pub fn lower_module_with_record_objects_and_interfaces(
                     }
                 }
                 _=>return Err(format!("{}: only INTEGER locals and fixed INTEGER arrays supported",proc.name)),
+            }
+        }
+        let mut boolean_variables=Vec::<usize>::new();
+        for (index,name) in locals.iter().enumerate() {
+            if boolean_locals.contains(name) {
+                boolean_variables.push(parameters.len()+index);
+            }
+        }
+        for (index,global) in globals.iter().enumerate() {
+            if boolean_globals.contains(&global.name) {
+                boolean_variables.push(parameters.len()+locals.len()+index);
             }
         }
         // Modules and procedures use separate scopes: a local or parameter
@@ -1694,7 +1728,7 @@ pub fn lower_module_with_record_objects_and_interfaces(
             return Err(format!("{}: function must return a value on every path", proc.name));
         }
         functions.push(Function { name: proc.name.clone(), parameters,
-                                  parameter_by_ref,locals,
+                                  parameter_by_ref,locals,boolean_variables,
                                   arrays:fixed_arrays,
                                   global_arrays:global_arrays.clone(),
                                   pointer_locals,pointer_globals:pointer_globals.clone(),
@@ -1729,7 +1763,11 @@ pub fn lower_module_with_record_objects_and_interfaces(
         Some(Function {
             name: "__module_init".into(),
             parameters: Vec::new(),parameter_by_ref:Vec::new(),
-            locals: Vec::new(), arrays: Vec::new(),
+            locals: Vec::new(),
+            boolean_variables: globals.iter().enumerate()
+                .filter_map(|(index,global)|boolean_globals.contains(&global.name)
+                    .then_some(index)).collect(),
+            arrays: Vec::new(),
             global_arrays: global_arrays.clone(),
             pointer_locals:Vec::new(),pointer_globals:pointer_globals.clone(),
             globals: globals.iter().map(|g| g.name.clone()).collect(),
@@ -2193,6 +2231,50 @@ mod tests {
     }
 
     #[test]
+    fn native_boolean_locals_and_private_globals_keep_source_types() {
+        let src="MODULE Truth;
+            VAR flag: BOOLEAN; count: INTEGER;
+            PROCEDURE Run*(n: INTEGER): INTEGER;
+            VAR p, q: BOOLEAN; x: INTEGER;
+            BEGIN
+              p := (n # 0) & (100 DIV n > 0);
+              flag := p OR (n = 0);
+              q := ~flag OR (n < 0);
+              IF p & flag THEN count := count+1 END;
+              IF q THEN RETURN 2 ELSE RETURN count END
+            END Run;
+            BEGIN flag := FALSE; count := 0
+            END Truth.";
+        let m=lower_module(src).unwrap();
+        assert_eq!(m.globals.iter().map(|g|g.name.as_str()).collect::<Vec<_>>(),
+                   ["flag","count"]);
+        assert_eq!(m.functions[0].locals,["p","q","x"]);
+        assert_eq!(m.functions[0].boolean_variables,[1,2,4]);
+        assert_eq!(m.initializer.as_ref().unwrap().boolean_variables,[0]);
+        assert!(matches!(&m.functions[0].body[0],Stmt::Assign{
+            variable:1,value:Expr::Binary(Op::And,_,_)
+        }));
+        assert!(matches!(&m.functions[0].body[1],Stmt::Assign{
+            variable:4,value:Expr::Binary(Op::Or,_,_)
+        }));
+        assert!(matches!(&m.functions[0].body[2],Stmt::Assign{
+            variable:2,value:Expr::Binary(Op::Or,left,_)
+        } if matches!(&**left,Expr::Not(_))));
+    }
+
+    #[test]
+    fn native_boolean_public_storage_and_formals_still_fail_closed() {
+        assert!(lower_module("MODULE Truth;
+            VAR flag*: BOOLEAN;
+            PROCEDURE Run*(n:INTEGER):INTEGER;
+            BEGIN RETURN n END Run; END Truth.").is_err());
+        assert!(lower_module("MODULE Truth;
+            PROCEDURE Run*(b:BOOLEAN):INTEGER;
+            BEGIN IF b THEN RETURN 1 ELSE RETURN 0 END END Run;
+            END Truth.").is_err());
+    }
+
+    #[test]
     fn native_boolean_conditions_preserve_short_circuit_structure() {
         let src="MODULE Logic;
             PROCEDURE BoolCall*(n: INTEGER): BOOLEAN;
@@ -2396,10 +2478,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operations_fail_closed() {
-        let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
-            BEGIN RETURN x DIV 3 END P; END M.");
-        assert!(e.unwrap_err().contains("unsupported binary"));
+    fn runtime_div_supported_but_unsupported_types_fail_closed() {
+        let m = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
+            BEGIN RETURN x DIV 3 END P; END M.").unwrap();
+        assert!(matches!(&m.functions[0].body[0],
+            Stmt::Return(Expr::Binary(Op::Div,_,rhs))
+            if **rhs==Expr::Integer(3)));
         let e = lower_module("MODULE M; PROCEDURE P*(x: INTEGER): INTEGER; \
             VAR z: REAL; BEGIN RETURN x END P; END M.");
         assert!(e.unwrap_err().contains("INTEGER local"));
