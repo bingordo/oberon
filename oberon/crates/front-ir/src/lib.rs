@@ -201,6 +201,15 @@ pub enum Expr {
     Variable(usize),
     /// Address of a checked assignable INTEGER scalar, exclusively for VAR calls.
     AddressOfScalar(usize),
+    /// Address of one checked fixed-array INTEGER element for a VAR actual.
+    /// The consumer must evaluate the subscript once, emit its signed bounds
+    /// check, then pass the address of the selected word, not a copied value.
+    AddressOfArrayElement { array: usize, index: Box<Expr> },
+    /// As above, with one independent bounds check per source dimension.
+    /// Flattening an offset cannot replace those per-dimension checks.
+    AddressOfMultiArrayElement {
+        array: usize, indices: Vec<Expr>, dims: Vec<u32>,
+    },
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
     /// Source-checked fixed INTEGER array, flattened into one native
@@ -946,6 +955,58 @@ struct CallSignature {
     module:Option<String>,
 }
 
+/// Construct only addresses proven assignable by the Oberon checker and
+/// represented by the native bridge. Keep scalar and array address formation
+/// together so imported calls and local calls have identical admission rules.
+/// The index AST is stored once; the consumer must not lower it separately
+/// for a value load and for address formation.
+fn lower_var_integer_actual(
+    arg:&OberonExpr,
+    names:&HashMap<&str,usize>,
+    arrays:&ArrayBindings<'_>,
+    records:&RecordObjects,
+    pointers:&PointerContext<'_>,
+    functions:&HashMap<String,CallSignature>,
+    constants:&CheckedConstants,
+)->Result<Expr,String> {
+    let ExprKind::Designator(actual)=&arg.kind else {
+        return Err("VAR INTEGER argument must be an assignable INTEGER designator".into());
+    };
+    if actual.base.len()!=1 {
+        return Err("VAR INTEGER argument must select a checked local or global object".into());
+    }
+    let root=actual.base[0].as_str();
+    match actual.sels.as_slice() {
+        []=>{
+            let index=names.get(root)
+                .ok_or("VAR INTEGER argument is not an addressable checked scalar")?;
+            Ok(Expr::AddressOfScalar(*index))
+        }
+        [syntax::ast::Selector::Index(indices)]=>{
+            let (array,dims)=arrays.get(root)
+                .ok_or("VAR INTEGER element needs a checked fixed INTEGER array")?;
+            if indices.len()!=dims.len() {
+                return Err("VAR INTEGER indexed element has wrong source rank".into());
+            }
+            let lowered=indices.iter().map(|index|
+                lower_expr(index,names,arrays,records,pointers,functions,constants))
+                .collect::<Result<Vec<_>,_>>()?;
+            if dims.len()==1 {
+                Ok(Expr::AddressOfArrayElement {
+                    array:*array,
+                    index:Box::new(lowered.into_iter().next()
+                        .expect("checked single-dimensional subscript")),
+                })
+            } else {
+                Ok(Expr::AddressOfMultiArrayElement {
+                    array:*array,indices:lowered,dims:dims.clone(),
+                })
+            }
+        }
+        _=>Err("VAR INTEGER argument requires a scalar or indexed INTEGER array element".into()),
+    }
+}
+
 fn lower_call(d:&syntax::ast::Designator,
               names:&HashMap<&str,usize>,
               arrays:&ArrayBindings<'_>,
@@ -970,15 +1031,8 @@ fn lower_call(d:&syntax::ast::Designator,
     let mut args=Vec::with_capacity(raw_args.len());
     for (arg,&by_ref) in raw_args.iter().zip(&expected.parameter_by_ref) {
         if by_ref {
-            let ExprKind::Designator(actual)=&arg.kind else {
-                return Err("VAR INTEGER argument must be assignable scalar designator".into());
-            };
-            if actual.base.len()!=1 || !actual.sels.is_empty() {
-                return Err("VAR INTEGER argument must be a direct scalar object".into());
-            }
-            let index=names.get(actual.base[0].as_str())
-                .ok_or("VAR INTEGER argument is not an addressable checked scalar")?;
-            args.push(Expr::AddressOfScalar(*index));
+            args.push(lower_var_integer_actual(
+                arg,names,arrays,records,pointers,functions,constants)?);
         } else {
             args.push(lower_expr(arg,names,arrays,records,pointers,functions,constants)?);
         }
