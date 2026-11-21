@@ -41,6 +41,8 @@ mod compiler_subset;
 mod compiler_arrays;
 #[path = "obgen/compiler_rich.rs"]
 mod compiler_rich;
+#[path = "obgen/compiler_typed.rs"]
+mod compiler_typed;
 
 // random generator
 
@@ -1332,6 +1334,8 @@ fn main() {
             compiler_arrays::render(base,&mode)
         } else if mode.starts_with("rich-") {
             compiler_rich::render(base,&mode)
+        } else if mode.starts_with("typed-") {
+            compiler_typed::render(base,&mode)
         } else {
             compiler_subset::render(base,&mode)
         };
