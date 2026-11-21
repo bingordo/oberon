@@ -95,8 +95,12 @@ impl Integer {
 impl Boolean {
     fn render(&self,c:bool)->String {
         match self {
-            Self::Literal(v)=>if c {if *v {"1"} else {"0"}}
-                else if *v {"TRUE"} else {"FALSE"}.to_string(),
+            Self::Literal(v)=>{
+                let value=if c {
+                    if *v {"1"} else {"0"}
+                } else if *v {"TRUE"} else {"FALSE"};
+                value.to_string()
+            },
             Self::Variable=>"flag".into(),
             Self::Compare(op,a,b)|Self::TouchCompare(op,a,b)=>{
                 let lhs=if matches!(self,Self::TouchCompare(..)) {
@@ -203,7 +207,7 @@ impl Stmt {
             }
             Self::If(cond,a,b)=>{
                 if c {
-                    format!("{pad}if ({}) {{\n{}\n{pad}}} else {{\n{}\n{pad}}}",
+                    format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
                         cond.render(true),sequence(a,true,indent+2),
                         sequence(b,true,indent+2))
                 } else {
@@ -214,7 +218,7 @@ impl Stmt {
             }
             Self::Repeat(n,body)=>{
                 if c {
-                    format!("{pad}k = 0;\n{pad}do {{\n{}\n{pad}  k++;\n{pad}}} while (k < {n})",
+                    format!("{pad}k = 0;\n{pad}do {{\n{};\n{pad}  k++;\n{pad}}} while (k < {n})",
                         sequence(body,true,indent+2))
                 } else {
                     format!("{pad}k := 0;\n{pad}REPEAT\n{};\n{pad}  INC(k)\n{pad}UNTIL k >= {n}",
@@ -261,6 +265,9 @@ impl Program {
             // recursively generated, not filled into a fixed program string.
             Stmt::SetInteger(3,Integer::Binary(IOp::Div,
                 Box::new(integer(&mut r,2)),Box::new(Integer::Literal(3)))),
+            Stmt::Update(4,Integer::Binary(IOp::Mod,
+                Box::new(Integer::Variable(2)),
+                Box::new(Integer::Literal(-5))),false),
             Stmt::SetBoolean(Boolean::And(
                 Box::new(Boolean::Compare(Rel::Ne,
                     Box::new(Integer::Variable(0)),Box::new(Integer::Literal(0)))),
