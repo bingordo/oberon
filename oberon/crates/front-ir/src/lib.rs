@@ -34,7 +34,7 @@ pub fn module_dependencies(source:&str)->Result<ModuleDependencies,String> {
 }
 
 /// Only the ABI we lower natively is advertised in this initial .sym writer:
-/// exported INTEGER-returning functions taking value/VAR INTEGER scalars.
+/// exported scalar functions with INTEGER/BOOLEAN value or VAR parameters.
 /// Other exports must not silently disappear from an interface file.
 pub fn checked_scalar_interface(source:&str)->Result<Interface,String> {
     checked_scalar_interface_with_imports(source,&[])
@@ -68,7 +68,8 @@ pub fn checked_scalar_interface_with_imports(
                 ([ty],false) if ty=="INTEGER"=>"INTEGER",
                 ([ty],true) if ty=="INTEGER"=>"VAR INTEGER",
                 ([ty],false) if ty=="BOOLEAN"=>"BOOLEAN",
-                _=>return Err("native scalar .sym requires INTEGER, VAR INTEGER, or BOOLEAN".into()),
+                ([ty],true) if ty=="BOOLEAN"=>"VAR BOOLEAN",
+                _=>return Err("native scalar .sym requires INTEGER/BOOLEAN or VAR INTEGER/BOOLEAN".into()),
             };
             for _ in &section.names {params.push(formal.into());}
         }
@@ -958,9 +959,11 @@ struct CallSignature {
 /// Construct only addresses proven assignable by the Oberon checker and
 /// represented by the native bridge. Keep scalar and array address formation
 /// together so imported calls and local calls have identical admission rules.
+/// VAR BOOLEAN uses scalar canonical 0/1 storage; only INTEGER arrays are
+/// projected in the native bridge, and other array-element VAR forms fail closed.
 /// The index AST is stored once; the consumer must not lower it separately
 /// for a value load and for address formation.
-fn lower_var_integer_actual(
+fn lower_var_scalar_actual(
     arg:&OberonExpr,
     names:&HashMap<&str,usize>,
     arrays:&ArrayBindings<'_>,
@@ -970,23 +973,23 @@ fn lower_var_integer_actual(
     constants:&CheckedConstants,
 )->Result<Expr,String> {
     let ExprKind::Designator(actual)=&arg.kind else {
-        return Err("VAR INTEGER argument must be an assignable INTEGER designator".into());
+        return Err("VAR scalar argument must be a checked assignable designator".into());
     };
     if actual.base.len()!=1 {
-        return Err("VAR INTEGER argument must select a checked local or global object".into());
+        return Err("VAR scalar argument must select a checked local or global object".into());
     }
     let root=actual.base[0].as_str();
     match actual.sels.as_slice() {
         []=>{
             let index=names.get(root)
-                .ok_or("VAR INTEGER argument is not an addressable checked scalar")?;
+                .ok_or("VAR scalar argument is not an addressable checked object")?;
             Ok(Expr::AddressOfScalar(*index))
         }
         [syntax::ast::Selector::Index(indices)]=>{
             let (array,dims)=arrays.get(root)
-                .ok_or("VAR INTEGER element needs a checked fixed INTEGER array")?;
+                .ok_or("VAR indexed element needs a checked fixed INTEGER array")?;
             if indices.len()!=dims.len() {
-                return Err("VAR INTEGER indexed element has wrong source rank".into());
+                return Err("VAR indexed element has wrong source rank".into());
             }
             let lowered=indices.iter().map(|index|
                 lower_expr(index,names,arrays,records,pointers,functions,constants))
@@ -1003,7 +1006,7 @@ fn lower_var_integer_actual(
                 })
             }
         }
-        _=>Err("VAR INTEGER argument requires a scalar or indexed INTEGER array element".into()),
+        _=>Err("VAR argument requires a scalar or checked INTEGER array element".into()),
     }
 }
 
@@ -1031,7 +1034,7 @@ fn lower_call(d:&syntax::ast::Designator,
     let mut args=Vec::with_capacity(raw_args.len());
     for (arg,&by_ref) in raw_args.iter().zip(&expected.parameter_by_ref) {
         if by_ref {
-            args.push(lower_var_integer_actual(
+            args.push(lower_var_scalar_actual(
                 arg,names,arrays,records,pointers,functions,constants)?);
         } else {
             args.push(lower_expr(arg,names,arrays,records,pointers,functions,constants)?);
@@ -1503,8 +1506,9 @@ pub fn lower_module_with_record_objects_and_interfaces(
             .ok_or("no checked source interface for imported module")?;
         for item in &interface.items {
             if let InterfaceItem::Proc{name,params,result}=item {
-                // Both scalar types have explicit 32-bit native ABI slots;
-                // VAR BOOLEAN and aggregate formals remain out of scope.
+                // Both scalar types use normalized 32-bit native ABI words;
+                // VAR formals pass pointers to those checked scalar homes.
+                // Aggregate formals remain out of scope.
                 let returns_boolean=match result.as_deref() {
                     Some("INTEGER")=>false,
                     Some("BOOLEAN")=>true,
@@ -1514,6 +1518,7 @@ pub fn lower_module_with_record_objects_and_interfaces(
                     "INTEGER"=>Some((false,false)),
                     "VAR INTEGER"=>Some((true,false)),
                     "BOOLEAN"=>Some((false,true)),
+                    "VAR BOOLEAN"=>Some((true,true)),
                     _=>None,
                 }).collect::<Option<Vec<_>>>();
                 let Some(formals)=formals else {continue;};
@@ -1698,9 +1703,9 @@ pub fn lower_module_with_record_objects_and_interfaces(
         for section in &proc.params {
             let is_boolean=section.ty.base.as_slice()==["BOOLEAN"];
             let is_integer=section.ty.base.as_slice()==["INTEGER"];
-            if section.ty.open!=0 || !(is_integer || (is_boolean && !section.by_ref)) {
+            if section.ty.open!=0 || !(is_integer || is_boolean) {
                 return Err(format!(
-                    "{}: only value INTEGER/BOOLEAN or VAR INTEGER formals are supported",
+                    "{}: only value/VAR INTEGER or BOOLEAN formals are supported",
                     proc.name));
             }
             for (name,_) in &section.names {
@@ -2397,12 +2402,7 @@ mod tests {
     }
 
     #[test]
-    fn native_var_boolean_and_non_scalar_formals_fail_closed() {
-        let source="MODULE Pred;
-          PROCEDURE Bad*(VAR b:BOOLEAN):INTEGER;
-          BEGIN IF b THEN RETURN 1 ELSE RETURN 0 END END Bad;
-          END Pred.";
-        assert!(lower_module(source).is_err());
+    fn native_non_scalar_formals_fail_closed() {
         let source="MODULE Pred;
           PROCEDURE Bad*(a:ARRAY OF BOOLEAN):BOOLEAN;
           BEGIN RETURN TRUE END Bad; END Pred.";
