@@ -204,6 +204,9 @@ enum Stmt {
     Update(usize,Integer,bool),
     SetArray(Integer,Integer),
     UpdateArray(Integer,Integer,bool),
+    /// Native VAR INTEGER formals currently admit direct scalar lvalues only.
+    /// The INTEGER value argument can contain recursively generated array reads.
+    CallVar(usize,Integer,Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
     /// automatic increment. Nested loops are not generated.
@@ -241,6 +244,16 @@ impl Stmt {
                         if *dec {"DEC"} else {"INC"},delta.render(false))
                 }
             }
+            Self::CallVar(slot,delta,minus)=>{
+                let target=INT_NAMES[*slot];
+                if c {
+                    format!("{pad}acc = change(&{target}, {}, {})",
+                        delta.render(true),minus.render(true))
+                } else {
+                    format!("{pad}acc := Change({target}, {}, {})",
+                        delta.render(false),minus.render(false))
+                }
+            }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
@@ -269,6 +282,7 @@ impl Stmt {
             Self::SetBoolean(b)=>1+b.nodes(),
             Self::SetArray(index,value)|Self::UpdateArray(index,value,_)=>
                 1+index.nodes()+value.nodes(),
+            Self::CallVar(_,delta,minus)=>1+delta.nodes()+minus.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
             Self::Repeat(_,body)=>1+body.iter().map(Self::nodes).sum::<usize>(),
@@ -280,14 +294,15 @@ fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
     stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(sep)
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(5)} else {r.below(9)};
+    let choice=if depth==0 {r.below(6)} else {r.below(11)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
         2=>Stmt::Update(3+r.below(3),integer(r,2),r.below(2)==0),
         3=>Stmt::SetArray(integer(r,2),integer(r,3)),
         4=>Stmt::UpdateArray(integer(r,2),integer(r,2),r.below(2)==0),
-        5|6=>Stmt::If(boolean(r,3),
+        5|6=>Stmt::CallVar(3+r.below(3),integer(r,2),boolean(r,2)),
+        7|8=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -322,6 +337,15 @@ impl Program {
             Stmt::SetArray(Integer::Literal(0),Integer::Variable(0)),
             Stmt::UpdateArray(Integer::Literal(3),Integer::Literal(1),false),
             Stmt::SetInteger(3,Integer::ArrayRead(Box::new(Integer::Variable(1)))),
+            // Mandatory scalar-by-reference calls, including an array
+            // value expression and a side-effectful BOOLEAN actual.
+            Stmt::CallVar(5,Integer::Variable(0),Boolean::Variable),
+            Stmt::CallVar(3,Integer::ArrayRead(Box::new(Integer::Variable(1))),
+                Boolean::And(
+                    Box::new(Boolean::Literal(true)),
+                    Box::new(Boolean::TouchCompare(Rel::Ne,
+                        Box::new(Integer::Variable(2)),
+                        Box::new(Integer::Literal(0)))))),
             // Guarantee a use of the BOOLEAN local so both languages must
             // preserve its value, and C -Werror never rejects an unused flag.
             Stmt::If(Boolean::Variable,
@@ -355,7 +379,12 @@ impl Program {
         let mut out=String::from(
             "MODULE Fuzz;\nVAR hits: INTEGER;\n\
              \x20 PROCEDURE Touch*(n:INTEGER):INTEGER;\n\
-             \x20 BEGIN INC(hits); RETURN n END Touch;\n");
+             \x20 BEGIN INC(hits); RETURN n END Touch;\n\
+             \x20 PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;\n\
+             \x20 BEGIN\n\
+             \x20   IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;\n\
+             \x20   RETURN n\n\
+             \x20 END Change;\n");
         out.push_str(&self.source_procedure("Probe",false));
         out.push_str(&self.source_procedure("Mirror",true));
         if checks {
@@ -397,6 +426,9 @@ impl Program {
              \x20 int64_t q=(int64_t)a / b, r=(int64_t)a % b;\n\
              \x20 if (r && ((r<0)!=(b<0))) --q;\n\
              \x20 return (int32_t)((int64_t)a-q*b);\n}\n\
+             static int32_t change(int32_t *n,int32_t delta,int minus) {\n\
+             \x20 *n=minus ? wrap_sub(*n,delta) : wrap_add(*n,delta);\n\
+             \x20 return *n;\n}\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
              \x20 int32_t cells[4]={a,b,c,0};\n");
@@ -472,7 +504,11 @@ mod tests {
             assert!(src.contains("cells: ARRAY 4 OF INTEGER"));
             assert!(src.contains("INC(cells["));
             assert!(src.contains("cells[("));
+            assert!(src.contains("PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER"));
+            assert!(src.contains("Change(acc, a, flag)"));
+            assert!(src.contains("Change(x, cells["));
             assert!(c.contains("int32_t cells[4]={a,b,c,0};"));
+            assert!(c.contains("static int32_t change(int32_t *n,int32_t delta,int minus)"));
         }
     }
     #[test]
@@ -519,6 +555,31 @@ mod tests {
             let c=render(seed,"typed-harness").unwrap();
             assert!(oberon.contains("cells[("));
             assert!(c.contains("floor_mod("));
+        }
+    }
+    #[test]
+    fn var_parameter_calls_cover_scalar_lvalues_and_array_values() {
+        let scalar=Stmt::CallVar(3,Integer::Literal(1),
+            Boolean::Literal(false));
+        assert_eq!(scalar.render(false,0),"acc := Change(x, 1, FALSE)");
+        assert_eq!(scalar.render(true,0),"acc = change(&x, 1, 0)");
+        // A recursive array expression is allowed as a value actual;
+        // passing an array element by reference is not yet admitted.
+        let array_value=Stmt::CallVar(4,
+            Integer::ArrayRead(Box::new(Integer::ArrayRead(
+                Box::new(Integer::Variable(0))))),Boolean::Variable);
+        assert_eq!(array_value.render(false,0),
+            "acc := Change(y, cells[(cells[(a MOD 4)] MOD 4)], flag)");
+        assert_eq!(array_value.render(true,0),
+            "acc = change(&y, cells[floor_mod(cells[floor_mod(a, 4)], 4)], flag)");
+        for seed in 0..128 {
+            let p=Program::generate(seed);
+            let src=p.source(&inputs(seed),false);
+            let c=p.c_reference(&inputs(seed),seed);
+            assert!(src.contains("Change(acc, a, flag)"));
+            assert!(src.contains("Change(x, cells["));
+            assert!(c.contains("change(&acc, a, flag)"));
+            assert!(c.contains("change(&x, cells["));
         }
     }
     #[test]
