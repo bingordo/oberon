@@ -558,7 +558,7 @@ mod tests {
         }
     }
     #[test]
-    fn var_parameter_calls_cover_scalar_and_indexed_lvalues() {
+    fn var_parameter_calls_cover_scalar_lvalues_and_array_values() {
         let scalar=Stmt::CallVar(3,Integer::Literal(1),
             Boolean::Literal(false));
         assert_eq!(scalar.render(false,0),"acc := Change(x, 1, FALSE)");
