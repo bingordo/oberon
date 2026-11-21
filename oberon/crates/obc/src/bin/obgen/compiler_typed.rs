@@ -6,6 +6,7 @@ use super::Rng;
 use std::fmt::Write as _;
 
 const INPUTS:usize=32;
+const ARRAY_LEN:usize=4;
 const INT_NAMES:[&str;6]=["a","b","c","x","y","acc"];
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -49,6 +50,8 @@ enum Integer {
     /// All operands are pure. Effectful calls occur only in Boolean trees,
     /// where AND/OR enforce a language-defined evaluation order.
     Binary(IOp,Box<Integer>,Box<Integer>),
+    /// A side-effect-free read from a bounded local INTEGER array.
+    ArrayRead(Box<Integer>),
 }
 #[derive(Clone,Debug)]
 enum Boolean {
@@ -72,11 +75,18 @@ fn literal(n:i32)->String {
     if n==i32::MIN {"(0 - 2147483647 - 1)".into()}
     else if n<0 {format!("({n})")} else {n.to_string()}
 }
+/// Any signed expression, including MIN(INTEGER), becomes an in-bounds
+/// subscript using Oberon's floor MOD semantics (not C's remainder).
+fn array_index(index:&Integer,c:bool)->String {
+    if c {format!("floor_mod({}, {ARRAY_LEN})",index.render(true))}
+    else {format!("({} MOD {ARRAY_LEN})",index.render(false))}
+}
 impl Integer {
     fn render(&self,c:bool)->String {
         match self {
             Self::Variable(i)=>INT_NAMES[*i].to_string(),
             Self::Literal(n)=>literal(*n),
+            Self::ArrayRead(index)=>format!("cells[{}]",array_index(index,c)),
             Self::Binary(op,a,b)=>{
                 let (a,b)=(a.render(c),b.render(c));
                 if c {
@@ -91,6 +101,7 @@ impl Integer {
     fn nodes(&self)->usize {
         match self {
             Self::Variable(_)|Self::Literal(_)=>1,
+            Self::ArrayRead(index)=>1+index.nodes(),
             Self::Binary(_,a,b)=>1+a.nodes()+b.nodes(),
         }
     }
@@ -148,6 +159,11 @@ fn integer(r:&mut Rng,depth:usize)->Integer {
             Integer::Literal(*r.pick(&[-17,-7,-3,-1,0,1,2,3,7,19,i32::MIN,i32::MAX]))
         } else {Integer::Variable(r.below(INT_NAMES.len()))};
     }
+    // Array reads are genuine recursive AST terms, not source templates.
+    // Their indices recursively contain arbitrary generated INTEGER trees.
+    if r.below(6)==0 {
+        return Integer::ArrayRead(Box::new(integer(r,depth-1)));
+    }
     let op=match r.below(5) {
         0=>IOp::Add,1=>IOp::Sub,2=>IOp::Mul,3=>IOp::Div,_=>IOp::Mod,
     };
@@ -186,6 +202,8 @@ enum Stmt {
     SetInteger(usize,Integer),
     SetBoolean(Boolean),
     Update(usize,Integer,bool),
+    SetArray(Integer,Integer),
+    UpdateArray(Integer,Integer,bool),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
     /// automatic increment. Nested loops are not generated.
@@ -207,6 +225,20 @@ impl Stmt {
                 } else {
                     format!("{pad}{}({name}, {})",
                         if *dec {"DEC"} else {"INC"},e.render(false))
+                }
+            }
+            Self::SetArray(index,value)=>format!("{pad}cells[{}] {} {}",
+                array_index(index,c),if c {"="} else {":="},value.render(c)),
+            Self::UpdateArray(index,delta,dec)=>{
+                let target=format!("cells[{}]",array_index(index,c));
+                if c {
+                    // Index is a pure typed expression; duplicated C rendering
+                    // cannot repeat any Touch side effect.
+                    format!("{pad}{target} = {}({target}, {})",
+                        if *dec {"wrap_sub"} else {"wrap_add"},delta.render(true))
+                } else {
+                    format!("{pad}{}({target}, {})",
+                        if *dec {"DEC"} else {"INC"},delta.render(false))
                 }
             }
             Self::If(cond,a,b)=>{
@@ -235,6 +267,8 @@ impl Stmt {
         match self {
             Self::SetInteger(_,x)|Self::Update(_,x,_)=>1+x.nodes(),
             Self::SetBoolean(b)=>1+b.nodes(),
+            Self::SetArray(index,value)|Self::UpdateArray(index,value,_)=>
+                1+index.nodes()+value.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
             Self::Repeat(_,body)=>1+body.iter().map(Self::nodes).sum::<usize>(),
@@ -246,17 +280,19 @@ fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
     stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(sep)
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(3)} else {r.below(7)};
+    let choice=if depth==0 {r.below(5)} else {r.below(9)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
         2=>Stmt::Update(3+r.below(3),integer(r,2),r.below(2)==0),
-        3|4=>Stmt::If(boolean(r,3),
+        3=>Stmt::SetArray(integer(r,2),integer(r,3)),
+        4=>Stmt::UpdateArray(integer(r,2),integer(r,2),r.below(2)==0),
+        5|6=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
             (0..1+r.below(3)).map(|_|statement(r,depth-1,false)).collect()),
-        _=>Stmt::Update(3+r.below(3),integer(r,2),r.below(2)==0),
+        _=>Stmt::UpdateArray(integer(r,2),integer(r,2),r.below(2)==0),
     }
 }
 #[derive(Clone,Debug)]
@@ -281,6 +317,11 @@ impl Program {
                         Box::new(Integer::Literal(0)))),
                     Box::new(boolean(&mut r,2)))))),
             Stmt::Repeat(1+r.below(3),vec![statement(&mut r,2,false)]),
+            // Required read/write/indexed-update witnesses for every seed.
+            // Further array operations are chosen recursively by the AST.
+            Stmt::SetArray(Integer::Literal(0),Integer::Variable(0)),
+            Stmt::UpdateArray(Integer::Literal(3),Integer::Literal(1),false),
+            Stmt::SetInteger(3,Integer::ArrayRead(Box::new(Integer::Variable(1)))),
             // Guarantee a use of the BOOLEAN local so both languages must
             // preserve its value, and C -Werror never rejects an unused flag.
             Stmt::If(Boolean::Variable,
@@ -294,16 +335,18 @@ impl Program {
         let mut out=format!(
             "  PROCEDURE {name}*(a,b,c: INTEGER): INTEGER;\n\
              \x20 VAR x,y,acc,k: INTEGER; flag: BOOLEAN;\n\
+             \x20     cells: ARRAY 4 OF INTEGER;\n\
              \x20 BEGIN\n\
              \x20   hits := 0;\n\
-             \x20   x := a; y := b; acc := c; flag := FALSE;\n");
+             \x20   x := a; y := b; acc := c; flag := FALSE;\n\
+             \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n");
         out.push_str(&sequence(&self.body,false,4));
         out.push_str(";\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
-            out.push_str("    RETURN (acc + x) + (y + hits)\n");
+            out.push_str("    RETURN ((acc + cells[0]) + (x + y)) + (hits + cells[3])\n");
         } else {
-            out.push_str("    RETURN ((acc + x) + y) + hits\n");
+            out.push_str("    RETURN ((((acc + x) + y) + hits) + cells[0]) + cells[3]\n");
         }
         writeln!(out,"  END {name};").unwrap();
         out
@@ -355,9 +398,10 @@ impl Program {
              \x20 if (r && ((r<0)!=(b<0))) --q;\n\
              \x20 return (int32_t)((int64_t)a-q*b);\n}\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
-             \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n");
+             \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
+             \x20 int32_t cells[4]={a,b,c,0};\n");
         out.push_str(&sequence(&self.body,true,2));
-        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(acc,x),y),hits);\n}\n");
+        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[3]);\n}\n");
         out.push_str(
             "extern int32_t Fuzz__Probe(int32_t,int32_t,int32_t);\n\
              extern int32_t Fuzz__Mirror(int32_t,int32_t,int32_t);\n\
@@ -425,6 +469,10 @@ mod tests {
             assert!(src.contains("Touch("));
             assert!(src.contains("flag := "));
             assert!(src.contains("Mirror*("));
+            assert!(src.contains("cells: ARRAY 4 OF INTEGER"));
+            assert!(src.contains("INC(cells["));
+            assert!(src.contains("cells[("));
+            assert!(c.contains("int32_t cells[4]={a,b,c,0};"));
         }
     }
     #[test]
@@ -447,13 +495,31 @@ mod tests {
             for helper in ["from_bits","wrap_add","wrap_sub","wrap_mul"] {
                 assert!(c.contains(&format!("static inline int32_t {helper}(")));
             }
-            assert!(c.contains("return wrap_add(wrap_add(wrap_add(acc,x),y),hits);"));
+            assert!(c.contains("return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[3]);"));
             assert!(!c.contains("return ((acc+x)+y)+hits;"));
         }
         let increment=Stmt::Update(3,Integer::Literal(i32::MAX),false);
         let decrement=Stmt::Update(3,Integer::Literal(i32::MAX),true);
         assert_eq!(increment.render(true,0),"x = wrap_add(x, 2147483647)");
         assert_eq!(decrement.render(true,0),"x = wrap_sub(x, 2147483647)");
+    }
+    #[test]
+    fn recursively_generated_array_accesses_are_bounded_and_pure() {
+        let index=Integer::ArrayRead(Box::new(Integer::Variable(0)));
+        assert_eq!(index.render(false),"cells[(a MOD 4)]");
+        assert_eq!(index.render(true),"cells[floor_mod(a, 4)]");
+        let store=Stmt::SetArray(index.clone(),Integer::Literal(i32::MIN));
+        let update=Stmt::UpdateArray(index,Integer::Literal(1),true);
+        assert!(store.render(false,0).contains("cells[(cells[(a MOD 4)] MOD 4)] :="));
+        assert!(store.render(true,0).contains("cells[floor_mod(cells[floor_mod(a, 4)], 4)] ="));
+        assert!(update.render(false,0).starts_with("DEC(cells["));
+        assert!(update.render(true,0).contains("wrap_sub("));
+        for seed in 0..128 {
+            let oberon=render(seed,"typed-source").unwrap();
+            let c=render(seed,"typed-harness").unwrap();
+            assert!(oberon.contains("cells[("));
+            assert!(c.contains("floor_mod("));
+        }
     }
     #[test]
     fn recursive_boolean_and_integer_expression_types() {
