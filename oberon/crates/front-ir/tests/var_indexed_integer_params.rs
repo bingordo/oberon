@@ -41,7 +41,7 @@ fn checked_indexed_var_actuals_carry_storage_and_source_bounds() {
         if name=="Bump" && matches!(args.as_slice(),[
             Expr::AddressOfArrayElement {array:0,index},
             Expr::ArrayElement {array:0,..}
-        ] if **index == Expr::Variable(1 + 1 + 0)))); // parameter n, local i
+        ] if index.as_ref()==&Expr::Variable(1)))); // parameter n, local i
 
     let multi=&module.functions[2];
     assert!(multi.arrays.is_empty());
