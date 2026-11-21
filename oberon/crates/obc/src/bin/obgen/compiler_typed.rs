@@ -272,10 +272,10 @@ impl Stmt {
             }
             Self::CallVar(target,delta,minus)=>{
                 if c {
-                    format!("{pad}change(&{}, {}, {})",
+                    format!("{pad}acc = change(&{}, {}, {})",
                         target.render(true),delta.render(true),minus.render(true))
                 } else {
-                    format!("{pad}Change({}, {}, {})",
+                    format!("{pad}acc := Change({}, {}, {})",
                         target.render(false),delta.render(false),minus.render(false))
                 }
             }
@@ -407,9 +407,10 @@ impl Program {
             "MODULE Fuzz;\nVAR hits: INTEGER;\n\
              \x20 PROCEDURE Touch*(n:INTEGER):INTEGER;\n\
              \x20 BEGIN INC(hits); RETURN n END Touch;\n\
-             \x20 PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN);\n\
+             \x20 PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;\n\
              \x20 BEGIN\n\
-             \x20   IF minus THEN DEC(n,delta) ELSE INC(n,delta) END\n\
+             \x20   IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;\n\
+             \x20   RETURN n\n\
              \x20 END Change;\n");
         out.push_str(&self.source_procedure("Probe",false));
         out.push_str(&self.source_procedure("Mirror",true));
@@ -452,8 +453,9 @@ impl Program {
              \x20 int64_t q=(int64_t)a / b, r=(int64_t)a % b;\n\
              \x20 if (r && ((r<0)!=(b<0))) --q;\n\
              \x20 return (int32_t)((int64_t)a-q*b);\n}\n\
-             static void change(int32_t *n,int32_t delta,int minus) {\n\
-             \x20 *n=minus ? wrap_sub(*n,delta) : wrap_add(*n,delta);\n}\n\
+             static int32_t change(int32_t *n,int32_t delta,int minus) {\n\
+             \x20 *n=minus ? wrap_sub(*n,delta) : wrap_add(*n,delta);\n\
+             \x20 return *n;\n}\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
              \x20 int32_t cells[4]={a,b,c,0};\n");
@@ -529,11 +531,11 @@ mod tests {
             assert!(src.contains("cells: ARRAY 4 OF INTEGER"));
             assert!(src.contains("INC(cells["));
             assert!(src.contains("cells[("));
-            assert!(src.contains("PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN)"));
+            assert!(src.contains("PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER"));
             assert!(src.contains("Change(acc, a, flag)"));
             assert!(src.contains("Change(cells["));
             assert!(c.contains("int32_t cells[4]={a,b,c,0};"));
-            assert!(c.contains("static void change(int32_t *n,int32_t delta,int minus)"));
+            assert!(c.contains("static int32_t change(int32_t *n,int32_t delta,int minus)"));
         }
     }
     #[test]
@@ -586,15 +588,15 @@ mod tests {
     fn var_parameter_calls_cover_scalar_and_indexed_lvalues() {
         let scalar=Stmt::CallVar(Place::Local(3),Integer::Literal(1),
             Boolean::Literal(false));
-        assert_eq!(scalar.render(false,0),"Change(x, 1, FALSE)");
-        assert_eq!(scalar.render(true,0),"change(&x, 1, 0)");
+        assert_eq!(scalar.render(false,0),"acc := Change(x, 1, FALSE)");
+        assert_eq!(scalar.render(true,0),"acc = change(&x, 1, 0)");
         let array=Stmt::CallVar(
             Place::Cell(Integer::ArrayRead(Box::new(Integer::Variable(0)))),
             Integer::Literal(-3),Boolean::Variable);
         assert_eq!(array.render(false,0),
-            "Change(cells[(cells[(a MOD 4)] MOD 4)], (-3), flag)");
+            "acc := Change(cells[(cells[(a MOD 4)] MOD 4)], (-3), flag)");
         assert_eq!(array.render(true,0),
-            "change(&cells[floor_mod(cells[floor_mod(a, 4)], 4)], (-3), flag)");
+            "acc = change(&cells[floor_mod(cells[floor_mod(a, 4)], 4)], (-3), flag)");
         for seed in 0..128 {
             let p=Program::generate(seed);
             let src=p.source(&inputs(seed),false);
