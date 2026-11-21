@@ -207,6 +207,9 @@ enum Stmt {
     /// Native VAR INTEGER formals currently admit direct scalar lvalues only.
     /// The INTEGER value argument can contain recursively generated array reads.
     CallVar(usize,Integer,Boolean),
+    /// Mutate a checked BOOLEAN lvalue through VAR, with a recursively
+    /// generated short-circuit BOOLEAN value argument.
+    CallVarBoolean(Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
     /// automatic increment. Nested loops are not generated.
@@ -254,6 +257,13 @@ impl Stmt {
                         delta.render(false),minus.render(false))
                 }
             }
+            Self::CallVarBoolean(guard)=>{
+                if c {
+                    format!("{pad}flag = flip_flag(&flag, {})",guard.render(true))
+                } else {
+                    format!("{pad}flag := FlipFlag(flag, {})",guard.render(false))
+                }
+            }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
@@ -283,6 +293,7 @@ impl Stmt {
             Self::SetArray(index,value)|Self::UpdateArray(index,value,_)=>
                 1+index.nodes()+value.nodes(),
             Self::CallVar(_,delta,minus)=>1+delta.nodes()+minus.nodes(),
+            Self::CallVarBoolean(guard)=>1+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
             Self::Repeat(_,body)=>1+body.iter().map(Self::nodes).sum::<usize>(),
@@ -294,7 +305,7 @@ fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
     stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(sep)
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(6)} else {r.below(11)};
+    let choice=if depth==0 {r.below(7)} else {r.below(12)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
@@ -302,7 +313,8 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
         3=>Stmt::SetArray(integer(r,2),integer(r,3)),
         4=>Stmt::UpdateArray(integer(r,2),integer(r,2),r.below(2)==0),
         5|6=>Stmt::CallVar(3+r.below(3),integer(r,2),boolean(r,2)),
-        7|8=>Stmt::If(boolean(r,3),
+        7=>Stmt::CallVarBoolean(boolean(r,3)),
+        8|9=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -346,6 +358,13 @@ impl Program {
                     Box::new(Boolean::TouchCompare(Rel::Ne,
                         Box::new(Integer::Variable(2)),
                         Box::new(Integer::Literal(0)))))),
+            // A mandatory VAR BOOLEAN mutation with a side-effectful
+            // short-circuit guard, including a possible skipped Touch.
+            Stmt::CallVarBoolean(Boolean::Or(
+                Box::new(Boolean::Variable),
+                Box::new(Boolean::TouchCompare(Rel::Ne,
+                    Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Literal(0)))))),
             // Guarantee a use of the BOOLEAN local so both languages must
             // preserve its value, and C -Werror never rejects an unused flag.
             Stmt::If(Boolean::Variable,
@@ -384,7 +403,12 @@ impl Program {
              \x20 BEGIN\n\
              \x20   IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;\n\
              \x20   RETURN n\n\
-             \x20 END Change;\n");
+             \x20 END Change;\n\
+             \x20 PROCEDURE FlipFlag(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;\n\
+             \x20 BEGIN\n\
+             \x20   IF guard THEN b := ~b END;\n\
+             \x20   RETURN b\n\
+             \x20 END FlipFlag;\n");
         out.push_str(&self.source_procedure("Probe",false));
         out.push_str(&self.source_procedure("Mirror",true));
         if checks {
@@ -429,6 +453,9 @@ impl Program {
              static int32_t change(int32_t *n,int32_t delta,int minus) {\n\
              \x20 *n=minus ? wrap_sub(*n,delta) : wrap_add(*n,delta);\n\
              \x20 return *n;\n}\n\
+             static int flip_flag(int *b,int guard) {\n\
+             \x20 if (guard) *b=!*b;\n\
+             \x20 return *b;\n}\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
              \x20 int32_t cells[4]={a,b,c,0};\n");
@@ -507,6 +534,9 @@ mod tests {
             assert!(src.contains("PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER"));
             assert!(src.contains("Change(acc, a, flag)"));
             assert!(src.contains("Change(x, cells["));
+            assert!(src.contains("PROCEDURE FlipFlag(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN"));
+            assert!(src.contains("flag := FlipFlag(flag, "));
+            assert!(c.contains("flip_flag(&flag, "));
             assert!(c.contains("int32_t cells[4]={a,b,c,0};"));
             assert!(c.contains("static int32_t change(int32_t *n,int32_t delta,int minus)"));
         }
@@ -580,6 +610,27 @@ mod tests {
             assert!(src.contains("Change(x, cells["));
             assert!(c.contains("change(&acc, a, flag)"));
             assert!(c.contains("change(&x, cells["));
+        }
+    }
+    #[test]
+    fn generated_var_boolean_mutation_preserves_short_circuit_effects() {
+        let guard=Boolean::Or(
+            Box::new(Boolean::Variable),
+            Box::new(Boolean::TouchCompare(Rel::Eq,
+                Box::new(Integer::Variable(0)),
+                Box::new(Integer::Literal(0)))));
+        let call=Stmt::CallVarBoolean(guard);
+        assert_eq!(call.render(false,0),
+            "flag := FlipFlag(flag, (flag OR (Touch(a) = 0)))");
+        assert_eq!(call.render(true,0),
+            "flag = flip_flag(&flag, (flag || (touch(a) == 0)))");
+        for seed in 0..128 {
+            let source=render(seed,"typed-source").unwrap();
+            let oracle=render(seed,"typed-harness").unwrap();
+            assert!(source.contains("PROCEDURE FlipFlag(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN"));
+            assert!(source.contains("flag := FlipFlag(flag, "));
+            assert!(oracle.contains("static int flip_flag(int *b,int guard)"));
+            assert!(oracle.contains("flag = flip_flag(&flag, "));
         }
     }
     #[test]
