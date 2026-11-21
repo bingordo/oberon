@@ -277,6 +277,11 @@ impl Program {
                         Box::new(Integer::Literal(0)))),
                     Box::new(boolean(&mut r,2)))))),
             Stmt::Repeat(1+r.below(3),vec![statement(&mut r,2,false)]),
+            // Guarantee a use of the BOOLEAN local so both languages must
+            // preserve its value, and C -Werror never rejects an unused flag.
+            Stmt::If(Boolean::Variable,
+                vec![Stmt::Update(5,Integer::Literal(1),false)],
+                vec![Stmt::Update(5,Integer::Literal(1),true)]),
         ];
         for _ in 0..5+r.below(6) {body.push(statement(&mut r,3,true));}
         Self{body}
