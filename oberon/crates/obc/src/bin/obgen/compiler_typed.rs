@@ -364,7 +364,7 @@ impl Program {
                 Box::new(Boolean::Variable),
                 Box::new(Boolean::TouchCompare(Rel::Ne,
                     Box::new(Integer::Variable(0)),
-                    Box::new(Integer::Literal(0))))),
+                    Box::new(Integer::Literal(0)))))),
             // Guarantee a use of the BOOLEAN local so both languages must
             // preserve its value, and C -Werror never rejects an unused flag.
             Stmt::If(Boolean::Variable,
