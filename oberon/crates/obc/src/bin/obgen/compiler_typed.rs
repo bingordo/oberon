@@ -17,9 +17,11 @@ impl IOp {
         match self {Self::Add=>"+",Self::Sub=>"-",Self::Mul=>"*",
             Self::Div=>"DIV",Self::Mod=>"MOD"}
     }
-    fn c(self)->&'static str {
-        match self {Self::Add=>"+",Self::Sub=>"-",Self::Mul=>"*",
-            Self::Div=>"floor_div",Self::Mod=>"floor_mod"}
+    fn c_helper(self)->&'static str {
+        match self {
+            Self::Add=>"wrap_add",Self::Sub=>"wrap_sub",Self::Mul=>"wrap_mul",
+            Self::Div=>"floor_div",Self::Mod=>"floor_mod",
+        }
     }
 }
 #[derive(Clone,Copy,Debug)]
@@ -77,10 +79,11 @@ impl Integer {
             Self::Literal(n)=>literal(*n),
             Self::Binary(op,a,b)=>{
                 let (a,b)=(a.render(c),b.render(c));
-                if c && matches!(op,IOp::Div|IOp::Mod) {
-                    format!("{}({a}, {b})",op.c())
+                if c {
+                    // Do not rely on the C compiler's signed-overflow policy.
+                    format!("{}({a}, {b})",op.c_helper())
                 } else {
-                    format!("({a} {} {b})",if c {op.c()} else {op.oberon()})
+                    format!("({a} {} {b})",op.oberon())
                 }
             }
         }
@@ -199,7 +202,8 @@ impl Stmt {
             Self::Update(slot,e,dec)=>{
                 let name=INT_NAMES[*slot];
                 if c {
-                    format!("{pad}{name} {} {}",if *dec {"-="} else {"+="},e.render(true))
+                    format!("{pad}{name} = {}({name}, {})",
+                        if *dec {"wrap_sub"} else {"wrap_add"},e.render(true))
                 } else {
                     format!("{pad}{}({name}, {})",
                         if *dec {"DEC"} else {"INC"},e.render(false))
@@ -327,6 +331,20 @@ impl Program {
         let mut out=String::from(
             "#include <stdint.h>\n#include <stdio.h>\n\
              static int32_t hits;\n\
+             /* Explicit mod-2^32 operations are defined even under -O2
+                and without -fwrapv. Convert unsigned bits to signed via
+                an in-range int64_t intermediate (no implementation-defined
+                narrowing of out-of-range uint32_t values). */\n\
+             static inline int32_t from_bits(uint32_t bits) {\n\
+             \x20 int64_t signed_value=(int64_t)bits;\n\
+             \x20 if (signed_value > INT32_MAX) signed_value -= 4294967296LL;\n\
+             \x20 return (int32_t)signed_value;\n}\n\
+             static inline int32_t wrap_add(int32_t a,int32_t b) {\n\
+             \x20 return from_bits((uint32_t)a + (uint32_t)b);\n}\n\
+             static inline int32_t wrap_sub(int32_t a,int32_t b) {\n\
+             \x20 return from_bits((uint32_t)a - (uint32_t)b);\n}\n\
+             static inline int32_t wrap_mul(int32_t a,int32_t b) {\n\
+             \x20 return from_bits((uint32_t)a * (uint32_t)b);\n}\n\
              static int32_t touch(int32_t x) { hits++; return x; }\n\
              static int32_t floor_div(int32_t a,int32_t b) {\n\
              \x20 int64_t q=(int64_t)a / b, r=(int64_t)a % b;\n\
@@ -339,7 +357,7 @@ impl Program {
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n");
         out.push_str(&sequence(&self.body,true,2));
-        out.push_str(";\n  return ((acc+x)+y)+hits;\n}\n");
+        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(acc,x),y),hits);\n}\n");
         out.push_str(
             "extern int32_t Fuzz__Probe(int32_t,int32_t,int32_t);\n\
              extern int32_t Fuzz__Mirror(int32_t,int32_t,int32_t);\n\
@@ -408,6 +426,34 @@ mod tests {
             assert!(src.contains("flag := "));
             assert!(src.contains("Mirror*("));
         }
+    }
+    #[test]
+    fn c_oracle_arithmetic_has_defined_32_bit_wrapping() {
+        // These exact expressions must not become signed C operators:
+        // test inputs deliberately include MIN/MAX and overflow.
+        for (op,helper) in [
+            (IOp::Add,"wrap_add"),(IOp::Sub,"wrap_sub"),
+            (IOp::Mul,"wrap_mul"),(IOp::Div,"floor_div"),
+            (IOp::Mod,"floor_mod"),
+        ] {
+            let expr=Integer::Binary(op,Box::new(Integer::Variable(0)),
+                Box::new(Integer::Variable(1)));
+            assert_eq!(expr.render(true),format!("{helper}(a, b)"));
+            assert_eq!(expr.render(false),
+                format!("(a {} b)",op.oberon()));
+        }
+        for seed in [0,1,3,7,99,2026] {
+            let c=render(seed,"typed-harness").unwrap();
+            for helper in ["from_bits","wrap_add","wrap_sub","wrap_mul"] {
+                assert!(c.contains(&format!("static inline int32_t {helper}(")));
+            }
+            assert!(c.contains("return wrap_add(wrap_add(wrap_add(acc,x),y),hits);"));
+            assert!(!c.contains("return ((acc+x)+y)+hits;"));
+        }
+        let increment=Stmt::Update(3,Integer::Literal(i32::MAX),false);
+        let decrement=Stmt::Update(3,Integer::Literal(i32::MAX),true);
+        assert_eq!(increment.render(true,0),"x = wrap_add(x, 2147483647)");
+        assert_eq!(decrement.render(true,0),"x = wrap_sub(x, 2147483647)");
     }
     #[test]
     fn recursive_boolean_and_integer_expression_types() {
