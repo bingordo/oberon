@@ -216,6 +216,8 @@ enum Stmt {
     CallVar(usize,Integer,Boolean),
     /// Mutate a checked BOOLEAN lvalue through VAR, with a recursively
     /// generated short-circuit BOOLEAN value argument.
+    CallVarIndexed(Integer,Integer,Boolean),
+    CallVarAlias(usize,usize,Integer),
     CallVarBoolean(Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
@@ -224,6 +226,9 @@ enum Stmt {
 }
 impl Stmt {
     fn render(&self,c:bool,indent:usize)->String {
+        self.render_with_link(c,indent,false)
+    }
+    fn render_with_link(&self,c:bool,indent:usize,imported:bool)->String {
         let pad=" ".repeat(indent);
         match self {
             Self::SetInteger(slot,e)=>format!("{pad}{} {} {}",
@@ -260,35 +265,58 @@ impl Stmt {
                     format!("{pad}acc = change(&{target}, {}, {})",
                         delta.render(true),minus.render(true))
                 } else {
-                    format!("{pad}acc := Change({target}, {}, {})",
+                    let callee=if imported {"Ops.Change"} else {"Change"};
+                    format!("{pad}acc := {callee}({target}, {}, {})",
                         delta.render(false),minus.render(false))
+                }
+            }
+            Self::CallVarIndexed(index,delta,minus)=>{
+                let target=format!("cells[{}]",array_index(index,c));
+                if c {
+                    format!("{pad}acc = change(&{target}, {}, {})",
+                        delta.render(true),minus.render(true))
+                } else {
+                    let callee=if imported {"Ops.Change"} else {"Change"};
+                    format!("{pad}acc := {callee}({target}, {}, {})",
+                        delta.render(false),minus.render(false))
+                }
+            }
+            Self::CallVarAlias(left,right,delta)=>{
+                let left=INT_NAMES[*left];
+                let right=INT_NAMES[*right];
+                if c {
+                    format!("{pad}acc = twist(&{left}, &{right}, {})",delta.render(true))
+                } else {
+                    let callee=if imported {"Ops.Twist"} else {"Twist"};
+                    format!("{pad}acc := {callee}({left}, {right}, {})",delta.render(false))
                 }
             }
             Self::CallVarBoolean(guard)=>{
                 if c {
                     format!("{pad}flag = flip_flag(&flag, {})",guard.render(true))
                 } else {
-                    format!("{pad}flag := FlipFlag(flag, {})",guard.render(false))
+                    let callee=if imported {"Ops.FlipFlag"} else {"FlipFlag"};
+                    format!("{pad}flag := {callee}(flag, {})",guard.render(false))
                 }
             }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
-                        cond.render(true),sequence(a,true,indent+2),
-                        sequence(b,true,indent+2))
+                        cond.render(true),sequence_with_link(a,true,indent+2,imported),
+                        sequence_with_link(b,true,indent+2,imported))
                 } else {
                     format!("{pad}IF {} THEN\n{}\n{pad}ELSE\n{}\n{pad}END",
-                        cond.render(false),sequence(a,false,indent+2),
-                        sequence(b,false,indent+2))
+                        cond.render(false),sequence_with_link(a,false,indent+2,imported),
+                        sequence_with_link(b,false,indent+2,imported))
                 }
             }
             Self::Repeat(n,body)=>{
                 if c {
                     format!("{pad}k = 0;\n{pad}do {{\n{};\n{pad}  k++;\n{pad}}} while (k < {n})",
-                        sequence(body,true,indent+2))
+                        sequence_with_link(body,true,indent+2,imported))
                 } else {
                     format!("{pad}k := 0;\n{pad}REPEAT\n{};\n{pad}  INC(k)\n{pad}UNTIL k >= {n}",
-                        sequence(body,false,indent+2))
+                        sequence_with_link(body,false,indent+2,imported))
                 }
             }
         }
@@ -301,6 +329,9 @@ impl Stmt {
             Self::SetArray(index,value)|Self::UpdateArray(index,value,_)=>
                 1+index.nodes()+value.nodes(),
             Self::CallVar(_,delta,minus)=>1+delta.nodes()+minus.nodes(),
+            Self::CallVarIndexed(index,delta,minus)=>
+                1+index.nodes()+delta.nodes()+minus.nodes(),
+            Self::CallVarAlias(_,_,delta)=>1+delta.nodes(),
             Self::CallVarBoolean(guard)=>1+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
@@ -311,8 +342,13 @@ impl Stmt {
 fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
     stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(";\n")
 }
+fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,imported:bool)->String {
+    if !imported { return sequence(stmts,c,indent); }
+    stmts.iter().map(|s|s.render_with_link(c,indent,imported))
+        .collect::<Vec<_>>().join(";\n")
+}
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(7)} else {r.below(12)};
+    let choice=if depth==0 {r.below(10)} else {r.below(15)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
@@ -321,7 +357,9 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
         4=>Stmt::UpdateArray(integer(r,2),integer(r,2),r.below(2)==0),
         5|6=>Stmt::CallVar(3+r.below(3),integer(r,2),boolean(r,2)),
         7=>Stmt::CallVarBoolean(boolean(r,3)),
-        8|9=>Stmt::If(boolean(r,3),
+        8=>Stmt::CallVarIndexed(integer(r,2),integer(r,2),boolean(r,2)),
+        9=>Stmt::CallVarAlias(3+r.below(3),3+r.below(3),integer(r,2)),
+        10|11=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -365,6 +403,11 @@ impl Program {
                     Box::new(Boolean::TouchCompare(Rel::Ne,
                         Box::new(Integer::Variable(2)),
                         Box::new(Integer::Literal(0)))))),
+            // Required indexed VAR and both aliased and distinct VAR pairs.
+            Stmt::CallVarIndexed(Integer::Variable(0),
+                Integer::Variable(1),Boolean::Variable),
+            Stmt::CallVarAlias(3,3,Integer::Variable(2)),
+            Stmt::CallVarAlias(3,4,Integer::Literal(1)),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -381,7 +424,7 @@ impl Program {
         for _ in 0..5+r.below(6) {body.push(statement(&mut r,3,true));}
         Self{body}
     }
-    fn source_procedure(&self,name:&str,mirror:bool)->String {
+    fn source_procedure(&self,name:&str,mirror:bool,imported:bool)->String {
         let mut out=format!(
             "  PROCEDURE {name}*(a,b,c: INTEGER): INTEGER;\n\
              \x20 VAR x,y,acc,k: INTEGER; flag: BOOLEAN;\n\
@@ -390,7 +433,7 @@ impl Program {
              \x20   hits := 0;\n\
              \x20   x := a; y := b; acc := c; flag := FALSE;\n\
              \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n");
-        out.push_str(&sequence(&self.body,false,4));
+        out.push_str(&sequence_with_link(&self.body,false,4,imported));
         out.push_str(";\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
@@ -402,22 +445,34 @@ impl Program {
         out
     }
     fn source(&self,cases:&[(i32,i32,i32)],checks:bool)->String {
-        let mut out=String::from(
-            "MODULE Fuzz;\nVAR hits: INTEGER;\n\
-             \x20 PROCEDURE Touch*(n:INTEGER):INTEGER;\n\
-             \x20 BEGIN INC(hits); RETURN n END Touch;\n\
-             \x20 PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;\n\
-             \x20 BEGIN\n\
-             \x20   IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;\n\
-             \x20   RETURN n\n\
-             \x20 END Change;\n\
-             \x20 PROCEDURE FlipFlag(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;\n\
-             \x20 BEGIN\n\
-             \x20   IF guard THEN b := ~b END;\n\
-             \x20   RETURN b\n\
-             \x20 END FlipFlag;\n");
-        out.push_str(&self.source_procedure("Probe",false));
-        out.push_str(&self.source_procedure("Mirror",true));
+        self.source_mode(cases,checks,false)
+    }
+    fn source_mode(&self,cases:&[(i32,i32,i32)],checks:bool,imported:bool)->String {
+        let mut out=String::from("MODULE Fuzz;\n");
+        if imported { out.push_str("IMPORT Ops := FuzzOps;\n"); }
+        out.push_str(r#"VAR hits: INTEGER;
+  PROCEDURE Touch*(n:INTEGER):INTEGER;
+  BEGIN INC(hits); RETURN n END Touch;
+"#);
+        if !imported {
+            out.push_str(r#"  PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
+  BEGIN
+    IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
+    RETURN n
+  END Change;
+  PROCEDURE FlipFlag(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
+  BEGIN
+    IF guard THEN b := ~b END;
+    RETURN b
+  END FlipFlag;
+  PROCEDURE Twist(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
+  BEGIN
+    INC(left,delta); DEC(right,delta); RETURN left
+  END Twist;
+"#);
+        }
+        out.push_str(&self.source_procedure("Probe",false,imported));
+        out.push_str(&self.source_procedure("Mirror",true,imported));
         if checks {
             out.push_str("BEGIN\n");
             for &(a,b,c) in cases {
@@ -429,6 +484,25 @@ impl Program {
         }
         out.push_str("END Fuzz.\n");
         out
+    }
+    fn provider()->String {
+        String::from(r#"MODULE FuzzOps;
+  PROCEDURE Change*(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
+  BEGIN
+    IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
+    RETURN n
+  END Change;
+  PROCEDURE FlipFlag*(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
+  BEGIN
+    IF guard THEN b := ~b END;
+    RETURN b
+  END FlipFlag;
+  PROCEDURE Twist*(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
+  BEGIN
+    INC(left,delta); DEC(right,delta); RETURN left
+  END Twist;
+END FuzzOps.
+"#)
     }
     fn c_reference(&self,cases:&[(i32,i32,i32)],seed:u64)->String {
         let mut out=String::from(
@@ -463,6 +537,11 @@ impl Program {
              static int flip_flag(int *b,int guard) {\n\
              \x20 if (guard) *b=!*b;\n\
              \x20 return *b;\n}\n\
+             static int32_t twist(int32_t *left,int32_t *right,int32_t delta) {\n\
+             \x20 *left=wrap_add(*left,delta);\n\
+             \x20 *right=wrap_sub(*right,delta);\n\
+             \x20 return *left;\n\
+}\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
              \x20 int32_t cells[4]={a,b,c,0};\n");
@@ -509,7 +588,10 @@ pub(super) fn render(seed:u64,mode:&str)->Result<String,String> {
     match mode {
         "typed-source"=>Ok(program.source(&cases,false)),
         "typed-selfcheck"=>Ok(program.source(&cases,true)),
-        "typed-harness"=>Ok(program.c_reference(&cases,seed)),
+        "typed-harness"|"typed-import-harness"=>Ok(program.c_reference(&cases,seed)),
+        "typed-import-provider"=>Ok(Program::provider()),
+        "typed-import-source"=>Ok(program.source_mode(&cases,false,true)),
+        "typed-import-selfcheck"=>Ok(program.source_mode(&cases,true,true)),
         _=>Err(format!("unknown typed compiler subset mode {mode}")),
     }
 }
@@ -638,6 +720,42 @@ mod tests {
             assert!(source.contains("flag := FlipFlag(flag, "));
             assert!(oracle.contains("static int flip_flag(int *b,int guard)"));
             assert!(oracle.contains("flag = flip_flag(&flag, "));
+        }
+    }
+    #[test]
+    fn imported_var_calls_cover_aliasing_indexed_lvalues_and_boolean() {
+        let provider=render(3,"typed-import-provider").unwrap();
+        assert!(provider.starts_with("MODULE FuzzOps;"));
+        assert!(provider.contains("PROCEDURE Change*(VAR n: INTEGER"));
+        assert!(provider.contains("PROCEDURE FlipFlag*(VAR b: BOOLEAN"));
+        assert!(provider.contains("PROCEDURE Twist*(VAR left,right: INTEGER"));
+        assert_eq!(provider,render(999,"typed-import-provider").unwrap());
+        let indexed=Stmt::CallVarIndexed(Integer::Variable(0),
+            Integer::Variable(1),Boolean::Variable);
+        assert_eq!(indexed.render_with_link(false,0,true),
+            "acc := Ops.Change(cells[(a MOD 4)], b, flag)");
+        assert_eq!(indexed.render(true,0),
+            "acc = change(&cells[floor_mod(a, 4)], b, flag)");
+        let alias=Stmt::CallVarAlias(3,3,Integer::Variable(2));
+        assert_eq!(alias.render_with_link(false,0,true),"acc := Ops.Twist(x, x, c)");
+        assert_eq!(alias.render(true,0),"acc = twist(&x, &x, c)");
+        for seed in 0..128 {
+            let src=render(seed,"typed-import-source").unwrap();
+            let selfcheck=render(seed,"typed-import-selfcheck").unwrap();
+            let oracle=render(seed,"typed-import-harness").unwrap();
+            assert!(src.starts_with("MODULE Fuzz;\nIMPORT Ops := FuzzOps;"));
+            assert!(!src.contains("  PROCEDURE Change("));
+            assert!(src.contains("Ops.Change(acc, a, flag)"));
+            assert!(src.contains("Ops.Change(cells[(a MOD 4)], b, flag)"));
+            assert!(src.contains("Ops.Twist(x, x, c)"));
+            assert!(src.contains("Ops.Twist(x, y, 1)"));
+            assert!(src.contains("Ops.FlipFlag(flag, "));
+            assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
+            assert!(selfcheck.starts_with(src.trim_end_matches("END Fuzz.\n")));
+            assert!(oracle.contains("twist(&x, &x, c)"));
+            assert!(oracle.contains("change(&cells[floor_mod(a, 4)], b, flag)"));
+            assert_eq!(oracle,render(seed,"typed-harness").unwrap());
+            assert_eq!(src,render(seed,"typed-import-source").unwrap());
         }
     }
     #[test]
