@@ -227,12 +227,31 @@ fn place(r:&mut Rng,depth:usize)->Place {
     if r.below(3)==0 {Place::Scalar(3+r.below(3))}
     else {Place::Indexed(Box::new(integer(r,depth)))}
 }
-/// Generate a pair of VAR actuals, sometimes identical, to exercise aliasing
-/// without relying on evaluation order of effectful subexpressions.
+/// Adding/subtracting a multiple of the array length leaves a wrapped 32-bit
+/// index in the same congruence class. Since ARRAY_LEN divides 2^32,
+/// even signed MIN/MAX wraparound preserves the final bounded array element.
+fn equivalent_index(index:Integer,r:&mut Rng)->Integer {
+    let offset=ARRAY_LEN as i32*(1+r.below(4) as i32);
+    Integer::Binary(
+        if r.below(2)==0 {IOp::Add} else {IOp::Sub},
+        Box::new(index),Box::new(Integer::Literal(offset)))
+}
+/// Generate distinct places, identical ASTs, and different address
+/// expressions guaranteed to alias. Index terms are pure: all actual
+/// addresses/values can be evaluated before any callee mutation.
 fn var_pair(r:&mut Rng)->(Place,Place) {
-    let left=place(r,2);
-    let right=if r.below(3)==0 {left.clone()} else {place(r,2)};
-    (left,right)
+    match r.below(4) {
+        0=>{
+            let left=place(r,2);
+            (left.clone(),left)
+        },
+        1=>{
+            let index=integer(r,2);
+            let alias=equivalent_index(index.clone(),r);
+            (Place::Indexed(Box::new(index)),Place::Indexed(Box::new(alias)))
+        },
+        _=>(place(r,2),place(r,2)),
+    }
 }
 #[derive(Clone,Debug)]
 enum Stmt {
@@ -447,6 +466,24 @@ impl Program {
                 Place::Indexed(Box::new(Integer::ArrayRead(
                     Box::new(Integer::Variable(0))))),
                 Integer::Variable(2)),
+            // Distinct source expressions resolve to the same VAR address
+            // modulo four, including 32-bit MIN/MAX wrapping. The delta
+            // reads an aliased element before the callee changes it.
+            Stmt::CallVarAlias(
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Place::Indexed(Box::new(Integer::Binary(IOp::Add,
+                    Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Literal(ARRAY_LEN as i32))))),
+                Integer::ArrayRead(Box::new(Integer::Variable(0)))),
+            // Nested index reads also alias even with an offset expression.
+            Stmt::CallVarAlias(
+                Place::Indexed(Box::new(Integer::ArrayRead(
+                    Box::new(Integer::Variable(1))))),
+                Place::Indexed(Box::new(Integer::Binary(IOp::Sub,
+                    Box::new(Integer::ArrayRead(
+                        Box::new(Integer::Variable(1)))),
+                    Box::new(Integer::Literal(ARRAY_LEN as i32))))),
+                Integer::Literal(3)),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -793,15 +830,50 @@ mod tests {
             assert!(src.contains("Ops.Twist(cells[(a MOD 4)], cells[(a MOD 4)], 7)"));
             assert!(src.contains("Ops.Twist(cells[(0 MOD 4)], cells[(3 MOD 4)], (-1))"));
             assert!(src.contains("Ops.Twist(y, cells[(cells[(a MOD 4)] MOD 4)], c)"));
+            assert!(src.contains("Ops.Twist(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
+            assert!(src.contains("Ops.Twist(cells[(cells[(b MOD 4)] MOD 4)], cells[((cells[(b MOD 4)] - 4) MOD 4)], 3)"));
             assert!(src.contains("Ops.FlipFlag(flag, "));
             assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
             assert!(selfcheck.starts_with(src.trim_end_matches("END Fuzz.\n")));
             assert!(oracle.contains("twist(&x, &x, c)"));
             assert!(oracle.contains("twist(&cells[floor_mod(a, 4)], &cells[floor_mod(a, 4)], 7)"));
             assert!(oracle.contains("twist(&cells[floor_mod(0, 4)], &cells[floor_mod(3, 4)], (-1))"));
+            assert!(oracle.contains("twist(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
+            assert!(oracle.contains("twist(&cells[floor_mod(cells[floor_mod(b, 4)], 4)], &cells[floor_mod(wrap_sub(cells[floor_mod(b, 4)], 4), 4)], 3)"));
             assert!(oracle.contains("change(&cells[floor_mod(a, 4)], b, flag)"));
             assert_eq!(oracle,render(seed,"typed-harness").unwrap());
             assert_eq!(src,render(seed,"typed-import-source").unwrap());
+        }
+    }
+    #[test]
+    fn distinct_equivalent_indices_alias_even_across_signed_wraparound() {
+        // This checks the generator's congruence rule, not interpreter-
+        // derived expected program outputs. Program results still come from
+        // the separately compiled C oracle.
+        for n in [
+            i32::MIN,i32::MIN+1,-999,-7,-1,0,1,3,4,999,i32::MAX-1,i32::MAX
+        ] {
+            for multiple in 1..=4i32 {
+                let offset=ARRAY_LEN as i32*multiple;
+                assert_eq!(n.rem_euclid(ARRAY_LEN as i32),
+                    n.wrapping_add(offset).rem_euclid(ARRAY_LEN as i32));
+                assert_eq!(n.rem_euclid(ARRAY_LEN as i32),
+                    n.wrapping_sub(offset).rem_euclid(ARRAY_LEN as i32));
+            }
+        }
+        let left=Integer::Variable(0);
+        let mut rng=Rng::new(9);
+        for _ in 0..32 {
+            let right=equivalent_index(left.clone(),&mut rng);
+            assert_ne!(left.render(false),right.render(false));
+            assert!(right.render(false).contains(" + ") ||
+                right.render(false).contains(" - "));
+        }
+        for seed in 0..128 {
+            let src=render(seed,"typed-import-source").unwrap();
+            let c=render(seed,"typed-import-harness").unwrap();
+            assert!(src.contains("Ops.Twist(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
+            assert!(c.contains("twist(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
         }
     }
     #[test]

@@ -59,7 +59,10 @@ and aliased and distinct `VAR` formals. The common type-directed `Place` AST
 handles both scalar and bounded indexed INTEGER lvalues, including recursively
 indexed array elements. Each generated seed covers same-address array aliasing,
 distinct array elements, and mixed scalar/array VAR pairs, in addition to
-scalar aliases; generated indices are pure to avoid unspecified argument
+scalar aliases. The generator now also tests distinct index ASTs that
+are guaranteed to select the same element (such as `a` versus `a + 4`
+modulo a four-element array), including nested reads and MIN/MAX 32-bit
+wraparound. Generated indices are pure to avoid unspecified argument
 side-effect evaluation order in the independent C oracle.
 
 The `typed-import-*` modes use the **same seed and AST** but move the
