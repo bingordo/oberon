@@ -204,6 +204,36 @@ fn boolean(r:&mut Rng,depth:usize)->Boolean {
     }
 }
 
+/// An assignable checked INTEGER place. Indexed addresses are bounded and
+/// side-effect free so multiple VAR actuals can be evaluated before mutation.
+#[derive(Clone,Debug)]
+enum Place {
+    Scalar(usize),
+    Indexed(Box<Integer>),
+}
+impl Place {
+    fn render(&self,c:bool)->String {
+        match self {
+            Self::Scalar(slot)=>INT_NAMES[*slot].to_string(),
+            Self::Indexed(index)=>format!("cells[{}]",array_index(index,c)),
+        }
+    }
+    #[cfg(test)]
+    fn nodes(&self)->usize {
+        match self {Self::Scalar(_)=>1,Self::Indexed(index)=>1+index.nodes()}
+    }
+}
+fn place(r:&mut Rng,depth:usize)->Place {
+    if r.below(3)==0 {Place::Scalar(3+r.below(3))}
+    else {Place::Indexed(Box::new(integer(r,depth)))}
+}
+/// Generate a pair of VAR actuals, sometimes identical, to exercise aliasing
+/// without relying on evaluation order of effectful subexpressions.
+fn var_pair(r:&mut Rng)->(Place,Place) {
+    let left=place(r,2);
+    let right=if r.below(3)==0 {left.clone()} else {place(r,2)};
+    (left,right)
+}
 #[derive(Clone,Debug)]
 enum Stmt {
     SetInteger(usize,Integer),
@@ -211,13 +241,11 @@ enum Stmt {
     Update(usize,Integer,bool),
     SetArray(Integer,Integer),
     UpdateArray(Integer,Integer,bool),
-    /// Native VAR INTEGER formals currently admit direct scalar lvalues only.
-    /// The INTEGER value argument can contain recursively generated array reads.
-    CallVar(usize,Integer,Boolean),
-    /// Mutate a checked BOOLEAN lvalue through VAR, with a recursively
-    /// generated short-circuit BOOLEAN value argument.
-    CallVarIndexed(Integer,Integer,Boolean),
-    CallVarAlias(usize,usize,Integer),
+    /// Scalar or bounded indexed actual; the value arguments can read arrays.
+    CallVar(Place,Integer,Boolean),
+    /// Two independently addressable actuals, deliberately sometimes aliased.
+    CallVarAlias(Place,Place,Integer),
+    /// Mutate a checked BOOLEAN lvalue with a short-circuit guard.
     CallVarBoolean(Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
@@ -259,19 +287,8 @@ impl Stmt {
                         if *dec {"DEC"} else {"INC"},delta.render(false))
                 }
             }
-            Self::CallVar(slot,delta,minus)=>{
-                let target=INT_NAMES[*slot];
-                if c {
-                    format!("{pad}acc = change(&{target}, {}, {})",
-                        delta.render(true),minus.render(true))
-                } else {
-                    let callee=if imported {"Ops.Change"} else {"Change"};
-                    format!("{pad}acc := {callee}({target}, {}, {})",
-                        delta.render(false),minus.render(false))
-                }
-            }
-            Self::CallVarIndexed(index,delta,minus)=>{
-                let target=format!("cells[{}]",array_index(index,c));
+            Self::CallVar(target,delta,minus)=>{
+                let target=target.render(c);
                 if c {
                     format!("{pad}acc = change(&{target}, {}, {})",
                         delta.render(true),minus.render(true))
@@ -282,8 +299,8 @@ impl Stmt {
                 }
             }
             Self::CallVarAlias(left,right,delta)=>{
-                let left=INT_NAMES[*left];
-                let right=INT_NAMES[*right];
+                let left=left.render(c);
+                let right=right.render(c);
                 if c {
                     format!("{pad}acc = twist(&{left}, &{right}, {})",delta.render(true))
                 } else {
@@ -328,10 +345,10 @@ impl Stmt {
             Self::SetBoolean(b)=>1+b.nodes(),
             Self::SetArray(index,value)|Self::UpdateArray(index,value,_)=>
                 1+index.nodes()+value.nodes(),
-            Self::CallVar(_,delta,minus)=>1+delta.nodes()+minus.nodes(),
-            Self::CallVarIndexed(index,delta,minus)=>
-                1+index.nodes()+delta.nodes()+minus.nodes(),
-            Self::CallVarAlias(_,_,delta)=>1+delta.nodes(),
+            Self::CallVar(target,delta,minus)=>
+                1+target.nodes()+delta.nodes()+minus.nodes(),
+            Self::CallVarAlias(left,right,delta)=>
+                1+left.nodes()+right.nodes()+delta.nodes(),
             Self::CallVarBoolean(guard)=>1+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
@@ -355,10 +372,14 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
         2=>Stmt::Update(3+r.below(3),integer(r,2),r.below(2)==0),
         3=>Stmt::SetArray(integer(r,2),integer(r,3)),
         4=>Stmt::UpdateArray(integer(r,2),integer(r,2),r.below(2)==0),
-        5|6=>Stmt::CallVar(3+r.below(3),integer(r,2),boolean(r,2)),
+        5|6=>Stmt::CallVar(place(r,2),integer(r,2),boolean(r,2)),
         7=>Stmt::CallVarBoolean(boolean(r,3)),
-        8=>Stmt::CallVarIndexed(integer(r,2),integer(r,2),boolean(r,2)),
-        9=>Stmt::CallVarAlias(3+r.below(3),3+r.below(3),integer(r,2)),
+        8=>Stmt::CallVar(Place::Indexed(Box::new(integer(r,2))),
+            integer(r,2),boolean(r,2)),
+        9=>{
+            let (left,right)=var_pair(r);
+            Stmt::CallVarAlias(left,right,integer(r,2))
+        },
         10|11=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
@@ -396,18 +417,36 @@ impl Program {
             Stmt::SetInteger(3,Integer::ArrayRead(Box::new(Integer::Variable(1)))),
             // Mandatory scalar-by-reference calls, including an array
             // value expression and a side-effectful BOOLEAN actual.
-            Stmt::CallVar(5,Integer::Variable(0),Boolean::Variable),
-            Stmt::CallVar(3,Integer::ArrayRead(Box::new(Integer::Variable(1))),
+            Stmt::CallVar(Place::Scalar(5),Integer::Variable(0),Boolean::Variable),
+            Stmt::CallVar(Place::Scalar(3),
+                Integer::ArrayRead(Box::new(Integer::Variable(1))),
                 Boolean::And(
                     Box::new(Boolean::Literal(true)),
                     Box::new(Boolean::TouchCompare(Rel::Ne,
                         Box::new(Integer::Variable(2)),
                         Box::new(Integer::Literal(0)))))),
             // Required indexed VAR and both aliased and distinct VAR pairs.
-            Stmt::CallVarIndexed(Integer::Variable(0),
+            Stmt::CallVar(Place::Indexed(Box::new(Integer::Variable(0))),
                 Integer::Variable(1),Boolean::Variable),
-            Stmt::CallVarAlias(3,3,Integer::Variable(2)),
-            Stmt::CallVarAlias(3,4,Integer::Literal(1)),
+            Stmt::CallVarAlias(Place::Scalar(3),Place::Scalar(3),
+                Integer::Variable(2)),
+            Stmt::CallVarAlias(Place::Scalar(3),Place::Scalar(4),
+                Integer::Literal(1)),
+            // Same-address and distinct array elements, and a mixed
+            // scalar/indexed pair with a nested array read as subscript.
+            Stmt::CallVarAlias(
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Integer::Literal(7)),
+            Stmt::CallVarAlias(
+                Place::Indexed(Box::new(Integer::Literal(0))),
+                Place::Indexed(Box::new(Integer::Literal(3))),
+                Integer::Literal(-1)),
+            Stmt::CallVarAlias(
+                Place::Scalar(4),
+                Place::Indexed(Box::new(Integer::ArrayRead(
+                    Box::new(Integer::Variable(0))))),
+                Integer::Variable(2)),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -678,13 +717,13 @@ mod tests {
     }
     #[test]
     fn var_parameter_calls_cover_scalar_lvalues_and_array_values() {
-        let scalar=Stmt::CallVar(3,Integer::Literal(1),
+        let scalar=Stmt::CallVar(Place::Scalar(3),Integer::Literal(1),
             Boolean::Literal(false));
         assert_eq!(scalar.render(false,0),"acc := Change(x, 1, FALSE)");
         assert_eq!(scalar.render(true,0),"acc = change(&x, 1, 0)");
-        // A recursive array expression is allowed as a value actual;
-        // passing an array element by reference is not yet admitted.
-        let array_value=Stmt::CallVar(4,
+        // Recursive array reads are allowed as value actuals as well as
+        // addressable bounded array elements in VAR positions.
+        let array_value=Stmt::CallVar(Place::Scalar(4),
             Integer::ArrayRead(Box::new(Integer::ArrayRead(
                 Box::new(Integer::Variable(0))))),Boolean::Variable);
         assert_eq!(array_value.render(false,0),
@@ -730,13 +769,15 @@ mod tests {
         assert!(provider.contains("PROCEDURE FlipFlag*(VAR b: BOOLEAN"));
         assert!(provider.contains("PROCEDURE Twist*(VAR left,right: INTEGER"));
         assert_eq!(provider,render(999,"typed-import-provider").unwrap());
-        let indexed=Stmt::CallVarIndexed(Integer::Variable(0),
+        let indexed=Stmt::CallVar(
+            Place::Indexed(Box::new(Integer::Variable(0))),
             Integer::Variable(1),Boolean::Variable);
         assert_eq!(indexed.render_with_link(false,0,true),
             "acc := Ops.Change(cells[(a MOD 4)], b, flag)");
         assert_eq!(indexed.render(true,0),
             "acc = change(&cells[floor_mod(a, 4)], b, flag)");
-        let alias=Stmt::CallVarAlias(3,3,Integer::Variable(2));
+        let alias=Stmt::CallVarAlias(
+            Place::Scalar(3),Place::Scalar(3),Integer::Variable(2));
         assert_eq!(alias.render_with_link(false,0,true),"acc := Ops.Twist(x, x, c)");
         assert_eq!(alias.render(true,0),"acc = twist(&x, &x, c)");
         for seed in 0..128 {
@@ -749,13 +790,43 @@ mod tests {
             assert!(src.contains("Ops.Change(cells[(a MOD 4)], b, flag)"));
             assert!(src.contains("Ops.Twist(x, x, c)"));
             assert!(src.contains("Ops.Twist(x, y, 1)"));
+            assert!(src.contains("Ops.Twist(cells[(a MOD 4)], cells[(a MOD 4)], 7)"));
+            assert!(src.contains("Ops.Twist(cells[(0 MOD 4)], cells[(3 MOD 4)], (-1))"));
+            assert!(src.contains("Ops.Twist(y, cells[(cells[(a MOD 4)] MOD 4)], c)"));
             assert!(src.contains("Ops.FlipFlag(flag, "));
             assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
             assert!(selfcheck.starts_with(src.trim_end_matches("END Fuzz.\n")));
             assert!(oracle.contains("twist(&x, &x, c)"));
+            assert!(oracle.contains("twist(&cells[floor_mod(a, 4)], &cells[floor_mod(a, 4)], 7)"));
+            assert!(oracle.contains("twist(&cells[floor_mod(0, 4)], &cells[floor_mod(3, 4)], (-1))"));
             assert!(oracle.contains("change(&cells[floor_mod(a, 4)], b, flag)"));
             assert_eq!(oracle,render(seed,"typed-harness").unwrap());
             assert_eq!(src,render(seed,"typed-import-source").unwrap());
+        }
+    }
+    #[test]
+    fn all_var_place_classes_remain_reproducible_and_bounded() {
+        let nested=Place::Indexed(Box::new(Integer::ArrayRead(
+            Box::new(Integer::Variable(0)))));
+        assert_eq!(nested.render(false),"cells[(cells[(a MOD 4)] MOD 4)]");
+        assert_eq!(nested.render(true),"cells[floor_mod(cells[floor_mod(a, 4)], 4)]");
+        let pair=Stmt::CallVarAlias(nested.clone(),nested,
+            Integer::Literal(i32::MIN));
+        assert_eq!(pair.render_with_link(false,0,true),
+            "acc := Ops.Twist(cells[(cells[(a MOD 4)] MOD 4)], cells[(cells[(a MOD 4)] MOD 4)], (0 - 2147483647 - 1))");
+        assert_eq!(pair.render(true,0),
+            "acc = twist(&cells[floor_mod(cells[floor_mod(a, 4)], 4)], &cells[floor_mod(cells[floor_mod(a, 4)], 4)], (0 - 2147483647 - 1))");
+        assert_eq!(pair.nodes(),7);
+        for seed in 0..128 {
+            let a=Program::generate(seed);
+            assert!(a.body.iter().any(|s|matches!(s,Stmt::CallVarAlias(
+                Place::Indexed(_),Place::Indexed(_),_))));
+            assert!(a.body.iter().any(|s|matches!(s,Stmt::CallVarAlias(
+                Place::Scalar(_),Place::Indexed(_),_))));
+            assert_eq!(render(seed,"typed-source").unwrap(),
+                render(seed,"typed-source").unwrap());
+            assert_eq!(render(seed,"typed-import-harness").unwrap(),
+                render(seed,"typed-harness").unwrap());
         }
     }
     #[test]
