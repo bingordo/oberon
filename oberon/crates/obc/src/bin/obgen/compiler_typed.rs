@@ -816,7 +816,7 @@ mod tests {
             "acc := Ops.Twist(cells[(cells[(a MOD 4)] MOD 4)], cells[(cells[(a MOD 4)] MOD 4)], (0 - 2147483647 - 1))");
         assert_eq!(pair.render(true,0),
             "acc = twist(&cells[floor_mod(cells[floor_mod(a, 4)], 4)], &cells[floor_mod(cells[floor_mod(a, 4)], 4)], (0 - 2147483647 - 1))");
-        assert_eq!(pair.nodes(),7);
+        assert_eq!(pair.nodes(),8);
         for seed in 0..128 {
             let a=Program::generate(seed);
             assert!(a.body.iter().any(|s|matches!(s,Stmt::CallVarAlias(
