@@ -9,6 +9,7 @@ const INPUTS:usize=32;
 const ARRAY_LEN:usize=4;
 const INT_NAMES:[&str;6]=["a","b","c","x","y","acc"];
 
+#[cfg(test)]
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Type {Integer,Boolean}
 #[derive(Clone,Copy,Debug)]
@@ -65,6 +66,7 @@ enum Boolean {
     And(Box<Boolean>,Box<Boolean>),
     Or(Box<Boolean>,Box<Boolean>),
 }
+#[cfg(test)]
 #[derive(Clone,Debug)]
 enum TypedExpr {
     Integer(Integer),
@@ -98,6 +100,7 @@ impl Integer {
             }
         }
     }
+    #[cfg(test)]
     fn nodes(&self)->usize {
         match self {
             Self::Variable(_)|Self::Literal(_)=>1,
@@ -127,6 +130,7 @@ impl Boolean {
             Self::Or(a,b)=>format!("({} {} {})",a.render(c),if c {"||"} else {"OR"},b.render(c)),
         }
     }
+    #[cfg(test)]
     fn nodes(&self)->usize {
         match self {
             Self::Literal(_)|Self::Variable=>1,
@@ -136,6 +140,7 @@ impl Boolean {
         }
     }
 }
+#[cfg(test)]
 impl TypedExpr {
     fn render(&self,c:bool)->String {
         match self {Self::Integer(e)=>e.render(c),Self::Boolean(e)=>e.render(c)}
@@ -143,10 +148,12 @@ impl TypedExpr {
     fn ty(&self)->Type {
         match self {Self::Integer(_)=>Type::Integer,Self::Boolean(_)=>Type::Boolean}
     }
+    #[cfg(test)]
     fn nodes(&self)->usize {
         match self {Self::Integer(e)=>e.nodes(),Self::Boolean(e)=>e.nodes()}
     }
 }
+#[cfg(test)]
 fn generate(r:&mut Rng,ty:Type,depth:usize)->TypedExpr {
     match ty {
         Type::Integer=>TypedExpr::Integer(integer(r,depth)),
@@ -286,6 +293,7 @@ impl Stmt {
             }
         }
     }
+    #[cfg(test)]
     fn nodes(&self)->usize {
         match self {
             Self::SetInteger(_,x)|Self::Update(_,x,_)=>1+x.nodes(),
@@ -301,8 +309,7 @@ impl Stmt {
     }
 }
 fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
-    let sep=if c {";\n"} else {";\n"};
-    stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(sep)
+    stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(";\n")
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
     let choice=if depth==0 {r.below(7)} else {r.below(12)};
