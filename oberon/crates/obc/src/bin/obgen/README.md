@@ -55,7 +55,12 @@ render the same bounded, recursively generated INTEGER/BOOLEAN AST and a
 separately compiled C differential oracle (no interpreter). The generated
 program always exercises wrapping arithmetic, bounded array reads and writes,
 short-circuit side effects, scalar and indexed `VAR INTEGER`, `VAR BOOLEAN`,
-and aliased and distinct scalar `VAR` formals.
+and aliased and distinct `VAR` formals. The common type-directed `Place` AST
+handles both scalar and bounded indexed INTEGER lvalues, including recursively
+indexed array elements. Each generated seed covers same-address array aliasing,
+distinct array elements, and mixed scalar/array VAR pairs, in addition to
+scalar aliases; generated indices are pure to avoid unspecified argument
+side-effect evaluation order in the independent C oracle.
 
 The `typed-import-*` modes use the **same seed and AST** but move the
 by-reference helpers into a separately compiled Oberon module:
