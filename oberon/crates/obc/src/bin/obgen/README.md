@@ -1,6 +1,6 @@
 # Standalone compiler subset generators
 
-The pinned Oberon `obgen` supports two independent, deterministic
+The pinned Oberon `obgen` supports several independent, deterministic
 compiler-subset families. Neither replaces the existing full Oberon
 generator or its regression corpus.
 
@@ -47,3 +47,35 @@ The consuming compiler repository pins the Oberon revision and runs
 small cached array differential smoke checks; its full scalar/array
 fuzz campaign remains manual-only. See
 `bingundu/compiler/tests/oberon_fuzz.sh`.
+
+## Type-directed recursive and imported-module modes
+
+The `typed-source`, `typed-selfcheck`, and `typed-harness` modes
+render the same bounded, recursively generated INTEGER/BOOLEAN AST and a
+separately compiled C differential oracle (no interpreter). The generated
+program always exercises wrapping arithmetic, bounded array reads and writes,
+short-circuit side effects, scalar and indexed `VAR INTEGER`, `VAR BOOLEAN`,
+and aliased and distinct scalar `VAR` formals.
+
+The `typed-import-*` modes use the **same seed and AST** but move the
+by-reference helpers into a separately compiled Oberon module:
+
+```sh
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-import-provider > FuzzOps.mod
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-import-source > Fuzz.mod
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-import-harness > reference.c
+```
+
+`Fuzz` imports `Ops := FuzzOps`, calling exported `Change`, `Twist`, and
+`FlipFlag` through checked procedure interfaces. `Twist(x,x,delta)`
+explicitly checks same-address aliasing; indexed `Change(cells[...],...)`
+checks address lowering and bounds. The source mode is suitable for compiling
+and linking two modules independently; the harness compares both exported
+`Fuzz.Probe` and `Fuzz.Mirror` with a C reference on 32 fixed/seeded inputs.
+Use `typed-import-selfcheck` instead of `typed-import-source` to emit the
+additional module-level metamorphic checks. The provider contents are
+seed-independent. Native end-to-end execution belongs on
+`bingordo/compiler-ci`, not the source repository's Actions.
