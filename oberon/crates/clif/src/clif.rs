@@ -2319,7 +2319,6 @@ struct Lower<'b, 'f, 'a> {
 
 impl<'b, 'f, 'a> Lower<'b, 'f, 'a> {
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn new(
         b: &'b Backend<'a>,
         bcx: FunctionBuilder<'f>,
