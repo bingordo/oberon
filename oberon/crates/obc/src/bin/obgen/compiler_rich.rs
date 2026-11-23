@@ -57,7 +57,7 @@ impl RichCase {
     fn expected(&self,a:i32,b:i32,c:i32)->i32 {
         // The generated divisor is never 0 or -1, including at i32::MIN.
         let mut divisor=b.rem_euclid(self.divisor_mod)+2;
-        if c<0 {divisor=-divisor;}
+        if c<0 {divisor = -divisor;}
         let (quotient,remainder)=Self::floor_div(a,divisor);
         let mut hits=0i32;
 
@@ -263,7 +263,7 @@ mod tests {
             assert!(src.contains("ARRAY 2,") || src.contains("ARRAY 3,")
                 || src.contains("ARRAY 4,"));
         }
-        let cases=(0..64).map(|seed|RichCase::generate(seed)).collect::<Vec<_>>();
+        let cases=(0..64).map(RichCase::generate).collect::<Vec<_>>();
         assert!(cases.windows(2).any(|w|w[0].rows!=w[1].rows));
         assert!(cases.windows(2).any(|w|w[0].iterations!=w[1].iterations));
         assert!(cases.windows(2).any(|w|w[0].step!=w[1].step));
