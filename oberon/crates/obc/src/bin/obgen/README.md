@@ -62,8 +62,15 @@ distinct array elements, and mixed scalar/array VAR pairs, in addition to
 scalar aliases. The generator now also tests distinct index ASTs that
 are guaranteed to select the same element (such as `a` versus `a + 4`
 modulo a four-element array), including nested reads and MIN/MAX 32-bit
-wraparound. Generated indices are pure to avoid unspecified argument
-side-effect evaluation order in the independent C oracle.
+wraparound. The imported/local `Twist` helper now performs ordered
+read-after-write and write-after-write operations, making aliased and distinct
+VAR arguments observably different. Each generated seed includes a three-call
+sequence that mutates the source of an array subscript, passes equivalent
+addresses computed from its updated value, and then recomputes the subscript
+after the call. The differential result includes **all four final array
+elements**, not just the two endpoints, so incorrect reloads and writes to
+interior elements are visible. Generated indices are pure to avoid unspecified
+argument side-effect evaluation order in the independent C oracle.
 
 The `typed-import-*` modes use the **same seed and AST** but move the
 by-reference helpers into a separately compiled Oberon module:
