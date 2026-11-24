@@ -240,13 +240,17 @@ fn equivalent_index(index:Integer,r:&mut Rng)->Integer {
 /// expressions guaranteed to alias. Index terms are pure: all actual
 /// addresses/values can be evaluated before any callee mutation.
 fn var_pair(r:&mut Rng)->(Place,Place) {
-    match r.below(4) {
+    match r.below(6) {
         0=>{
             let left=place(r,2);
             (left.clone(),left)
         },
-        1=>{
-            let index=integer(r,2);
+        1|2=>{
+            // A nested read can depend on an earlier VAR write; both
+            // actuals still resolve to the same bounded array element.
+            let index=if r.below(2)==0 {
+                Integer::ArrayRead(Box::new(integer(r,1)))
+            } else {integer(r,2)};
             let alias=equivalent_index(index.clone(),r);
             (Place::Indexed(Box::new(index)),Place::Indexed(Box::new(alias)))
         },
@@ -484,6 +488,25 @@ impl Program {
                         Box::new(Integer::Variable(1)))),
                     Box::new(Integer::Literal(ARRAY_LEN as i32))))),
                 Integer::Literal(3)),
+            // Cross-call memory dependence: mutate the index source, call
+            // with two equivalent but distinct addresses computed from its
+            // NEW value, then re-evaluate that index after Twist has written.
+            // The delta also snapshots the index-source value before Twist.
+            Stmt::CallVar(
+                Place::Indexed(Box::new(Integer::Literal(0))),
+                Integer::Literal(1),Boolean::Literal(false)),
+            Stmt::CallVarAlias(
+                Place::Indexed(Box::new(Integer::ArrayRead(
+                    Box::new(Integer::Literal(0))))),
+                Place::Indexed(Box::new(Integer::Binary(IOp::Add,
+                    Box::new(Integer::ArrayRead(
+                        Box::new(Integer::Literal(0)))),
+                    Box::new(Integer::Literal(ARRAY_LEN as i32))))),
+                Integer::ArrayRead(Box::new(Integer::Literal(0)))),
+            Stmt::CallVar(
+                Place::Indexed(Box::new(Integer::ArrayRead(
+                    Box::new(Integer::Literal(0))))),
+                Integer::Variable(2),Boolean::Literal(true)),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -879,6 +902,42 @@ mod tests {
             let c=render(seed,"typed-import-harness").unwrap();
             assert!(src.contains("Ops.Twist(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
             assert!(c.contains("twist(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
+        }
+    }
+    #[test]
+    fn var_chain_reloads_index_after_mutating_its_source_and_checks_all_cells() {
+        let source_calls=[
+            "Ops.Change(cells[(0 MOD 4)], 1, FALSE)",
+            "Ops.Twist(cells[(cells[(0 MOD 4)] MOD 4)], cells[((cells[(0 MOD 4)] + 4) MOD 4)], cells[(0 MOD 4)])",
+            "Ops.Change(cells[(cells[(0 MOD 4)] MOD 4)], c, TRUE)",
+        ];
+        let oracle_calls=[
+            "change(&cells[floor_mod(0, 4)], 1, 0)",
+            "twist(&cells[floor_mod(cells[floor_mod(0, 4)], 4)], &cells[floor_mod(wrap_add(cells[floor_mod(0, 4)], 4), 4)], cells[floor_mod(0, 4)])",
+            "change(&cells[floor_mod(cells[floor_mod(0, 4)], 4)], c, 1)",
+        ];
+        for seed in 0..128 {
+            let src=render(seed,"typed-import-source").unwrap();
+            let c=render(seed,"typed-import-harness").unwrap();
+            let mut previous=0;
+            for call in source_calls {
+                let index=src.find(call).expect("missing chained Oberon VAR call");
+                assert!(index>=previous,"chain not in evaluation order");
+                previous=index+call.len();
+            }
+            previous=0;
+            for call in oracle_calls {
+                let index=c.find(call).expect("missing chained C VAR call");
+                assert!(index>=previous,"C chain not in evaluation order");
+                previous=index+call.len();
+            }
+            for slot in 0..ARRAY_LEN {
+                let name=format!("cells[{slot}]");
+                assert!(src.contains(&name),"missing visible cell {slot}");
+                assert!(c.contains(&name),"missing oracle cell {slot}");
+            }
+            assert!(src.contains("RETURN (((((((acc + x) + y) + hits) + cells[0]) + cells[1]) + cells[2]) + cells[3])"));
+            assert!(src.contains("RETURN ((acc + cells[0]) + (x + y)) + ((hits + cells[1]) + (cells[2] + cells[3]))"));
         }
     }
     #[test]
