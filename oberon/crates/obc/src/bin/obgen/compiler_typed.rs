@@ -513,9 +513,9 @@ impl Program {
         out.push_str(";\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
-            out.push_str("    RETURN ((acc + cells[0]) + (x + y)) + (hits + cells[3])\n");
+            out.push_str("    RETURN ((acc + cells[0]) + (x + y)) + ((hits + cells[1]) + (cells[2] + cells[3]))\n");
         } else {
-            out.push_str("    RETURN ((((acc + x) + y) + hits) + cells[0]) + cells[3]\n");
+            out.push_str("    RETURN (((((((acc + x) + y) + hits) + cells[0]) + cells[1]) + cells[2]) + cells[3])\n");
         }
         writeln!(out,"  END {name};").unwrap();
         out
@@ -530,23 +530,7 @@ impl Program {
   PROCEDURE Touch*(n:INTEGER):INTEGER;
   BEGIN INC(hits); RETURN n END Touch;
 "#);
-        if !imported {
-            out.push_str(r#"  PROCEDURE Change(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
-  BEGIN
-    IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
-    RETURN n
-  END Change;
-  PROCEDURE FlipFlag(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
-  BEGIN
-    IF guard THEN b := ~b END;
-    RETURN b
-  END FlipFlag;
-  PROCEDURE Twist(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
-  BEGIN
-    INC(left,delta); DEC(right,delta); RETURN left
-  END Twist;
-"#);
-        }
+        if !imported {out.push_str(&Self::helpers(false));}
         out.push_str(&self.source_procedure("Probe",false,imported));
         out.push_str(&self.source_procedure("Mirror",true,imported));
         if checks {
@@ -561,24 +545,31 @@ impl Program {
         out.push_str("END Fuzz.\n");
         out
     }
-    fn provider()->String {
-        String::from(r#"MODULE FuzzOps;
-  PROCEDURE Change*(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
-  BEGIN
-    IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
-    RETURN n
-  END Change;
-  PROCEDURE FlipFlag*(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
-  BEGIN
-    IF guard THEN b := ~b END;
-    RETURN b
-  END FlipFlag;
-  PROCEDURE Twist*(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
-  BEGIN
-    INC(left,delta); DEC(right,delta); RETURN left
-  END Twist;
-END FuzzOps.
+    /// Keep local/imported Oberon helper bodies identical; the C oracle
+    /// remains an independent implementation and separate compilation.
+    fn helpers(exported:bool)->String {
+        let star=if exported {"*"} else {""};
+        format!(r#"  PROCEDURE Change{star}(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
+   BEGIN
+     IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
+     RETURN n
+   END Change;
+   PROCEDURE FlipFlag{star}(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
+   BEGIN
+     IF guard THEN b := ~b END;
+     RETURN b
+   END FlipFlag;
+   PROCEDURE Twist{star}(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
+   BEGIN
+     INC(left,delta);
+     right := left + right;
+     DEC(left);
+     RETURN right
+   END Twist;
 "#)
+    }
+    fn provider()->String {
+        format!("MODULE FuzzOps;\n{}END FuzzOps.\n",Self::helpers(true))
     }
     fn c_reference(&self,cases:&[(i32,i32,i32)],seed:u64)->String {
         let mut out=String::from(
@@ -615,14 +606,15 @@ END FuzzOps.
              \x20 return *b;\n}\n\
              static int32_t twist(int32_t *left,int32_t *right,int32_t delta) {\n\
              \x20 *left=wrap_add(*left,delta);\n\
-             \x20 *right=wrap_sub(*right,delta);\n\
-             \x20 return *left;\n\
+             \x20 *right=wrap_add(*left,*right);\n\
+             \x20 *left=wrap_sub(*left,1);\n\
+             \x20 return *right;\n\
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
              \x20 int32_t cells[4]={a,b,c,0};\n");
         out.push_str(&sequence(&self.body,true,2));
-        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[3]);\n}\n");
+        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[1]),cells[2]),cells[3]);\n}\n");
         out.push_str(
             "extern int32_t Fuzz__Probe(int32_t,int32_t,int32_t);\n\
              extern int32_t Fuzz__Mirror(int32_t,int32_t,int32_t);\n\
@@ -726,7 +718,7 @@ mod tests {
             for helper in ["from_bits","wrap_add","wrap_sub","wrap_mul"] {
                 assert!(c.contains(&format!("static inline int32_t {helper}(")));
             }
-            assert!(c.contains("return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[3]);"));
+            assert!(c.contains("return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[1]),cells[2]),cells[3]);"));
             assert!(!c.contains("return ((acc+x)+y)+hits;"));
         }
         let increment=Stmt::Update(3,Integer::Literal(i32::MAX),false);
@@ -806,6 +798,19 @@ mod tests {
         assert!(provider.contains("PROCEDURE FlipFlag*(VAR b: BOOLEAN"));
         assert!(provider.contains("PROCEDURE Twist*(VAR left,right: INTEGER"));
         assert_eq!(provider,render(999,"typed-import-provider").unwrap());
+        let local=render(3,"typed-source").unwrap();
+        for line in ["INC(left,delta);","right := left + right;",
+            "DEC(left);","RETURN right"] {
+            assert!(provider.contains(line));
+            assert!(local.contains(line));
+        }
+        assert!(provider.contains("PROCEDURE Twist*(VAR left,right: INTEGER"));
+        assert!(local.contains("PROCEDURE Twist(VAR left,right: INTEGER"));
+        assert!(!local.contains("PROCEDURE Twist*(VAR left,right: INTEGER"));
+        let oracle=render(3,"typed-harness").unwrap();
+        assert!(oracle.contains("*right=wrap_add(*left,*right);"));
+        assert!(oracle.contains("*left=wrap_sub(*left,1);"));
+        assert!(oracle.contains("return *right;"));
         let indexed=Stmt::CallVar(
             Place::Indexed(Box::new(Integer::Variable(0))),
             Integer::Variable(1),Boolean::Variable);
