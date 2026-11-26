@@ -211,6 +211,10 @@ pub enum Expr {
     AddressOfMultiArrayElement {
         array: usize, indices: Vec<Expr>, dims: Vec<u32>,
     },
+    /// Source-checked INTEGER leaf in private BYTE/INTEGER record storage.
+    /// Its exact aligned byte offset comes from checked record layout.
+    /// Only VAR INTEGER calls may consume this address, not an aggregate ABI.
+    AddressOfRecordField { array: usize, byte_offset: u32, bits: u8 },
     /// Index into Function.arrays; the subscript is a checked INTEGER expr.
     ArrayElement { array: usize, index: Box<Expr> },
     /// Source-checked fixed INTEGER array, flattened into one native
@@ -957,10 +961,11 @@ struct CallSignature {
 }
 
 /// Construct only addresses proven assignable by the Oberon checker and
-/// represented by the native bridge. Keep scalar and array address formation
-/// together so imported calls and local calls have identical admission rules.
-/// VAR BOOLEAN uses scalar canonical 0/1 storage; only INTEGER arrays are
-/// projected in the native bridge, and other array-element VAR forms fail closed.
+/// represented by the native bridge. Keep scalar, array and record-field
+/// address formation together for identical imported/local call admission.
+/// VAR BOOLEAN uses scalar canonical 0/1 storage; only checked INTEGER
+/// record leaf fields may escape as VAR INTEGER, never aggregate records,
+/// BYTE fields or arbitrary pointer dereferences.
 /// The index AST is stored once; the consumer must not lower it separately
 /// for a value load and for address formation.
 fn lower_var_scalar_actual(
@@ -1006,7 +1011,24 @@ fn lower_var_scalar_actual(
                 })
             }
         }
-        _=>Err("VAR argument requires a scalar or checked INTEGER array element".into()),
+        selectors if selectors.iter().all(|sel|
+            matches!(sel,syntax::ast::Selector::Field(_)))=>{
+            let path=record_selector_path(actual)
+                .ok_or("VAR record actual requires a checked field path")?;
+            // This is *only* a checked scalar leaf, not a record or
+            // subrecord address. Preserve homogeneous storage as the
+            // existing indexed-place pointer; byte-backed records use
+            // their authoritative byte offsets instead of word indices.
+            match record_field(records,root,&path)? {
+                Expr::ArrayElement{array,index}=>Ok(Expr::AddressOfArrayElement {
+                    array,index,
+                }),
+                Expr::RecordField{array,byte_offset,bits:32}=>
+                    Ok(Expr::AddressOfRecordField{array,byte_offset,bits:32}),
+                _=>Err("VAR record actual must select a checked INTEGER leaf".into()),
+            }
+        }
+        _=>Err("VAR argument needs a checked scalar, INTEGER array element or INTEGER record field".into()),
     }
 }
 
