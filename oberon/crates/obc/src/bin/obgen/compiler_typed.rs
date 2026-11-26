@@ -7,6 +7,8 @@ use std::fmt::Write as _;
 
 const INPUTS:usize=32;
 const ARRAY_LEN:usize=4;
+const MATRIX_ROWS:usize=2;
+const MATRIX_COLS:usize=3;
 const INT_NAMES:[&str;6]=["a","b","c","x","y","acc"];
 
 #[cfg(test)]
@@ -53,6 +55,8 @@ enum Integer {
     Binary(IOp,Box<Integer>,Box<Integer>),
     /// A side-effect-free read from a bounded local INTEGER array.
     ArrayRead(Box<Integer>),
+    /// Pure multidimensional read with independently bounded row and column.
+    MatrixRead(Box<Integer>,Box<Integer>),
 }
 #[derive(Clone,Debug)]
 enum Boolean {
@@ -79,9 +83,23 @@ fn literal(n:i32)->String {
 }
 /// Any signed expression, including MIN(INTEGER), becomes an in-bounds
 /// subscript using Oberon's floor MOD semantics (not C's remainder).
+fn bounded_index(index:&Integer,length:usize,c:bool)->String {
+    if c {format!("floor_mod({}, {length})",index.render(true))}
+    else {format!("({} MOD {length})",index.render(false))}
+}
 fn array_index(index:&Integer,c:bool)->String {
-    if c {format!("floor_mod({}, {ARRAY_LEN})",index.render(true))}
-    else {format!("({} MOD {ARRAY_LEN})",index.render(false))}
+    bounded_index(index,ARRAY_LEN,c)
+}
+fn matrix_place(row:&Integer,col:&Integer,c:bool)->String {
+    if c {
+        format!("matrix[{}][{}]",
+            bounded_index(row,MATRIX_ROWS,true),
+            bounded_index(col,MATRIX_COLS,true))
+    } else {
+        format!("matrix[{}, {}]",
+            bounded_index(row,MATRIX_ROWS,false),
+            bounded_index(col,MATRIX_COLS,false))
+    }
 }
 impl Integer {
     fn render(&self,c:bool)->String {
@@ -89,6 +107,7 @@ impl Integer {
             Self::Variable(i)=>INT_NAMES[*i].to_string(),
             Self::Literal(n)=>literal(*n),
             Self::ArrayRead(index)=>format!("cells[{}]",array_index(index,c)),
+            Self::MatrixRead(row,col)=>matrix_place(row,col,c),
             Self::Binary(op,a,b)=>{
                 let (a,b)=(a.render(c),b.render(c));
                 if c {
@@ -105,6 +124,7 @@ impl Integer {
         match self {
             Self::Variable(_)|Self::Literal(_)=>1,
             Self::ArrayRead(index)=>1+index.nodes(),
+            Self::MatrixRead(row,col)=>1+row.nodes()+col.nodes(),
             Self::Binary(_,a,b)=>1+a.nodes()+b.nodes(),
         }
     }
@@ -171,6 +191,10 @@ fn integer(r:&mut Rng,depth:usize)->Integer {
     if r.below(6)==0 {
         return Integer::ArrayRead(Box::new(integer(r,depth-1)));
     }
+    if r.below(9)==0 {
+        return Integer::MatrixRead(
+            Box::new(integer(r,depth-1)),Box::new(integer(r,depth-1)));
+    }
     let op=match r.below(5) {
         0=>IOp::Add,1=>IOp::Sub,2=>IOp::Mul,3=>IOp::Div,_=>IOp::Mod,
     };
@@ -210,22 +234,31 @@ fn boolean(r:&mut Rng,depth:usize)->Boolean {
 enum Place {
     Scalar(usize),
     Indexed(Box<Integer>),
+    Matrix(Box<Integer>,Box<Integer>),
 }
 impl Place {
     fn render(&self,c:bool)->String {
         match self {
             Self::Scalar(slot)=>INT_NAMES[*slot].to_string(),
             Self::Indexed(index)=>format!("cells[{}]",array_index(index,c)),
+            Self::Matrix(row,col)=>matrix_place(row,col,c),
         }
     }
     #[cfg(test)]
     fn nodes(&self)->usize {
-        match self {Self::Scalar(_)=>1,Self::Indexed(index)=>1+index.nodes()}
+        match self {
+            Self::Scalar(_)=>1,
+            Self::Indexed(index)=>1+index.nodes(),
+            Self::Matrix(row,col)=>1+row.nodes()+col.nodes(),
+        }
     }
 }
 fn place(r:&mut Rng,depth:usize)->Place {
-    if r.below(3)==0 {Place::Scalar(3+r.below(3))}
-    else {Place::Indexed(Box::new(integer(r,depth)))}
+    match r.below(4) {
+        0=>Place::Scalar(3+r.below(3)),
+        1=>Place::Matrix(Box::new(integer(r,depth)),Box::new(integer(r,depth))),
+        _=>Place::Indexed(Box::new(integer(r,depth))),
+    }
 }
 /// Adding/subtracting a multiple of the array length leaves a wrapped 32-bit
 /// index in the same congruence class. Since ARRAY_LEN divides 2^32,
@@ -236,11 +269,20 @@ fn equivalent_index(index:Integer,r:&mut Rng)->Integer {
         if r.below(2)==0 {IOp::Add} else {IOp::Sub},
         Box::new(index),Box::new(Integer::Literal(offset)))
 }
+/// Generate equivalent but syntactically distinct multidimensional indices.
+/// Normalize first: adding 3 to an *unbounded* signed column could wrap and
+/// cease to alias because 3 does not divide 2^32.
+fn equivalent_bounded_index(index:Integer,length:usize)->Integer {
+    Integer::Binary(IOp::Add,
+        Box::new(Integer::Binary(IOp::Mod,Box::new(index),
+            Box::new(Integer::Literal(length as i32)))),
+        Box::new(Integer::Literal(length as i32)))
+}
 /// Generate distinct places, identical ASTs, and different address
 /// expressions guaranteed to alias. Index terms are pure: all actual
 /// addresses/values can be evaluated before any callee mutation.
 fn var_pair(r:&mut Rng)->(Place,Place) {
-    match r.below(6) {
+    match r.below(7) {
         0=>{
             let left=place(r,2);
             (left.clone(),left)
@@ -253,6 +295,14 @@ fn var_pair(r:&mut Rng)->(Place,Place) {
             } else {integer(r,2)};
             let alias=equivalent_index(index.clone(),r);
             (Place::Indexed(Box::new(index)),Place::Indexed(Box::new(alias)))
+        },
+        3|4=>{
+            let row=integer(r,2);
+            let col=integer(r,2);
+            let same_row=equivalent_bounded_index(row.clone(),MATRIX_ROWS);
+            let same_col=equivalent_bounded_index(col.clone(),MATRIX_COLS);
+            (Place::Matrix(Box::new(row),Box::new(col)),
+                Place::Matrix(Box::new(same_row),Box::new(same_col)))
         },
         _=>(place(r,2),place(r,2)),
     }
@@ -600,6 +650,41 @@ impl Program {
                         Box::new(Integer::Literal(0)))))),
             Stmt::CallVarMixed(Place::Scalar(3),
                 Integer::Variable(2),Boolean::Variable),
+            // Required multidimensional VAR cases: aliased row+column
+            // expressions, distinct matrix cells, and multi-hop forwarding.
+            Stmt::CallVar(
+                Place::Matrix(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1))),
+                Integer::MatrixRead(Box::new(Integer::Literal(1)),
+                    Box::new(Integer::Literal(2))),Boolean::Variable),
+            Stmt::CallVarAlias(
+                Place::Matrix(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1))),
+                Place::Matrix(
+                    Box::new(equivalent_bounded_index(Integer::Variable(0),MATRIX_ROWS)),
+                    Box::new(equivalent_bounded_index(Integer::Variable(1),MATRIX_COLS))),
+                Integer::MatrixRead(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1)))),
+            Stmt::CallVarAlias(
+                Place::Matrix(Box::new(Integer::Literal(0)),
+                    Box::new(Integer::Literal(0))),
+                Place::Matrix(Box::new(Integer::Literal(1)),
+                    Box::new(Integer::Literal(2))),Integer::Literal(3)),
+            Stmt::CallVarForward(
+                Place::Matrix(Box::new(Integer::Variable(1)),
+                    Box::new(Integer::Variable(2))),
+                Place::Matrix(
+                    Box::new(equivalent_bounded_index(Integer::Variable(1),MATRIX_ROWS)),
+                    Box::new(equivalent_bounded_index(Integer::Variable(2),MATRIX_COLS))),
+                Integer::Variable(0)),
+            Stmt::CallVarForward(
+                Place::Matrix(Box::new(Integer::Literal(1)),
+                    Box::new(Integer::Literal(1))),
+                Place::Scalar(4),Integer::Literal(-3)),
+            Stmt::CallVarMixed(
+                Place::Matrix(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1))),
+                Integer::Literal(5),Boolean::Variable),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -621,12 +706,17 @@ impl Program {
             "  PROCEDURE {name}*(a,b,c: INTEGER): INTEGER;\n\
              \x20 VAR x,y,acc,k: INTEGER; flag: BOOLEAN;\n\
              \x20     cells: ARRAY 4 OF INTEGER;\n\
+             \x20     matrix: ARRAY 2,3 OF INTEGER;\n\
              \x20 BEGIN\n\
              \x20   hits := 0;\n\
              \x20   x := a; y := b; acc := c; flag := FALSE;\n\
-             \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n");
+             \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n\
+             \x20   matrix[0,0] := a; matrix[0,1] := b; matrix[0,2] := c;\n\
+             \x20   matrix[1,0] := 0; matrix[1,1] := 1; matrix[1,2] := (-1);\n");
         out.push_str(&sequence_with_link(&self.body,false,4,mode));
         out.push_str(";\n");
+        // Make every matrix cell observable, including the interior ones.
+        out.push_str("    acc := acc + matrix[0,0] + matrix[0,1] + matrix[0,2] + matrix[1,0] + matrix[1,1] + matrix[1,2];\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
             out.push_str("    RETURN ((acc + cells[0]) + (x + y)) + ((hits + cells[1]) + (cells[2] + cells[3]))\n");
@@ -786,9 +876,12 @@ impl Program {
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
-             \x20 int32_t cells[4]={a,b,c,0};\n");
+             \x20 int32_t cells[4]={a,b,c,0};\n\
+             \x20 int32_t matrix[2][3]={{a,b,c},{0,1,-1}};\n");
         out.push_str(&sequence(&self.body,true,2));
-        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[1]),cells[2]),cells[3]);\n}\n");
+        // Full matrix state is part of the independent differential.
+        out.push_str(";\n  acc = wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,matrix[0][0]),matrix[0][1]),matrix[0][2]),matrix[1][0]),matrix[1][1]),matrix[1][2]);\n");
+        out.push_str("  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[1]),cells[2]),cells[3]);\n}\n");
         out.push_str(
             "extern int32_t Fuzz__Probe(int32_t,int32_t,int32_t);\n\
              extern int32_t Fuzz__Mirror(int32_t,int32_t,int32_t);\n\
@@ -1097,6 +1190,49 @@ mod tests {
             assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarForward(..))).count()>=3);
             assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarBooleanForward(..))).count()>=2);
             assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarMixed(..))).count()>=2);
+        }
+    }
+    #[test]
+    fn checked_multidimensional_var_places_cover_same_distinct_and_forwarded_addresses() {
+        let first=Place::Matrix(Box::new(Integer::Variable(0)),
+            Box::new(Integer::Variable(1)));
+        let alias=Place::Matrix(
+            Box::new(equivalent_bounded_index(Integer::Variable(0),MATRIX_ROWS)),
+            Box::new(equivalent_bounded_index(Integer::Variable(1),MATRIX_COLS)));
+        assert_eq!(first.render(false),"matrix[(a MOD 2), (b MOD 3)]");
+        assert_eq!(first.render(true),
+            "matrix[floor_mod(a, 2)][floor_mod(b, 3)]");
+        assert_eq!(alias.render(false),
+            "matrix[(((a MOD 2) + 2) MOD 2), (((b MOD 3) + 3) MOD 3)]");
+        assert_eq!(alias.render(true),
+            "matrix[floor_mod(wrap_add(floor_mod(a, 2), 2), 2)][floor_mod(wrap_add(floor_mod(b, 3), 3), 3)]");
+        let forwarded=Stmt::CallVarForward(first.clone(),alias.clone(),
+            Integer::Literal(7));
+        assert_eq!(forwarded.render_with_link(false,0,CallMode::Relayed),
+            "acc := Relay.Forward(matrix[(a MOD 2), (b MOD 3)], matrix[(((a MOD 2) + 2) MOD 2), (((b MOD 3) + 3) MOD 3)], 7)");
+        assert!(forwarded.render(true,0).starts_with(
+            "acc = forward(&matrix[floor_mod(a, 2)][floor_mod(b, 3)], &matrix["));
+        // Each dimension is normalized BEFORE adding its length: even
+        // MIN/MAX input values cannot overflow and change an alias.
+        for n in [i32::MIN,i32::MIN+1,-11,-1,0,1,4,11,i32::MAX-1,i32::MAX] {
+            for dim in [MATRIX_ROWS as i32,MATRIX_COLS as i32] {
+                let bounded=n.rem_euclid(dim);
+                assert_eq!(bounded, (bounded+dim).rem_euclid(dim));
+            }
+        }
+        for seed in 0..128 {
+            let src=render(seed,"typed-relay-source").unwrap();
+            let c=render(seed,"typed-relay-harness").unwrap();
+            assert!(src.contains("matrix: ARRAY 2,3 OF INTEGER"));
+            assert!(c.contains("int32_t matrix[2][3]={{a,b,c},{0,1,-1}};"));
+            assert!(src.contains("Ops.Twist(matrix[(a MOD 2), (b MOD 3)], matrix[(((a MOD 2) + 2) MOD 2), (((b MOD 3) + 3) MOD 3)], matrix[(a MOD 2), (b MOD 3)])"));
+            assert!(src.contains("Relay.Forward(matrix[(b MOD 2), (c MOD 3)], matrix[(((b MOD 2) + 2) MOD 2), (((c MOD 3) + 3) MOD 3)], a)"));
+            assert!(src.contains("Relay.ForwardMixed(matrix[(a MOD 2), (b MOD 3)], flag, 5, flag)"));
+            assert!(c.contains("forward_mixed(&matrix[floor_mod(a, 2)][floor_mod(b, 3)], &flag, 5, flag)"));
+            assert!(src.contains("acc := acc + matrix[0,0] + matrix[0,1] + matrix[0,2] + matrix[1,0] + matrix[1,1] + matrix[1,2];"));
+            assert!(c.contains("acc = wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,matrix[0][0]),matrix[0][1]),matrix[0][2]),matrix[1][0]),matrix[1][1]),matrix[1][2]);"));
+            assert_eq!(c,render(seed,"typed-import-harness").unwrap());
+            assert_eq!(src,render(seed,"typed-relay-source").unwrap());
         }
     }
     #[test]
