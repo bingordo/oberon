@@ -257,6 +257,9 @@ fn var_pair(r:&mut Rng)->(Place,Place) {
         _=>(place(r,2),place(r,2)),
     }
 }
+/// Local, imported directly, or forwarded through a second imported module.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum CallMode { Local, Imported, Relayed }
 #[derive(Clone,Debug)]
 enum Stmt {
     SetInteger(usize,Integer),
@@ -268,6 +271,8 @@ enum Stmt {
     CallVar(Place,Integer,Boolean),
     /// Two independently addressable actuals, deliberately sometimes aliased.
     CallVarAlias(Place,Place,Integer),
+    /// Forward original VAR addresses through a second call frame.
+    CallVarForward(Place,Place,Integer),
     /// Mutate a checked BOOLEAN lvalue with a short-circuit guard.
     CallVarBoolean(Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
@@ -277,9 +282,9 @@ enum Stmt {
 }
 impl Stmt {
     fn render(&self,c:bool,indent:usize)->String {
-        self.render_with_link(c,indent,false)
+        self.render_with_link(c,indent,CallMode::Local)
     }
-    fn render_with_link(&self,c:bool,indent:usize,imported:bool)->String {
+    fn render_with_link(&self,c:bool,indent:usize,mode:CallMode)->String {
         let pad=" ".repeat(indent);
         match self {
             Self::SetInteger(slot,e)=>format!("{pad}{} {} {}",
@@ -316,7 +321,7 @@ impl Stmt {
                     format!("{pad}acc = change(&{target}, {}, {})",
                         delta.render(true),minus.render(true))
                 } else {
-                    let callee=if imported {"Ops.Change"} else {"Change"};
+                    let callee=if mode!=CallMode::Local {"Ops.Change"} else {"Change"};
                     format!("{pad}acc := {callee}({target}, {}, {})",
                         delta.render(false),minus.render(false))
                 }
@@ -327,36 +332,51 @@ impl Stmt {
                 if c {
                     format!("{pad}acc = twist(&{left}, &{right}, {})",delta.render(true))
                 } else {
-                    let callee=if imported {"Ops.Twist"} else {"Twist"};
+                    let callee=if mode!=CallMode::Local {"Ops.Twist"} else {"Twist"};
                     format!("{pad}acc := {callee}({left}, {right}, {})",delta.render(false))
+                }
+            }
+            Self::CallVarForward(left,right,delta)=>{
+                let left=left.render(c);
+                let right=right.render(c);
+                if c {
+                    format!("{pad}acc = forward(&{left}, &{right}, {})",delta.render(true))
+                } else {
+                    let callee=match mode {
+                        CallMode::Local=>"Forward",
+                        CallMode::Imported=>"Ops.Forward",
+                        CallMode::Relayed=>"Relay.Forward",
+                    };
+                    format!("{pad}acc := {callee}({left}, {right}, {})",
+                        delta.render(false))
                 }
             }
             Self::CallVarBoolean(guard)=>{
                 if c {
                     format!("{pad}flag = flip_flag(&flag, {})",guard.render(true))
                 } else {
-                    let callee=if imported {"Ops.FlipFlag"} else {"FlipFlag"};
+                    let callee=if mode!=CallMode::Local {"Ops.FlipFlag"} else {"FlipFlag"};
                     format!("{pad}flag := {callee}(flag, {})",guard.render(false))
                 }
             }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
-                        cond.render(true),sequence_with_link(a,true,indent+2,imported),
-                        sequence_with_link(b,true,indent+2,imported))
+                        cond.render(true),sequence_with_link(a,true,indent+2,mode),
+                        sequence_with_link(b,true,indent+2,mode))
                 } else {
                     format!("{pad}IF {} THEN\n{}\n{pad}ELSE\n{}\n{pad}END",
-                        cond.render(false),sequence_with_link(a,false,indent+2,imported),
-                        sequence_with_link(b,false,indent+2,imported))
+                        cond.render(false),sequence_with_link(a,false,indent+2,mode),
+                        sequence_with_link(b,false,indent+2,mode))
                 }
             }
             Self::Repeat(n,body)=>{
                 if c {
                     format!("{pad}k = 0;\n{pad}do {{\n{};\n{pad}  k++;\n{pad}}} while (k < {n})",
-                        sequence_with_link(body,true,indent+2,imported))
+                        sequence_with_link(body,true,indent+2,mode))
                 } else {
                     format!("{pad}k := 0;\n{pad}REPEAT\n{};\n{pad}  INC(k)\n{pad}UNTIL k >= {n}",
-                        sequence_with_link(body,false,indent+2,imported))
+                        sequence_with_link(body,false,indent+2,mode))
                 }
             }
         }
@@ -370,7 +390,8 @@ impl Stmt {
                 1+index.nodes()+value.nodes(),
             Self::CallVar(target,delta,minus)=>
                 1+target.nodes()+delta.nodes()+minus.nodes(),
-            Self::CallVarAlias(left,right,delta)=>
+            Self::CallVarAlias(left,right,delta)|
+            Self::CallVarForward(left,right,delta)=>
                 1+left.nodes()+right.nodes()+delta.nodes(),
             Self::CallVarBoolean(guard)=>1+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
@@ -382,13 +403,13 @@ impl Stmt {
 fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
     stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(";\n")
 }
-fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,imported:bool)->String {
-    if !imported { return sequence(stmts,c,indent); }
-    stmts.iter().map(|s|s.render_with_link(c,indent,imported))
+fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,mode:CallMode)->String {
+    if mode==CallMode::Local { return sequence(stmts,c,indent); }
+    stmts.iter().map(|s|s.render_with_link(c,indent,mode))
         .collect::<Vec<_>>().join(";\n")
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(10)} else {r.below(15)};
+    let choice=if depth==0 {r.below(11)} else {r.below(16)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
@@ -403,7 +424,11 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
             let (left,right)=var_pair(r);
             Stmt::CallVarAlias(left,right,integer(r,2))
         },
-        10|11=>Stmt::If(boolean(r,3),
+        10=>{
+            let (left,right)=var_pair(r);
+            Stmt::CallVarForward(left,right,integer(r,2))
+        },
+        11|12=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -507,6 +532,22 @@ impl Program {
                 Place::Indexed(Box::new(Integer::ArrayRead(
                     Box::new(Integer::Literal(0))))),
                 Integer::Variable(2),Boolean::Literal(true)),
+            // Forward identical scalar addresses and equivalent indexed
+            // addresses through two separate call frames. Keep a distinct
+            // mixed scalar/array pair in every seed too.
+            Stmt::CallVarForward(
+                Place::Scalar(3),Place::Scalar(3),Integer::Variable(2)),
+            Stmt::CallVarForward(
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Place::Indexed(Box::new(Integer::Binary(IOp::Add,
+                    Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Literal(ARRAY_LEN as i32))))),
+                Integer::ArrayRead(Box::new(Integer::Variable(0)))),
+            Stmt::CallVarForward(
+                Place::Scalar(4),
+                Place::Indexed(Box::new(Integer::ArrayRead(
+                    Box::new(Integer::Variable(1))))),
+                Integer::Variable(2)),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -523,7 +564,7 @@ impl Program {
         for _ in 0..5+r.below(6) {body.push(statement(&mut r,3,true));}
         Self{body}
     }
-    fn source_procedure(&self,name:&str,mirror:bool,imported:bool)->String {
+    fn source_procedure(&self,name:&str,mirror:bool,mode:CallMode)->String {
         let mut out=format!(
             "  PROCEDURE {name}*(a,b,c: INTEGER): INTEGER;\n\
              \x20 VAR x,y,acc,k: INTEGER; flag: BOOLEAN;\n\
@@ -532,7 +573,7 @@ impl Program {
              \x20   hits := 0;\n\
              \x20   x := a; y := b; acc := c; flag := FALSE;\n\
              \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n");
-        out.push_str(&sequence_with_link(&self.body,false,4,imported));
+        out.push_str(&sequence_with_link(&self.body,false,4,mode));
         out.push_str(";\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
@@ -544,18 +585,23 @@ impl Program {
         out
     }
     fn source(&self,cases:&[(i32,i32,i32)],checks:bool)->String {
-        self.source_mode(cases,checks,false)
+        self.source_mode(cases,checks,CallMode::Local)
     }
-    fn source_mode(&self,cases:&[(i32,i32,i32)],checks:bool,imported:bool)->String {
+    fn source_mode(&self,cases:&[(i32,i32,i32)],checks:bool,mode:CallMode)->String {
         let mut out=String::from("MODULE Fuzz;\n");
-        if imported { out.push_str("IMPORT Ops := FuzzOps;\n"); }
+        match mode {
+            CallMode::Local=>{},
+            CallMode::Imported=>out.push_str("IMPORT Ops := FuzzOps;\n"),
+            CallMode::Relayed=>
+                out.push_str("IMPORT Ops := FuzzOps, Relay := FuzzRelay;\n"),
+        }
         out.push_str(r#"VAR hits: INTEGER;
   PROCEDURE Touch*(n:INTEGER):INTEGER;
   BEGIN INC(hits); RETURN n END Touch;
 "#);
-        if !imported {out.push_str(&Self::helpers(false));}
-        out.push_str(&self.source_procedure("Probe",false,imported));
-        out.push_str(&self.source_procedure("Mirror",true,imported));
+        if mode==CallMode::Local {out.push_str(&Self::helpers(false));}
+        out.push_str(&self.source_procedure("Probe",false,mode));
+        out.push_str(&self.source_procedure("Mirror",true,mode));
         if checks {
             out.push_str("BEGIN\n");
             for &(a,b,c) in cases {
@@ -572,7 +618,7 @@ impl Program {
     /// remains an independent implementation and separate compilation.
     fn helpers(exported:bool)->String {
         let star=if exported {"*"} else {""};
-        format!(r#"  PROCEDURE Change{star}(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
+        let mut out=format!(r#"  PROCEDURE Change{star}(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
    BEGIN
      IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
      RETURN n
@@ -589,10 +635,30 @@ impl Program {
      DEC(left);
      RETURN right
    END Twist;
+"#);
+        out.push_str(&Self::forward_helper(exported,""));
+        out
+    }
+    /// Forward the exact VAR addresses into *another* procedure. The relay
+    /// module calls the same exported procedures through FuzzOps imports.
+    fn forward_helper(exported:bool,prefix:&str)->String {
+        let star=if exported {"*"} else {""};
+        format!(r#"  PROCEDURE Forward{star}(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
+    VAR result: INTEGER;
+    BEGIN
+      result := {prefix}Twist(left,right,delta);
+      INC(left);
+      result := result + {prefix}Change(right,delta,FALSE);
+      RETURN result + left
+    END Forward;
 "#)
     }
     fn provider()->String {
         format!("MODULE FuzzOps;\n{}END FuzzOps.\n",Self::helpers(true))
+    }
+    fn relay_provider()->String {
+        format!("MODULE FuzzRelay;\nIMPORT Ops := FuzzOps;\n{}END FuzzRelay.\n",
+            Self::forward_helper(true,"Ops."))
     }
     fn c_reference(&self,cases:&[(i32,i32,i32)],seed:u64)->String {
         let mut out=String::from(
@@ -632,6 +698,12 @@ impl Program {
              \x20 *right=wrap_add(*left,*right);\n\
              \x20 *left=wrap_sub(*left,1);\n\
              \x20 return *right;\n\
+}\n\
+             static int32_t forward(int32_t *left,int32_t *right,int32_t delta) {\n\
+             \x20 int32_t result=twist(left,right,delta);\n\
+             \x20 *left=wrap_add(*left,1);\n\
+             \x20 result=wrap_add(result,change(right,delta,0));\n\
+             \x20 return wrap_add(result,*left);\n\
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
@@ -679,10 +751,14 @@ pub(super) fn render(seed:u64,mode:&str)->Result<String,String> {
     match mode {
         "typed-source"=>Ok(program.source(&cases,false)),
         "typed-selfcheck"=>Ok(program.source(&cases,true)),
-        "typed-harness"|"typed-import-harness"=>Ok(program.c_reference(&cases,seed)),
+        "typed-harness"|"typed-import-harness"|"typed-relay-harness"=>
+            Ok(program.c_reference(&cases,seed)),
         "typed-import-provider"=>Ok(Program::provider()),
-        "typed-import-source"=>Ok(program.source_mode(&cases,false,true)),
-        "typed-import-selfcheck"=>Ok(program.source_mode(&cases,true,true)),
+        "typed-relay-provider"=>Ok(Program::relay_provider()),
+        "typed-import-source"=>Ok(program.source_mode(&cases,false,CallMode::Imported)),
+        "typed-import-selfcheck"=>Ok(program.source_mode(&cases,true,CallMode::Imported)),
+        "typed-relay-source"=>Ok(program.source_mode(&cases,false,CallMode::Relayed)),
+        "typed-relay-selfcheck"=>Ok(program.source_mode(&cases,true,CallMode::Relayed)),
         _=>Err(format!("unknown typed compiler subset mode {mode}")),
     }
 }
@@ -837,13 +913,13 @@ mod tests {
         let indexed=Stmt::CallVar(
             Place::Indexed(Box::new(Integer::Variable(0))),
             Integer::Variable(1),Boolean::Variable);
-        assert_eq!(indexed.render_with_link(false,0,true),
+        assert_eq!(indexed.render_with_link(false,0,CallMode::Imported),
             "acc := Ops.Change(cells[(a MOD 4)], b, flag)");
         assert_eq!(indexed.render(true,0),
             "acc = change(&cells[floor_mod(a, 4)], b, flag)");
         let alias=Stmt::CallVarAlias(
             Place::Scalar(3),Place::Scalar(3),Integer::Variable(2));
-        assert_eq!(alias.render_with_link(false,0,true),"acc := Ops.Twist(x, x, c)");
+        assert_eq!(alias.render_with_link(false,0,CallMode::Imported),"acc := Ops.Twist(x, x, c)");
         assert_eq!(alias.render(true,0),"acc = twist(&x, &x, c)");
         for seed in 0..128 {
             let src=render(seed,"typed-import-source").unwrap();
@@ -871,6 +947,49 @@ mod tests {
             assert!(oracle.contains("change(&cells[floor_mod(a, 4)], b, flag)"));
             assert_eq!(oracle,render(seed,"typed-harness").unwrap());
             assert_eq!(src,render(seed,"typed-import-source").unwrap());
+        }
+    }
+    #[test]
+    fn imported_var_forwarding_preserves_aliases_through_three_modules() {
+        let provider=render(0,"typed-import-provider").unwrap();
+        let relay=render(0,"typed-relay-provider").unwrap();
+        let local=render(0,"typed-source").unwrap();
+        assert!(provider.contains("PROCEDURE Forward*(VAR left,right: INTEGER"));
+        assert!(provider.contains("result := Twist(left,right,delta);"));
+        assert!(local.contains("PROCEDURE Forward(VAR left,right: INTEGER"));
+        assert!(relay.starts_with("MODULE FuzzRelay;\nIMPORT Ops := FuzzOps;\n"));
+        assert!(relay.contains("PROCEDURE Forward*(VAR left,right: INTEGER"));
+        assert!(relay.contains("result := Ops.Twist(left,right,delta);"));
+        assert!(relay.contains("result := result + Ops.Change(right,delta,FALSE);"));
+        assert!(!relay.contains("PROCEDURE Twist("));
+        assert_eq!(relay,render(9876,"typed-relay-provider").unwrap());
+        for seed in 0..128 {
+            let direct=render(seed,"typed-import-source").unwrap();
+            let relayed=render(seed,"typed-relay-source").unwrap();
+            let selfcheck=render(seed,"typed-relay-selfcheck").unwrap();
+            let oracle=render(seed,"typed-relay-harness").unwrap();
+            assert!(relayed.starts_with(
+                "MODULE Fuzz;\nIMPORT Ops := FuzzOps, Relay := FuzzRelay;\n"));
+            assert_eq!(relayed.replace("IMPORT Ops := FuzzOps, Relay := FuzzRelay;",
+                "IMPORT Ops := FuzzOps;")
+                .replace("Relay.Forward(","Ops.Forward("),direct);
+            assert_eq!(oracle,render(seed,"typed-import-harness").unwrap());
+            assert!(oracle.contains("static int32_t forward(int32_t *left,int32_t *right,int32_t delta)"));
+            assert!(oracle.contains("int32_t result=twist(left,right,delta);"));
+            assert!(oracle.contains("result=wrap_add(result,change(right,delta,0));"));
+            assert!(oracle.contains("return wrap_add(result,*left);"));
+            assert!(relayed.contains("Relay.Forward(x, x, c)"));
+            assert!(relayed.contains(
+                "Relay.Forward(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
+            assert!(relayed.contains(
+                "Relay.Forward(y, cells[(cells[(b MOD 4)] MOD 4)], c)"));
+            assert!(oracle.contains("forward(&x, &x, c)"));
+            assert!(oracle.contains(
+                "forward(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
+            assert!(selfcheck.starts_with(relayed.trim_end_matches("END Fuzz.\n")));
+            assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
+            let p=Program::generate(seed);
+            assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarForward(..))).count()>=3);
         }
     }
     #[test]
@@ -948,7 +1067,7 @@ mod tests {
         assert_eq!(nested.render(true),"cells[floor_mod(cells[floor_mod(a, 4)], 4)]");
         let pair=Stmt::CallVarAlias(nested.clone(),nested,
             Integer::Literal(i32::MIN));
-        assert_eq!(pair.render_with_link(false,0,true),
+        assert_eq!(pair.render_with_link(false,0,CallMode::Imported),
             "acc := Ops.Twist(cells[(cells[(a MOD 4)] MOD 4)], cells[(cells[(a MOD 4)] MOD 4)], (0 - 2147483647 - 1))");
         assert_eq!(pair.render(true,0),
             "acc = twist(&cells[floor_mod(cells[floor_mod(a, 4)], 4)], &cells[floor_mod(cells[floor_mod(a, 4)], 4)], (0 - 2147483647 - 1))");
