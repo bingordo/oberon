@@ -703,6 +703,22 @@ impl Program {
       result := result + {prefix}Change(right,delta,FALSE);
       RETURN result + left
     END Forward;
+  PROCEDURE ForwardFlag{star}(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
+    VAR saved: BOOLEAN;
+    BEGIN
+      saved := {prefix}FlipFlag(b,guard);
+      IF saved THEN b := ~b END;
+      RETURN {prefix}FlipFlag(b,~guard)
+    END ForwardFlag;
+  PROCEDURE ForwardMixed{star}(VAR n: INTEGER; VAR b: BOOLEAN;
+                               delta: INTEGER; guard: BOOLEAN): INTEGER;
+    VAR saved: INTEGER;
+    BEGIN
+      saved := {prefix}Change(n,delta,guard);
+      b := {prefix}FlipFlag(b,saved # 0);
+      IF b THEN INC(n) ELSE DEC(n) END;
+      RETURN n + saved
+    END ForwardMixed;
 "#)
     }
     fn provider()->String {
@@ -756,6 +772,17 @@ impl Program {
              \x20 *left=wrap_add(*left,1);\n\
              \x20 result=wrap_add(result,change(right,delta,0));\n\
              \x20 return wrap_add(result,*left);\n\
+}\n\
+             static int forward_flag(int *b,int guard) {\n\
+             \x20 int saved=flip_flag(b,guard);\n\
+             \x20 if (saved) *b=!*b;\n\
+             \x20 return flip_flag(b,!guard);\n\
+}\n\
+             static int32_t forward_mixed(int32_t *n,int *b,int32_t delta,int guard) {\n\
+             \x20 int32_t saved=change(n,delta,guard);\n\
+             \x20 *b=flip_flag(b,saved!=0);\n\
+             \x20 *n=*b ? wrap_add(*n,1) : wrap_sub(*n,1);\n\
+             \x20 return wrap_add(*n,saved);\n\
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
