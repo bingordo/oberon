@@ -650,6 +650,41 @@ impl Program {
                         Box::new(Integer::Literal(0)))))),
             Stmt::CallVarMixed(Place::Scalar(3),
                 Integer::Variable(2),Boolean::Variable),
+            // Required multidimensional VAR cases: aliased row+column
+            // expressions, distinct matrix cells, and multi-hop forwarding.
+            Stmt::CallVar(
+                Place::Matrix(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1))),
+                Integer::MatrixRead(Box::new(Integer::Literal(1)),
+                    Box::new(Integer::Literal(2))),Boolean::Variable),
+            Stmt::CallVarAlias(
+                Place::Matrix(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1))),
+                Place::Matrix(
+                    Box::new(equivalent_bounded_index(Integer::Variable(0),MATRIX_ROWS)),
+                    Box::new(equivalent_bounded_index(Integer::Variable(1),MATRIX_COLS))),
+                Integer::MatrixRead(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1)))),
+            Stmt::CallVarAlias(
+                Place::Matrix(Box::new(Integer::Literal(0)),
+                    Box::new(Integer::Literal(0))),
+                Place::Matrix(Box::new(Integer::Literal(1)),
+                    Box::new(Integer::Literal(2))),Integer::Literal(3)),
+            Stmt::CallVarForward(
+                Place::Matrix(Box::new(Integer::Variable(1)),
+                    Box::new(Integer::Variable(2))),
+                Place::Matrix(
+                    Box::new(equivalent_bounded_index(Integer::Variable(1),MATRIX_ROWS)),
+                    Box::new(equivalent_bounded_index(Integer::Variable(2),MATRIX_COLS))),
+                Integer::Variable(0)),
+            Stmt::CallVarForward(
+                Place::Matrix(Box::new(Integer::Literal(1)),
+                    Box::new(Integer::Literal(1))),
+                Place::Scalar(4),Integer::Literal(-3)),
+            Stmt::CallVarMixed(
+                Place::Matrix(Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Variable(1))),
+                Integer::Literal(5),Boolean::Variable),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -671,10 +706,13 @@ impl Program {
             "  PROCEDURE {name}*(a,b,c: INTEGER): INTEGER;\n\
              \x20 VAR x,y,acc,k: INTEGER; flag: BOOLEAN;\n\
              \x20     cells: ARRAY 4 OF INTEGER;\n\
+             \x20     matrix: ARRAY 2,3 OF INTEGER;\n\
              \x20 BEGIN\n\
              \x20   hits := 0;\n\
              \x20   x := a; y := b; acc := c; flag := FALSE;\n\
-             \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n");
+             \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n\
+             \x20   matrix[0,0] := a; matrix[0,1] := b; matrix[0,2] := c;\n\
+             \x20   matrix[1,0] := 0; matrix[1,1] := 1; matrix[1,2] := (-1);\n");
         out.push_str(&sequence_with_link(&self.body,false,4,mode));
         out.push_str(";\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
