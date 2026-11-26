@@ -275,6 +275,10 @@ enum Stmt {
     CallVarForward(Place,Place,Integer),
     /// Mutate a checked BOOLEAN lvalue with a short-circuit guard.
     CallVarBoolean(Boolean),
+    /// Forward a BOOLEAN VAR address, independently of INTEGER actuals.
+    CallVarBooleanForward(Boolean),
+    /// Forward different typed VAR addresses in a single mixed ABI call.
+    CallVarMixed(Place,Integer,Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
     /// automatic increment. Nested loops are not generated.
@@ -359,6 +363,33 @@ impl Stmt {
                     format!("{pad}flag := {callee}(flag, {})",guard.render(false))
                 }
             }
+            Self::CallVarBooleanForward(guard)=>{
+                if c {
+                    format!("{pad}flag = forward_flag(&flag, {})",guard.render(true))
+                } else {
+                    let callee=match mode {
+                        CallMode::Local=>"ForwardFlag",
+                        CallMode::Imported=>"Ops.ForwardFlag",
+                        CallMode::Relayed=>"Relay.ForwardFlag",
+                    };
+                    format!("{pad}flag := {callee}(flag, {})",guard.render(false))
+                }
+            }
+            Self::CallVarMixed(target,delta,guard)=>{
+                let target=target.render(c);
+                if c {
+                    format!("{pad}acc = forward_mixed(&{target}, &flag, {}, {})",
+                        delta.render(true),guard.render(true))
+                } else {
+                    let callee=match mode {
+                        CallMode::Local=>"ForwardMixed",
+                        CallMode::Imported=>"Ops.ForwardMixed",
+                        CallMode::Relayed=>"Relay.ForwardMixed",
+                    };
+                    format!("{pad}acc := {callee}({target}, flag, {}, {})",
+                        delta.render(false),guard.render(false))
+                }
+            }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
@@ -393,7 +424,10 @@ impl Stmt {
             Self::CallVarAlias(left,right,delta)|
             Self::CallVarForward(left,right,delta)=>
                 1+left.nodes()+right.nodes()+delta.nodes(),
-            Self::CallVarBoolean(guard)=>1+guard.nodes(),
+            Self::CallVarBoolean(guard)|
+            Self::CallVarBooleanForward(guard)=>1+guard.nodes(),
+            Self::CallVarMixed(target,delta,guard)=>
+                1+target.nodes()+delta.nodes()+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
             Self::Repeat(_,body)=>1+body.iter().map(Self::nodes).sum::<usize>(),
@@ -409,7 +443,7 @@ fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,mode:CallMode)->String {
         .collect::<Vec<_>>().join(";\n")
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(11)} else {r.below(16)};
+    let choice=if depth==0 {r.below(13)} else {r.below(18)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
@@ -428,7 +462,9 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
             let (left,right)=var_pair(r);
             Stmt::CallVarForward(left,right,integer(r,2))
         },
-        11|12=>Stmt::If(boolean(r,3),
+        11=>Stmt::CallVarBooleanForward(boolean(r,3)),
+        12=>Stmt::CallVarMixed(place(r,2),integer(r,2),boolean(r,2)),
+        13|14=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -548,6 +584,22 @@ impl Program {
                 Place::Indexed(Box::new(Integer::ArrayRead(
                     Box::new(Integer::Variable(1))))),
                 Integer::Variable(2)),
+            // Forward BOOLEAN storage through the same two module boundaries,
+            // with both guard values and an actual that snapshots the flag.
+            Stmt::SetBoolean(Boolean::Literal(true)),
+            Stmt::CallVarBooleanForward(Boolean::Variable),
+            Stmt::CallVarBooleanForward(Boolean::Literal(false)),
+            // Heterogeneous VAR INTEGER + VAR BOOLEAN in one ABI call, with
+            // an indexed target and short-circuit side effects in the guard.
+            Stmt::CallVarMixed(
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Integer::Literal(i32::MIN),
+                Boolean::Or(Box::new(Boolean::Variable),
+                    Box::new(Boolean::TouchCompare(Rel::Gt,
+                        Box::new(Integer::Variable(1)),
+                        Box::new(Integer::Literal(0)))))),
+            Stmt::CallVarMixed(Place::Scalar(3),
+                Integer::Variable(2),Boolean::Variable),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -651,6 +703,22 @@ impl Program {
       result := result + {prefix}Change(right,delta,FALSE);
       RETURN result + left
     END Forward;
+  PROCEDURE ForwardFlag{star}(VAR b: BOOLEAN; guard: BOOLEAN): BOOLEAN;
+    VAR saved: BOOLEAN;
+    BEGIN
+      saved := {prefix}FlipFlag(b,guard);
+      IF saved THEN b := ~b END;
+      RETURN {prefix}FlipFlag(b,~guard)
+    END ForwardFlag;
+  PROCEDURE ForwardMixed{star}(VAR n: INTEGER; VAR b: BOOLEAN;
+                               delta: INTEGER; guard: BOOLEAN): INTEGER;
+    VAR saved: INTEGER;
+    BEGIN
+      saved := {prefix}Change(n,delta,guard);
+      b := {prefix}FlipFlag(b,saved # 0);
+      IF b THEN INC(n) ELSE DEC(n) END;
+      RETURN n + saved
+    END ForwardMixed;
 "#)
     }
     fn provider()->String {
@@ -704,6 +772,17 @@ impl Program {
              \x20 *left=wrap_add(*left,1);\n\
              \x20 result=wrap_add(result,change(right,delta,0));\n\
              \x20 return wrap_add(result,*left);\n\
+}\n\
+             static int forward_flag(int *b,int guard) {\n\
+             \x20 int saved=flip_flag(b,guard);\n\
+             \x20 if (saved) *b=!*b;\n\
+             \x20 return flip_flag(b,!guard);\n\
+}\n\
+             static int32_t forward_mixed(int32_t *n,int *b,int32_t delta,int guard) {\n\
+             \x20 int32_t saved=change(n,delta,guard);\n\
+             \x20 *b=flip_flag(b,saved!=0);\n\
+             \x20 *n=*b ? wrap_add(*n,1) : wrap_sub(*n,1);\n\
+             \x20 return wrap_add(*n,saved);\n\
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
@@ -963,6 +1042,14 @@ mod tests {
         assert!(relay.contains("result := result + Ops.Change(right,delta,FALSE);"));
         assert!(!relay.contains("PROCEDURE Twist("));
         assert_eq!(relay,render(9876,"typed-relay-provider").unwrap());
+        for name in ["ForwardFlag","ForwardMixed"] {
+            assert!(provider.contains(&format!("PROCEDURE {name}*(")));
+            assert!(relay.contains(&format!("PROCEDURE {name}*(")));
+            assert!(local.contains(&format!("PROCEDURE {name}(")));
+        }
+        assert!(relay.contains("saved := Ops.FlipFlag(b,guard);"));
+        assert!(relay.contains("saved := Ops.Change(n,delta,guard);"));
+        assert!(relay.contains("b := Ops.FlipFlag(b,saved # 0);"));
         for seed in 0..128 {
             let direct=render(seed,"typed-import-source").unwrap();
             let relayed=render(seed,"typed-relay-source").unwrap();
@@ -972,12 +1059,20 @@ mod tests {
                 "MODULE Fuzz;\nIMPORT Ops := FuzzOps, Relay := FuzzRelay;\n"));
             assert_eq!(relayed.replace("IMPORT Ops := FuzzOps, Relay := FuzzRelay;",
                 "IMPORT Ops := FuzzOps;")
-                .replace("Relay.Forward(","Ops.Forward("),direct);
+                .replace("Relay.Forward(","Ops.Forward(")
+                .replace("Relay.ForwardFlag(","Ops.ForwardFlag(")
+                .replace("Relay.ForwardMixed(","Ops.ForwardMixed("),direct);
             assert_eq!(oracle,render(seed,"typed-import-harness").unwrap());
             assert!(oracle.contains("static int32_t forward(int32_t *left,int32_t *right,int32_t delta)"));
             assert!(oracle.contains("int32_t result=twist(left,right,delta);"));
             assert!(oracle.contains("result=wrap_add(result,change(right,delta,0));"));
             assert!(oracle.contains("return wrap_add(result,*left);"));
+            assert!(oracle.contains("static int forward_flag(int *b,int guard)"));
+            assert!(oracle.contains("int saved=flip_flag(b,guard);"));
+            assert!(oracle.contains("return flip_flag(b,!guard);"));
+            assert!(oracle.contains("static int32_t forward_mixed(int32_t *n,int *b,int32_t delta,int guard)"));
+            assert!(oracle.contains("*b=flip_flag(b,saved!=0);"));
+            assert!(oracle.contains("return wrap_add(*n,saved);"));
             assert!(relayed.contains("Relay.Forward(x, x, c)"));
             assert!(relayed.contains(
                 "Relay.Forward(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
@@ -986,10 +1081,22 @@ mod tests {
             assert!(oracle.contains("forward(&x, &x, c)"));
             assert!(oracle.contains(
                 "forward(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
+            assert!(relayed.contains("Relay.ForwardFlag(flag, flag)"));
+            assert!(relayed.contains("Relay.ForwardFlag(flag, FALSE)"));
+            assert!(relayed.contains(
+                "Relay.ForwardMixed(cells[(a MOD 4)], flag, (0 - 2147483647 - 1), (flag OR (Touch(b) > 0)))"));
+            assert!(relayed.contains("Relay.ForwardMixed(x, flag, c, flag)"));
+            assert!(oracle.contains("forward_flag(&flag, flag)"));
+            assert!(oracle.contains("forward_flag(&flag, 0)"));
+            assert!(oracle.contains(
+                "forward_mixed(&cells[floor_mod(a, 4)], &flag, (0 - 2147483647 - 1), (flag || (touch(b) > 0)))"));
+            assert!(oracle.contains("forward_mixed(&x, &flag, c, flag)"));
             assert!(selfcheck.starts_with(relayed.trim_end_matches("END Fuzz.\n")));
             assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
             let p=Program::generate(seed);
             assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarForward(..))).count()>=3);
+            assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarBooleanForward(..))).count()>=2);
+            assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarMixed(..))).count()>=2);
         }
     }
     #[test]
