@@ -129,3 +129,21 @@ through `FuzzRelay`. Both paths use identical source-level helper
 semantics and the same C reference. Source generation is covered by
 128-seed unit tests; full GAS/direct-ELF differential execution is
 performed in `bingordo/compiler-ci`.
+
+## Checked multidimensional `VAR` actuals
+
+The typed generator's shared assignable-place AST also supports a local
+`ARRAY 2,3 OF INTEGER`, including recursive pure matrix reads, checked
+two-component indices, indexed VAR calls, and mixed integer/Boolean VAR
+calls. All the same `typed-*`, `typed-import-*`, and `typed-relay-*`
+modes use this AST without a new rendering path or schedule.
+
+Each seed requires identical-address and distinct-address matrix pairs,
+different row/column expressions that are guaranteed to alias, and relayed
+`VAR` forwarding. The equivalent-index transformation **normalizes each
+coordinate before adding its dimension**, so even a signed MIN/MAX input
+cannot spoil the equality for the three-column extent; an unbounded
+`column + 3` would not be safe under 32-bit wraparound. The independent
+C oracle uses matching two-dimensional storage, separately defined
+wrapping arithmetic, and compares **all six matrix elements** in the
+final value, including cells not otherwise read by the test program.
