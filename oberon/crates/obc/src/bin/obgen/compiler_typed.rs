@@ -275,6 +275,10 @@ enum Stmt {
     CallVarForward(Place,Place,Integer),
     /// Mutate a checked BOOLEAN lvalue with a short-circuit guard.
     CallVarBoolean(Boolean),
+    /// Forward a BOOLEAN VAR address, independently of INTEGER actuals.
+    CallVarBooleanForward(Boolean),
+    /// Forward different typed VAR addresses in a single mixed ABI call.
+    CallVarMixed(Place,Integer,Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
     /// A loop never mutates the control variable 'k' except by its final
     /// automatic increment. Nested loops are not generated.
@@ -359,6 +363,33 @@ impl Stmt {
                     format!("{pad}flag := {callee}(flag, {})",guard.render(false))
                 }
             }
+            Self::CallVarBooleanForward(guard)=>{
+                if c {
+                    format!("{pad}flag = forward_flag(&flag, {})",guard.render(true))
+                } else {
+                    let callee=match mode {
+                        CallMode::Local=>"ForwardFlag",
+                        CallMode::Imported=>"Ops.ForwardFlag",
+                        CallMode::Relayed=>"Relay.ForwardFlag",
+                    };
+                    format!("{pad}flag := {callee}(flag, {})",guard.render(false))
+                }
+            }
+            Self::CallVarMixed(target,delta,guard)=>{
+                let target=target.render(c);
+                if c {
+                    format!("{pad}acc = forward_mixed(&{target}, &flag, {}, {})",
+                        delta.render(true),guard.render(true))
+                } else {
+                    let callee=match mode {
+                        CallMode::Local=>"ForwardMixed",
+                        CallMode::Imported=>"Ops.ForwardMixed",
+                        CallMode::Relayed=>"Relay.ForwardMixed",
+                    };
+                    format!("{pad}acc := {callee}({target}, flag, {}, {})",
+                        delta.render(false),guard.render(false))
+                }
+            }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
@@ -393,7 +424,10 @@ impl Stmt {
             Self::CallVarAlias(left,right,delta)|
             Self::CallVarForward(left,right,delta)=>
                 1+left.nodes()+right.nodes()+delta.nodes(),
-            Self::CallVarBoolean(guard)=>1+guard.nodes(),
+            Self::CallVarBoolean(guard)|
+            Self::CallVarBooleanForward(guard)=>1+guard.nodes(),
+            Self::CallVarMixed(target,delta,guard)=>
+                1+target.nodes()+delta.nodes()+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
                 +c.iter().map(Self::nodes).sum::<usize>(),
             Self::Repeat(_,body)=>1+body.iter().map(Self::nodes).sum::<usize>(),
@@ -409,7 +443,7 @@ fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,mode:CallMode)->String {
         .collect::<Vec<_>>().join(";\n")
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(11)} else {r.below(16)};
+    let choice=if depth==0 {r.below(13)} else {r.below(18)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
@@ -428,7 +462,9 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
             let (left,right)=var_pair(r);
             Stmt::CallVarForward(left,right,integer(r,2))
         },
-        11|12=>Stmt::If(boolean(r,3),
+        11=>Stmt::CallVarBooleanForward(boolean(r,3)),
+        12=>Stmt::CallVarMixed(place(r,2),integer(r,2),boolean(r,2)),
+        13|14=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -548,6 +584,22 @@ impl Program {
                 Place::Indexed(Box::new(Integer::ArrayRead(
                     Box::new(Integer::Variable(1))))),
                 Integer::Variable(2)),
+            // Forward BOOLEAN storage through the same two module boundaries,
+            // with both guard values and an actual that snapshots the flag.
+            Stmt::SetBoolean(Boolean::Literal(true)),
+            Stmt::CallVarBooleanForward(Boolean::Variable),
+            Stmt::CallVarBooleanForward(Boolean::Literal(false)),
+            // Heterogeneous VAR INTEGER + VAR BOOLEAN in one ABI call, with
+            // an indexed target and short-circuit side effects in the guard.
+            Stmt::CallVarMixed(
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Integer::Literal(i32::MIN),
+                Boolean::Or(Box::new(Boolean::Variable),
+                    Box::new(Boolean::TouchCompare(Rel::Gt,
+                        Box::new(Integer::Variable(1)),
+                        Box::new(Integer::Literal(0)))))),
+            Stmt::CallVarMixed(Place::Scalar(3),
+                Integer::Variable(2),Boolean::Variable),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
