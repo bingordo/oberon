@@ -94,3 +94,32 @@ Use `typed-import-selfcheck` instead of `typed-import-source` to emit the
 additional module-level metamorphic checks. The provider contents are
 seed-independent. Native end-to-end execution belongs on
 `bingordo/compiler-ci`, not the source repository's Actions.
+
+## Three-module VAR forwarding differential
+
+The `typed-relay-*` modes add a third native module between the generated
+consumer and the operations provider, without changing the typed AST or the
+independent C oracle. `Fuzz.Probe` calls `FuzzRelay.Forward` with scalar
+and indexed `VAR INTEGER` arguments; the relay forwards **the original
+addresses** to `FuzzOps.Twist` and `FuzzOps.Change`, then reads the
+mutated values again. This stresses pointer/VAR forwarding through two
+call boundaries, distinct expressions selecting one array address,
+same-scalar aliases, and mixed scalar/array actuals.
+
+```sh
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-import-provider > FuzzOps.mod
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-relay-provider > FuzzRelay.mod
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-relay-source > Fuzz.mod
+cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
+  --base 42 --compiler-subset=typed-relay-harness > reference.c
+```
+
+The prior `typed-import-*` two-module modes remain supported; their
+`Forward` helper is exported from `FuzzOps` instead of forwarding
+through `FuzzRelay`. Both paths use identical source-level helper
+semantics and the same C reference. Source generation is covered by
+128-seed unit tests; full GAS/direct-ELF differential execution is
+performed in `bingordo/compiler-ci`.
