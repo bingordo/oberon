@@ -7,6 +7,8 @@ use std::fmt::Write as _;
 
 const INPUTS:usize=32;
 const ARRAY_LEN:usize=4;
+const MATRIX_ROWS:usize=2;
+const MATRIX_COLS:usize=3;
 const INT_NAMES:[&str;6]=["a","b","c","x","y","acc"];
 
 #[cfg(test)]
@@ -53,6 +55,8 @@ enum Integer {
     Binary(IOp,Box<Integer>,Box<Integer>),
     /// A side-effect-free read from a bounded local INTEGER array.
     ArrayRead(Box<Integer>),
+    /// Pure multidimensional read with independently bounded row and column.
+    MatrixRead(Box<Integer>,Box<Integer>),
 }
 #[derive(Clone,Debug)]
 enum Boolean {
@@ -79,9 +83,23 @@ fn literal(n:i32)->String {
 }
 /// Any signed expression, including MIN(INTEGER), becomes an in-bounds
 /// subscript using Oberon's floor MOD semantics (not C's remainder).
+fn bounded_index(index:&Integer,length:usize,c:bool)->String {
+    if c {format!("floor_mod({}, {length})",index.render(true))}
+    else {format!("({} MOD {length})",index.render(false))}
+}
 fn array_index(index:&Integer,c:bool)->String {
-    if c {format!("floor_mod({}, {ARRAY_LEN})",index.render(true))}
-    else {format!("({} MOD {ARRAY_LEN})",index.render(false))}
+    bounded_index(index,ARRAY_LEN,c)
+}
+fn matrix_place(row:&Integer,col:&Integer,c:bool)->String {
+    if c {
+        format!("matrix[{}][{}]",
+            bounded_index(row,MATRIX_ROWS,true),
+            bounded_index(col,MATRIX_COLS,true))
+    } else {
+        format!("matrix[{}, {}]",
+            bounded_index(row,MATRIX_ROWS,false),
+            bounded_index(col,MATRIX_COLS,false))
+    }
 }
 impl Integer {
     fn render(&self,c:bool)->String {
@@ -89,6 +107,7 @@ impl Integer {
             Self::Variable(i)=>INT_NAMES[*i].to_string(),
             Self::Literal(n)=>literal(*n),
             Self::ArrayRead(index)=>format!("cells[{}]",array_index(index,c)),
+            Self::MatrixRead(row,col)=>matrix_place(row,col,c),
             Self::Binary(op,a,b)=>{
                 let (a,b)=(a.render(c),b.render(c));
                 if c {
@@ -105,6 +124,7 @@ impl Integer {
         match self {
             Self::Variable(_)|Self::Literal(_)=>1,
             Self::ArrayRead(index)=>1+index.nodes(),
+            Self::MatrixRead(row,col)=>1+row.nodes()+col.nodes(),
             Self::Binary(_,a,b)=>1+a.nodes()+b.nodes(),
         }
     }
@@ -171,6 +191,10 @@ fn integer(r:&mut Rng,depth:usize)->Integer {
     if r.below(6)==0 {
         return Integer::ArrayRead(Box::new(integer(r,depth-1)));
     }
+    if r.below(9)==0 {
+        return Integer::MatrixRead(
+            Box::new(integer(r,depth-1)),Box::new(integer(r,depth-1)));
+    }
     let op=match r.below(5) {
         0=>IOp::Add,1=>IOp::Sub,2=>IOp::Mul,3=>IOp::Div,_=>IOp::Mod,
     };
@@ -210,22 +234,31 @@ fn boolean(r:&mut Rng,depth:usize)->Boolean {
 enum Place {
     Scalar(usize),
     Indexed(Box<Integer>),
+    Matrix(Box<Integer>,Box<Integer>),
 }
 impl Place {
     fn render(&self,c:bool)->String {
         match self {
             Self::Scalar(slot)=>INT_NAMES[*slot].to_string(),
             Self::Indexed(index)=>format!("cells[{}]",array_index(index,c)),
+            Self::Matrix(row,col)=>matrix_place(row,col,c),
         }
     }
     #[cfg(test)]
     fn nodes(&self)->usize {
-        match self {Self::Scalar(_)=>1,Self::Indexed(index)=>1+index.nodes()}
+        match self {
+            Self::Scalar(_)=>1,
+            Self::Indexed(index)=>1+index.nodes(),
+            Self::Matrix(row,col)=>1+row.nodes()+col.nodes(),
+        }
     }
 }
 fn place(r:&mut Rng,depth:usize)->Place {
-    if r.below(3)==0 {Place::Scalar(3+r.below(3))}
-    else {Place::Indexed(Box::new(integer(r,depth)))}
+    match r.below(4) {
+        0=>Place::Scalar(3+r.below(3)),
+        1=>Place::Matrix(Box::new(integer(r,depth)),Box::new(integer(r,depth))),
+        _=>Place::Indexed(Box::new(integer(r,depth))),
+    }
 }
 /// Adding/subtracting a multiple of the array length leaves a wrapped 32-bit
 /// index in the same congruence class. Since ARRAY_LEN divides 2^32,
@@ -236,11 +269,20 @@ fn equivalent_index(index:Integer,r:&mut Rng)->Integer {
         if r.below(2)==0 {IOp::Add} else {IOp::Sub},
         Box::new(index),Box::new(Integer::Literal(offset)))
 }
+/// Generate equivalent but syntactically distinct multidimensional indices.
+/// Normalize first: adding 3 to an *unbounded* signed column could wrap and
+/// cease to alias because 3 does not divide 2^32.
+fn equivalent_bounded_index(index:Integer,length:usize)->Integer {
+    Integer::Binary(IOp::Add,
+        Box::new(Integer::Binary(IOp::Mod,Box::new(index),
+            Box::new(Integer::Literal(length as i32)))),
+        Box::new(Integer::Literal(length as i32)))
+}
 /// Generate distinct places, identical ASTs, and different address
 /// expressions guaranteed to alias. Index terms are pure: all actual
 /// addresses/values can be evaluated before any callee mutation.
 fn var_pair(r:&mut Rng)->(Place,Place) {
-    match r.below(6) {
+    match r.below(7) {
         0=>{
             let left=place(r,2);
             (left.clone(),left)
@@ -253,6 +295,14 @@ fn var_pair(r:&mut Rng)->(Place,Place) {
             } else {integer(r,2)};
             let alias=equivalent_index(index.clone(),r);
             (Place::Indexed(Box::new(index)),Place::Indexed(Box::new(alias)))
+        },
+        3|4=>{
+            let row=integer(r,2);
+            let col=integer(r,2);
+            let same_row=equivalent_bounded_index(row.clone(),MATRIX_ROWS);
+            let same_col=equivalent_bounded_index(col.clone(),MATRIX_COLS);
+            (Place::Matrix(Box::new(row),Box::new(col)),
+                Place::Matrix(Box::new(same_row),Box::new(same_col)))
         },
         _=>(place(r,2),place(r,2)),
     }
