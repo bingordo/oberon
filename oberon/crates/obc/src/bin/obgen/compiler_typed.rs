@@ -635,10 +635,30 @@ impl Program {
      DEC(left);
      RETURN right
    END Twist;
+"#);
+        out.push_str(&Self::forward_helper(exported,""));
+        out
+    }
+    /// Forward the exact VAR addresses into *another* procedure. The relay
+    /// module calls the same exported procedures through FuzzOps imports.
+    fn forward_helper(exported:bool,prefix:&str)->String {
+        let star=if exported {"*"} else {""};
+        format!(r#"  PROCEDURE Forward{star}(VAR left,right: INTEGER; delta: INTEGER): INTEGER;
+    VAR result: INTEGER;
+    BEGIN
+      result := {prefix}Twist(left,right,delta);
+      INC(left);
+      result := result + {prefix}Change(right,delta,FALSE);
+      RETURN result + left
+    END Forward;
 "#)
     }
     fn provider()->String {
         format!("MODULE FuzzOps;\n{}END FuzzOps.\n",Self::helpers(true))
+    }
+    fn relay_provider()->String {
+        format!("MODULE FuzzRelay;\nIMPORT Ops := FuzzOps;\n{}END FuzzRelay.\n",
+            Self::forward_helper(true,"Ops."))
     }
     fn c_reference(&self,cases:&[(i32,i32,i32)],seed:u64)->String {
         let mut out=String::from(
@@ -678,6 +698,12 @@ impl Program {
              \x20 *right=wrap_add(*left,*right);\n\
              \x20 *left=wrap_sub(*left,1);\n\
              \x20 return *right;\n\
+}\n\
+             static int32_t forward(int32_t *left,int32_t *right,int32_t delta) {\n\
+             \x20 int32_t result=twist(left,right,delta);\n\
+             \x20 *left=wrap_add(*left,1);\n\
+             \x20 result=wrap_add(result,change(right,delta,0));\n\
+             \x20 return wrap_add(result,*left);\n\
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
@@ -725,10 +751,14 @@ pub(super) fn render(seed:u64,mode:&str)->Result<String,String> {
     match mode {
         "typed-source"=>Ok(program.source(&cases,false)),
         "typed-selfcheck"=>Ok(program.source(&cases,true)),
-        "typed-harness"|"typed-import-harness"=>Ok(program.c_reference(&cases,seed)),
+        "typed-harness"|"typed-import-harness"|"typed-relay-harness"=>
+            Ok(program.c_reference(&cases,seed)),
         "typed-import-provider"=>Ok(Program::provider()),
-        "typed-import-source"=>Ok(program.source_mode(&cases,false,true)),
-        "typed-import-selfcheck"=>Ok(program.source_mode(&cases,true,true)),
+        "typed-relay-provider"=>Ok(Program::relay_provider()),
+        "typed-import-source"=>Ok(program.source_mode(&cases,false,CallMode::Imported)),
+        "typed-import-selfcheck"=>Ok(program.source_mode(&cases,true,CallMode::Imported)),
+        "typed-relay-source"=>Ok(program.source_mode(&cases,false,CallMode::Relayed)),
+        "typed-relay-selfcheck"=>Ok(program.source_mode(&cases,true,CallMode::Relayed)),
         _=>Err(format!("unknown typed compiler subset mode {mode}")),
     }
 }
@@ -883,13 +913,13 @@ mod tests {
         let indexed=Stmt::CallVar(
             Place::Indexed(Box::new(Integer::Variable(0))),
             Integer::Variable(1),Boolean::Variable);
-        assert_eq!(indexed.render_with_link(false,0,true),
+        assert_eq!(indexed.render_with_link(false,0,CallMode::Imported),
             "acc := Ops.Change(cells[(a MOD 4)], b, flag)");
         assert_eq!(indexed.render(true,0),
             "acc = change(&cells[floor_mod(a, 4)], b, flag)");
         let alias=Stmt::CallVarAlias(
             Place::Scalar(3),Place::Scalar(3),Integer::Variable(2));
-        assert_eq!(alias.render_with_link(false,0,true),"acc := Ops.Twist(x, x, c)");
+        assert_eq!(alias.render_with_link(false,0,CallMode::Imported),"acc := Ops.Twist(x, x, c)");
         assert_eq!(alias.render(true,0),"acc = twist(&x, &x, c)");
         for seed in 0..128 {
             let src=render(seed,"typed-import-source").unwrap();
@@ -994,7 +1024,7 @@ mod tests {
         assert_eq!(nested.render(true),"cells[floor_mod(cells[floor_mod(a, 4)], 4)]");
         let pair=Stmt::CallVarAlias(nested.clone(),nested,
             Integer::Literal(i32::MIN));
-        assert_eq!(pair.render_with_link(false,0,true),
+        assert_eq!(pair.render_with_link(false,0,CallMode::Imported),
             "acc := Ops.Twist(cells[(cells[(a MOD 4)] MOD 4)], cells[(cells[(a MOD 4)] MOD 4)], (0 - 2147483647 - 1))");
         assert_eq!(pair.render(true,0),
             "acc = twist(&cells[floor_mod(cells[floor_mod(a, 4)], 4)], &cells[floor_mod(cells[floor_mod(a, 4)], 4)], (0 - 2147483647 - 1))");
