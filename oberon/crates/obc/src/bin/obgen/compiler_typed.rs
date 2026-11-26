@@ -715,6 +715,8 @@ impl Program {
              \x20   matrix[1,0] := 0; matrix[1,1] := 1; matrix[1,2] := (-1);\n");
         out.push_str(&sequence_with_link(&self.body,false,4,mode));
         out.push_str(";\n");
+        // Make every matrix cell observable, including the interior ones.
+        out.push_str("    acc := acc + matrix[0,0] + matrix[0,1] + matrix[0,2] + matrix[1,0] + matrix[1,1] + matrix[1,2];\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
             out.push_str("    RETURN ((acc + cells[0]) + (x + y)) + ((hits + cells[1]) + (cells[2] + cells[3]))\n");
@@ -874,9 +876,12 @@ impl Program {
 }\n\
              static int32_t reference_probe(int32_t a,int32_t b,int32_t c) {\n\
              \x20 int32_t x=a,y=b,acc=c,k=0; int flag=0; hits=0;\n\
-             \x20 int32_t cells[4]={a,b,c,0};\n");
+             \x20 int32_t cells[4]={a,b,c,0};\n\
+             \x20 int32_t matrix[2][3]={{a,b,c},{0,1,-1}};\n");
         out.push_str(&sequence(&self.body,true,2));
-        out.push_str(";\n  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[1]),cells[2]),cells[3]);\n}\n");
+        // Full matrix state is part of the independent differential.
+        out.push_str(";\n  acc = wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,matrix[0][0]),matrix[0][1]),matrix[0][2]),matrix[1][0]),matrix[1][1]),matrix[1][2]);\n");
+        out.push_str("  return wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,x),y),hits),cells[0]),cells[1]),cells[2]),cells[3]);\n}\n");
         out.push_str(
             "extern int32_t Fuzz__Probe(int32_t,int32_t,int32_t);\n\
              extern int32_t Fuzz__Mirror(int32_t,int32_t,int32_t);\n\
