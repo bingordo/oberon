@@ -1042,6 +1042,14 @@ mod tests {
         assert!(relay.contains("result := result + Ops.Change(right,delta,FALSE);"));
         assert!(!relay.contains("PROCEDURE Twist("));
         assert_eq!(relay,render(9876,"typed-relay-provider").unwrap());
+        for name in ["ForwardFlag","ForwardMixed"] {
+            assert!(provider.contains(&format!("PROCEDURE {name}*(")));
+            assert!(relay.contains(&format!("PROCEDURE {name}*(")));
+            assert!(local.contains(&format!("PROCEDURE {name}(")));
+        }
+        assert!(relay.contains("saved := Ops.FlipFlag(b,guard);"));
+        assert!(relay.contains("saved := Ops.Change(n,delta,guard);"));
+        assert!(relay.contains("b := Ops.FlipFlag(b,saved # 0);"));
         for seed in 0..128 {
             let direct=render(seed,"typed-import-source").unwrap();
             let relayed=render(seed,"typed-relay-source").unwrap();
@@ -1051,12 +1059,20 @@ mod tests {
                 "MODULE Fuzz;\nIMPORT Ops := FuzzOps, Relay := FuzzRelay;\n"));
             assert_eq!(relayed.replace("IMPORT Ops := FuzzOps, Relay := FuzzRelay;",
                 "IMPORT Ops := FuzzOps;")
-                .replace("Relay.Forward(","Ops.Forward("),direct);
+                .replace("Relay.Forward(","Ops.Forward(")
+                .replace("Relay.ForwardFlag(","Ops.ForwardFlag(")
+                .replace("Relay.ForwardMixed(","Ops.ForwardMixed("),direct);
             assert_eq!(oracle,render(seed,"typed-import-harness").unwrap());
             assert!(oracle.contains("static int32_t forward(int32_t *left,int32_t *right,int32_t delta)"));
             assert!(oracle.contains("int32_t result=twist(left,right,delta);"));
             assert!(oracle.contains("result=wrap_add(result,change(right,delta,0));"));
             assert!(oracle.contains("return wrap_add(result,*left);"));
+            assert!(oracle.contains("static int forward_flag(int *b,int guard)"));
+            assert!(oracle.contains("int saved=flip_flag(b,guard);"));
+            assert!(oracle.contains("return flip_flag(b,!guard);"));
+            assert!(oracle.contains("static int32_t forward_mixed(int32_t *n,int *b,int32_t delta,int guard)"));
+            assert!(oracle.contains("*b=flip_flag(b,saved!=0);"));
+            assert!(oracle.contains("return wrap_add(*n,saved);"));
             assert!(relayed.contains("Relay.Forward(x, x, c)"));
             assert!(relayed.contains(
                 "Relay.Forward(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
@@ -1065,10 +1081,22 @@ mod tests {
             assert!(oracle.contains("forward(&x, &x, c)"));
             assert!(oracle.contains(
                 "forward(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
+            assert!(relayed.contains("Relay.ForwardFlag(flag, flag)"));
+            assert!(relayed.contains("Relay.ForwardFlag(flag, FALSE)"));
+            assert!(relayed.contains(
+                "Relay.ForwardMixed(cells[(a MOD 4)], flag, (0 - 2147483647 - 1), (flag OR (Touch(b) > 0)))"));
+            assert!(relayed.contains("Relay.ForwardMixed(x, flag, c, flag)"));
+            assert!(oracle.contains("forward_flag(&flag, flag)"));
+            assert!(oracle.contains("forward_flag(&flag, 0)"));
+            assert!(oracle.contains(
+                "forward_mixed(&cells[floor_mod(a, 4)], &flag, (0 - 2147483647 - 1), (flag || (touch(b) > 0)))"));
+            assert!(oracle.contains("forward_mixed(&x, &flag, c, flag)"));
             assert!(selfcheck.starts_with(relayed.trim_end_matches("END Fuzz.\n")));
             assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
             let p=Program::generate(seed);
             assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarForward(..))).count()>=3);
+            assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarBooleanForward(..))).count()>=2);
+            assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarMixed(..))).count()>=2);
         }
     }
     #[test]
