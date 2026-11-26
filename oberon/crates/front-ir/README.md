@@ -2,9 +2,18 @@ Small checked Oberon frontend library for the separate Rust native compiler. Use
 
 Supported procedure subset: value `INTEGER` parameters, scalar `INTEGER` locals/globals, fixed one-dimensional `ARRAY n OF INTEGER` declarations with literal nonzero lengths up to 1024, private named or anonymous INTEGER-only record variables, assignments, field and array access, IF/ELSIF, WHILE, integer-returning procedures, same-module calls and module BEGIN initialization. Unsupported constructs fail closed.
 
-Private INTEGER-only records are projected to **one contiguous, zeroed, addressable memory object per record**, using the checked fixed INTEGER-array storage representation with field indices resolved from source field names (four-byte elements, one to 1024 fields). Direct `r.field` reads and writes and direct `a := b` whole-record copies now use that same object. This is a **restricted homogeneous layout**, not a general record ABI: exported types and objects, heterogeneous fields, record-valued parameters and returns, pointers, arbitrary address exposure, VAR arguments and external references are unsupported. The semantic checker remains authoritative for source types and assignment compatibility; a rejected shape never receives invented layout.
+Private INTEGER-only records are projected to **one contiguous, zeroed, addressable memory object per record**, using the checked fixed INTEGER-array storage representation with field indices resolved from source field names (four-byte elements, one to 1024 fields). Direct `r.field` reads and writes and direct `a := b` whole-record copies now use that same object. This is a **restricted homogeneous layout**, not a general record ABI: exported types and objects, heterogeneous fields, record-valued parameters and returns, pointers, aggregate address exposure, record-valued VAR arguments and external record references are unsupported. The semantic checker remains authoritative for source types and assignment compatibility; a rejected shape never receives invented layout.
 
 The projection exports arrays through `Function.arrays: Vec<ArrayLocal>`, with `ArrayLocal { name, length }`, `Expr::ArrayElement` and `Stmt::AssignArray`. Array indices are semantic-checked expressions. The consuming compiler owns frame layout, zero initialization, signed bounds traps, SSA and machine code. The bridge does not expose array ABI parameters, open/multidimensional arrays or module imports.
+
+Checked `VAR INTEGER` calls may also take scalar INTEGER record-leaf designators,
+including nested private-record leaves and aligned INTEGER fields in mixed
+BYTE/INTEGER record storage. Homogeneous records reuse the existing checked
+word-array element address; mixed records carry the authoritative byte offset
+as `AddressOfRecordField`. This exposes only the selected checked scalar
+leaf, not a record ABI, arbitrary address escape, a BYTE reference or
+pointer-dereference argument. Imported and local scalar calls share the same
+address admission rules.
 
 The native compiler pins this repository to a reviewed commit; changes to the bridge require updating that pinned Git revision and running focused driver and compiler-ci source/native GAS/direct ELF execution tests. Until then, the change is only a frontend candidate and is not available to the production `bingordo/compiler` driver.
 
