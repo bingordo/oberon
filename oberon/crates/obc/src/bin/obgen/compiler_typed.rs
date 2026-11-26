@@ -618,7 +618,7 @@ impl Program {
     /// remains an independent implementation and separate compilation.
     fn helpers(exported:bool)->String {
         let star=if exported {"*"} else {""};
-        format!(r#"  PROCEDURE Change{star}(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
+        let mut out=format!(r#"  PROCEDURE Change{star}(VAR n: INTEGER; delta: INTEGER; minus: BOOLEAN): INTEGER;
    BEGIN
      IF minus THEN DEC(n,delta) ELSE INC(n,delta) END;
      RETURN n
