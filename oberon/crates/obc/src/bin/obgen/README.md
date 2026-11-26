@@ -104,7 +104,13 @@ and indexed `VAR INTEGER` arguments; the relay forwards **the original
 addresses** to `FuzzOps.Twist` and `FuzzOps.Change`, then reads the
 mutated values again. This stresses pointer/VAR forwarding through two
 call boundaries, distinct expressions selecting one array address,
-same-scalar aliases, and mixed scalar/array actuals.
+same-scalar aliases, and mixed scalar/array actuals. The same type-directed
+AST also generates relayed `VAR BOOLEAN` calls (`ForwardFlag`) and
+heterogeneous `VAR INTEGER` + `VAR BOOLEAN` calls (`ForwardMixed`), with
+both Boolean guard values, short-circuit `Touch` effects, and read-after-write
+mutations in the callee. Each seed includes mandatory witnesses and recursive
+randomized calls for both new signatures. The C oracle models the helper
+semantics independently with defined 32-bit wrapping.
 
 ```sh
 cargo run --manifest-path oberon/Cargo.toml --bin obgen -- \
