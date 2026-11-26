@@ -257,6 +257,9 @@ fn var_pair(r:&mut Rng)->(Place,Place) {
         _=>(place(r,2),place(r,2)),
     }
 }
+/// Local, imported directly, or forwarded through a second imported module.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum CallMode { Local, Imported, Relayed }
 #[derive(Clone,Debug)]
 enum Stmt {
     SetInteger(usize,Integer),
@@ -268,6 +271,8 @@ enum Stmt {
     CallVar(Place,Integer,Boolean),
     /// Two independently addressable actuals, deliberately sometimes aliased.
     CallVarAlias(Place,Place,Integer),
+    /// Forward original VAR addresses through a second call frame.
+    CallVarForward(Place,Place,Integer),
     /// Mutate a checked BOOLEAN lvalue with a short-circuit guard.
     CallVarBoolean(Boolean),
     If(Boolean,Vec<Stmt>,Vec<Stmt>),
@@ -277,9 +282,9 @@ enum Stmt {
 }
 impl Stmt {
     fn render(&self,c:bool,indent:usize)->String {
-        self.render_with_link(c,indent,false)
+        self.render_with_link(c,indent,CallMode::Local)
     }
-    fn render_with_link(&self,c:bool,indent:usize,imported:bool)->String {
+    fn render_with_link(&self,c:bool,indent:usize,mode:CallMode)->String {
         let pad=" ".repeat(indent);
         match self {
             Self::SetInteger(slot,e)=>format!("{pad}{} {} {}",
@@ -316,7 +321,7 @@ impl Stmt {
                     format!("{pad}acc = change(&{target}, {}, {})",
                         delta.render(true),minus.render(true))
                 } else {
-                    let callee=if imported {"Ops.Change"} else {"Change"};
+                    let callee=if mode!=CallMode::Local {"Ops.Change"} else {"Change"};
                     format!("{pad}acc := {callee}({target}, {}, {})",
                         delta.render(false),minus.render(false))
                 }
@@ -327,36 +332,51 @@ impl Stmt {
                 if c {
                     format!("{pad}acc = twist(&{left}, &{right}, {})",delta.render(true))
                 } else {
-                    let callee=if imported {"Ops.Twist"} else {"Twist"};
+                    let callee=if mode!=CallMode::Local {"Ops.Twist"} else {"Twist"};
                     format!("{pad}acc := {callee}({left}, {right}, {})",delta.render(false))
+                }
+            }
+            Self::CallVarForward(left,right,delta)=>{
+                let left=left.render(c);
+                let right=right.render(c);
+                if c {
+                    format!("{pad}acc = forward(&{left}, &{right}, {})",delta.render(true))
+                } else {
+                    let callee=match mode {
+                        CallMode::Local=>"Forward",
+                        CallMode::Imported=>"Ops.Forward",
+                        CallMode::Relayed=>"Relay.Forward",
+                    };
+                    format!("{pad}acc := {callee}({left}, {right}, {})",
+                        delta.render(false))
                 }
             }
             Self::CallVarBoolean(guard)=>{
                 if c {
                     format!("{pad}flag = flip_flag(&flag, {})",guard.render(true))
                 } else {
-                    let callee=if imported {"Ops.FlipFlag"} else {"FlipFlag"};
+                    let callee=if mode!=CallMode::Local {"Ops.FlipFlag"} else {"FlipFlag"};
                     format!("{pad}flag := {callee}(flag, {})",guard.render(false))
                 }
             }
             Self::If(cond,a,b)=>{
                 if c {
                     format!("{pad}if ({}) {{\n{};\n{pad}}} else {{\n{};\n{pad}}}",
-                        cond.render(true),sequence_with_link(a,true,indent+2,imported),
-                        sequence_with_link(b,true,indent+2,imported))
+                        cond.render(true),sequence_with_link(a,true,indent+2,mode),
+                        sequence_with_link(b,true,indent+2,mode))
                 } else {
                     format!("{pad}IF {} THEN\n{}\n{pad}ELSE\n{}\n{pad}END",
-                        cond.render(false),sequence_with_link(a,false,indent+2,imported),
-                        sequence_with_link(b,false,indent+2,imported))
+                        cond.render(false),sequence_with_link(a,false,indent+2,mode),
+                        sequence_with_link(b,false,indent+2,mode))
                 }
             }
             Self::Repeat(n,body)=>{
                 if c {
                     format!("{pad}k = 0;\n{pad}do {{\n{};\n{pad}  k++;\n{pad}}} while (k < {n})",
-                        sequence_with_link(body,true,indent+2,imported))
+                        sequence_with_link(body,true,indent+2,mode))
                 } else {
                     format!("{pad}k := 0;\n{pad}REPEAT\n{};\n{pad}  INC(k)\n{pad}UNTIL k >= {n}",
-                        sequence_with_link(body,false,indent+2,imported))
+                        sequence_with_link(body,false,indent+2,mode))
                 }
             }
         }
@@ -370,7 +390,8 @@ impl Stmt {
                 1+index.nodes()+value.nodes(),
             Self::CallVar(target,delta,minus)=>
                 1+target.nodes()+delta.nodes()+minus.nodes(),
-            Self::CallVarAlias(left,right,delta)=>
+            Self::CallVarAlias(left,right,delta)|
+            Self::CallVarForward(left,right,delta)=>
                 1+left.nodes()+right.nodes()+delta.nodes(),
             Self::CallVarBoolean(guard)=>1+guard.nodes(),
             Self::If(b,a,c)=>1+b.nodes()+a.iter().map(Self::nodes).sum::<usize>()
@@ -382,13 +403,13 @@ impl Stmt {
 fn sequence(stmts:&[Stmt],c:bool,indent:usize)->String {
     stmts.iter().map(|s|s.render(c,indent)).collect::<Vec<_>>().join(";\n")
 }
-fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,imported:bool)->String {
-    if !imported { return sequence(stmts,c,indent); }
-    stmts.iter().map(|s|s.render_with_link(c,indent,imported))
+fn sequence_with_link(stmts:&[Stmt],c:bool,indent:usize,mode:CallMode)->String {
+    if mode==CallMode::Local { return sequence(stmts,c,indent); }
+    stmts.iter().map(|s|s.render_with_link(c,indent,mode))
         .collect::<Vec<_>>().join(";\n")
 }
 fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
-    let choice=if depth==0 {r.below(10)} else {r.below(15)};
+    let choice=if depth==0 {r.below(11)} else {r.below(16)};
     match choice {
         0=>Stmt::SetInteger(3+r.below(3),integer(r,3)),
         1=>Stmt::SetBoolean(boolean(r,3)),
@@ -403,7 +424,11 @@ fn statement(r:&mut Rng,depth:usize,allow_loop:bool)->Stmt {
             let (left,right)=var_pair(r);
             Stmt::CallVarAlias(left,right,integer(r,2))
         },
-        10|11=>Stmt::If(boolean(r,3),
+        10=>{
+            let (left,right)=var_pair(r);
+            Stmt::CallVarForward(left,right,integer(r,2))
+        },
+        11|12=>Stmt::If(boolean(r,3),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect(),
             (0..1+r.below(2)).map(|_|statement(r,depth-1,false)).collect()),
         _ if allow_loop=>Stmt::Repeat(1+r.below(4),
@@ -507,6 +532,22 @@ impl Program {
                 Place::Indexed(Box::new(Integer::ArrayRead(
                     Box::new(Integer::Literal(0))))),
                 Integer::Variable(2),Boolean::Literal(true)),
+            // Forward identical scalar addresses and equivalent indexed
+            // addresses through two separate call frames. Keep a distinct
+            // mixed scalar/array pair in every seed too.
+            Stmt::CallVarForward(
+                Place::Scalar(3),Place::Scalar(3),Integer::Variable(2)),
+            Stmt::CallVarForward(
+                Place::Indexed(Box::new(Integer::Variable(0))),
+                Place::Indexed(Box::new(Integer::Binary(IOp::Add,
+                    Box::new(Integer::Variable(0)),
+                    Box::new(Integer::Literal(ARRAY_LEN as i32))))),
+                Integer::ArrayRead(Box::new(Integer::Variable(0)))),
+            Stmt::CallVarForward(
+                Place::Scalar(4),
+                Place::Indexed(Box::new(Integer::ArrayRead(
+                    Box::new(Integer::Variable(1))))),
+                Integer::Variable(2)),
             // A mandatory VAR BOOLEAN mutation with a side-effectful
             // short-circuit guard, including a possible skipped Touch.
             Stmt::CallVarBoolean(Boolean::Or(
@@ -523,7 +564,7 @@ impl Program {
         for _ in 0..5+r.below(6) {body.push(statement(&mut r,3,true));}
         Self{body}
     }
-    fn source_procedure(&self,name:&str,mirror:bool,imported:bool)->String {
+    fn source_procedure(&self,name:&str,mirror:bool,mode:CallMode)->String {
         let mut out=format!(
             "  PROCEDURE {name}*(a,b,c: INTEGER): INTEGER;\n\
              \x20 VAR x,y,acc,k: INTEGER; flag: BOOLEAN;\n\
@@ -532,7 +573,7 @@ impl Program {
              \x20   hits := 0;\n\
              \x20   x := a; y := b; acc := c; flag := FALSE;\n\
              \x20   cells[0] := a; cells[1] := b; cells[2] := c; cells[3] := 0;\n");
-        out.push_str(&sequence_with_link(&self.body,false,4,imported));
+        out.push_str(&sequence_with_link(&self.body,false,4,mode));
         out.push_str(";\n");
         // These two endings are equivalent under 32-bit wrapping arithmetic.
         if mirror {
@@ -544,18 +585,23 @@ impl Program {
         out
     }
     fn source(&self,cases:&[(i32,i32,i32)],checks:bool)->String {
-        self.source_mode(cases,checks,false)
+        self.source_mode(cases,checks,CallMode::Local)
     }
-    fn source_mode(&self,cases:&[(i32,i32,i32)],checks:bool,imported:bool)->String {
+    fn source_mode(&self,cases:&[(i32,i32,i32)],checks:bool,mode:CallMode)->String {
         let mut out=String::from("MODULE Fuzz;\n");
-        if imported { out.push_str("IMPORT Ops := FuzzOps;\n"); }
+        match mode {
+            CallMode::Local=>{},
+            CallMode::Imported=>out.push_str("IMPORT Ops := FuzzOps;\n"),
+            CallMode::Relayed=>
+                out.push_str("IMPORT Ops := FuzzOps, Relay := FuzzRelay;\n"),
+        }
         out.push_str(r#"VAR hits: INTEGER;
   PROCEDURE Touch*(n:INTEGER):INTEGER;
   BEGIN INC(hits); RETURN n END Touch;
 "#);
-        if !imported {out.push_str(&Self::helpers(false));}
-        out.push_str(&self.source_procedure("Probe",false,imported));
-        out.push_str(&self.source_procedure("Mirror",true,imported));
+        if mode==CallMode::Local {out.push_str(&Self::helpers(false));}
+        out.push_str(&self.source_procedure("Probe",false,mode));
+        out.push_str(&self.source_procedure("Mirror",true,mode));
         if checks {
             out.push_str("BEGIN\n");
             for &(a,b,c) in cases {
