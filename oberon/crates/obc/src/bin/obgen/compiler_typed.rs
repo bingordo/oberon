@@ -1193,6 +1193,49 @@ mod tests {
         }
     }
     #[test]
+    fn checked_multidimensional_var_places_cover_same_distinct_and_forwarded_addresses() {
+        let first=Place::Matrix(Box::new(Integer::Variable(0)),
+            Box::new(Integer::Variable(1)));
+        let alias=Place::Matrix(
+            Box::new(equivalent_bounded_index(Integer::Variable(0),MATRIX_ROWS)),
+            Box::new(equivalent_bounded_index(Integer::Variable(1),MATRIX_COLS)));
+        assert_eq!(first.render(false),"matrix[(a MOD 2), (b MOD 3)]");
+        assert_eq!(first.render(true),
+            "matrix[floor_mod(a, 2)][floor_mod(b, 3)]");
+        assert_eq!(alias.render(false),
+            "matrix[(((a MOD 2) + 2) MOD 2), (((b MOD 3) + 3) MOD 3)]");
+        assert_eq!(alias.render(true),
+            "matrix[floor_mod(wrap_add(floor_mod(a, 2), 2), 2)][floor_mod(wrap_add(floor_mod(b, 3), 3), 3)]");
+        let forwarded=Stmt::CallVarForward(first.clone(),alias.clone(),
+            Integer::Literal(7));
+        assert_eq!(forwarded.render_with_link(false,0,CallMode::Relayed),
+            "acc := Relay.Forward(matrix[(a MOD 2), (b MOD 3)], matrix[(((a MOD 2) + 2) MOD 2), (((b MOD 3) + 3) MOD 3)], 7)");
+        assert!(forwarded.render(true,0).starts_with(
+            "acc = forward(&matrix[floor_mod(a, 2)][floor_mod(b, 3)], &matrix["));
+        // Each dimension is normalized BEFORE adding its length: even
+        // MIN/MAX input values cannot overflow and change an alias.
+        for n in [i32::MIN,i32::MIN+1,-11,-1,0,1,4,11,i32::MAX-1,i32::MAX] {
+            for dim in [MATRIX_ROWS as i32,MATRIX_COLS as i32] {
+                let bounded=n.rem_euclid(dim);
+                assert_eq!(bounded, (bounded+dim).rem_euclid(dim));
+            }
+        }
+        for seed in 0..128 {
+            let src=render(seed,"typed-relay-source").unwrap();
+            let c=render(seed,"typed-relay-harness").unwrap();
+            assert!(src.contains("matrix: ARRAY 2,3 OF INTEGER"));
+            assert!(c.contains("int32_t matrix[2][3]={{a,b,c},{0,1,-1}};"));
+            assert!(src.contains("Ops.Twist(matrix[(a MOD 2), (b MOD 3)], matrix[(((a MOD 2) + 2) MOD 2), (((b MOD 3) + 3) MOD 3)], matrix[(a MOD 2), (b MOD 3)])"));
+            assert!(src.contains("Relay.Forward(matrix[(b MOD 2), (c MOD 3)], matrix[(((b MOD 2) + 2) MOD 2), (((c MOD 3) + 3) MOD 3)], a)"));
+            assert!(src.contains("Relay.ForwardMixed(matrix[(a MOD 2), (b MOD 3)], flag, 5, flag)"));
+            assert!(c.contains("forward_mixed(&matrix[floor_mod(a, 2)][floor_mod(b, 3)], &flag, 5, flag)"));
+            assert!(src.contains("acc := acc + matrix[0,0] + matrix[0,1] + matrix[0,2] + matrix[1,0] + matrix[1,1] + matrix[1,2];"));
+            assert!(c.contains("acc = wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(wrap_add(acc,matrix[0][0]),matrix[0][1]),matrix[0][2]),matrix[1][0]),matrix[1][1]),matrix[1][2]);"));
+            assert_eq!(c,render(seed,"typed-import-harness").unwrap());
+            assert_eq!(src,render(seed,"typed-relay-source").unwrap());
+        }
+    }
+    #[test]
     fn distinct_equivalent_indices_alias_even_across_signed_wraparound() {
         // This checks the generator's congruence rule, not interpreter-
         // derived expected program outputs. Program results still come from
