@@ -950,6 +950,49 @@ mod tests {
         }
     }
     #[test]
+    fn imported_var_forwarding_preserves_aliases_through_three_modules() {
+        let provider=render(0,"typed-import-provider").unwrap();
+        let relay=render(0,"typed-relay-provider").unwrap();
+        let local=render(0,"typed-source").unwrap();
+        assert!(provider.contains("PROCEDURE Forward*(VAR left,right: INTEGER"));
+        assert!(provider.contains("result := Twist(left,right,delta);"));
+        assert!(local.contains("PROCEDURE Forward(VAR left,right: INTEGER"));
+        assert!(relay.starts_with("MODULE FuzzRelay;\nIMPORT Ops := FuzzOps;\n"));
+        assert!(relay.contains("PROCEDURE Forward*(VAR left,right: INTEGER"));
+        assert!(relay.contains("result := Ops.Twist(left,right,delta);"));
+        assert!(relay.contains("result := result + Ops.Change(right,delta,FALSE);"));
+        assert!(!relay.contains("PROCEDURE Twist("));
+        assert_eq!(relay,render(9876,"typed-relay-provider").unwrap());
+        for seed in 0..128 {
+            let direct=render(seed,"typed-import-source").unwrap();
+            let relayed=render(seed,"typed-relay-source").unwrap();
+            let selfcheck=render(seed,"typed-relay-selfcheck").unwrap();
+            let oracle=render(seed,"typed-relay-harness").unwrap();
+            assert!(relayed.starts_with(
+                "MODULE Fuzz;\nIMPORT Ops := FuzzOps, Relay := FuzzRelay;\n"));
+            assert_eq!(relayed.replace("IMPORT Ops := FuzzOps, Relay := FuzzRelay;",
+                "IMPORT Ops := FuzzOps;")
+                .replace("Relay.Forward(","Ops.Forward("),direct);
+            assert_eq!(oracle,render(seed,"typed-import-harness").unwrap());
+            assert!(oracle.contains("static int32_t forward(int32_t *left,int32_t *right,int32_t delta)"));
+            assert!(oracle.contains("int32_t result=twist(left,right,delta);"));
+            assert!(oracle.contains("result=wrap_add(result,change(right,delta,0));"));
+            assert!(oracle.contains("return wrap_add(result,*left);"));
+            assert!(relayed.contains("Relay.Forward(x, x, c)"));
+            assert!(relayed.contains(
+                "Relay.Forward(cells[(a MOD 4)], cells[((a + 4) MOD 4)], cells[(a MOD 4)])"));
+            assert!(relayed.contains(
+                "Relay.Forward(y, cells[(cells[(b MOD 4)] MOD 4)], c)"));
+            assert!(oracle.contains("forward(&x, &x, c)"));
+            assert!(oracle.contains(
+                "forward(&cells[floor_mod(a, 4)], &cells[floor_mod(wrap_add(a, 4), 4)], cells[floor_mod(a, 4)])"));
+            assert!(selfcheck.starts_with(relayed.trim_end_matches("END Fuzz.\n")));
+            assert_eq!(selfcheck.matches("ASSERT(FALSE)").count(),INPUTS);
+            let p=Program::generate(seed);
+            assert!(p.body.iter().filter(|s|matches!(s,Stmt::CallVarForward(..))).count()>=3);
+        }
+    }
+    #[test]
     fn distinct_equivalent_indices_alias_even_across_signed_wraparound() {
         // This checks the generator's congruence rule, not interpreter-
         // derived expected program outputs. Program results still come from
